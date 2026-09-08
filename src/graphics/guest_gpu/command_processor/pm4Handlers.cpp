@@ -594,8 +594,11 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 
 	auto payload_dw = KYTY_PM4_LEN(cmd_id) - 1u;
 
+	// Conditional IB comparisons accept dword-aligned addresses. Clearing bit 2
+	// selects the preceding value when the guest puts a predicate at +4.
+	// A dword-aligned 64-bit load is a plain unaligned load on x86-64 and arm64.
 	auto* compare_addr = reinterpret_cast<const volatile uint64_t*>(
-	    (buffer[1] & 0xfffffff8u) | (static_cast<uint64_t>(buffer[2]) << 32u));
+	    (buffer[1] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[2]) << 32u));
 	uint64_t mask        = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
 	uint64_t reference   = buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u);
 	uint32_t mode        = buffer[0] & 0x3u;
