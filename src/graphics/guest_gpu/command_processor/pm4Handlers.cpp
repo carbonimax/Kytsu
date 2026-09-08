@@ -970,12 +970,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
 
 	const uint32_t control = buffer[2];
+	const bool     chain   = (control & (1u << 20u)) != 0;
 
 	auto* indirect_buffer =
 	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
 	const uint32_t indirect_num_dw = control & 0xfffffu;
 
 	if (indirect_num_dw == 0) {
+		if (chain) cp.ProcessIndirectBuffer({}, true);
 		return 3;
 	}
 	if (indirect_buffer == nullptr) {
@@ -986,7 +988,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
+	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, chain);
 
 	return 3;
 }
