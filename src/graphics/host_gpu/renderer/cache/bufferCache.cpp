@@ -1120,10 +1120,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, m_graphics.null_descriptor_enabled ? MemoryUsage::DeviceLocal : MemoryUsage::Stream, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
+	// Bound in place of a missing guest buffer, so a read must see zeros.
 	if (!m_graphics.null_descriptor_enabled) {
 		auto& buffer = GetBuffer(null_id);
 		std::memset(buffer.Mapped().data(), 0, static_cast<size_t>(buffer.Size()));
 		buffer.Flush(0, buffer.Size());
+	} else {
+		auto& buffer = GetBuffer(null_id);
+		buffer.Fill(0, buffer.Size(), 0);
 	}
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	if (graphics.readback_queue != nullptr && AsyncFaultReadbacks()) {
