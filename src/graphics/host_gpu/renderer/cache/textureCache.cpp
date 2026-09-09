@@ -1011,6 +1011,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
+		// The guest reallocated the same address as a bigger surface of the same shape. Only the
+		// extent grew, so the cached image is a corner of the requested one and expanding keeps
+		// its contents; the checks above already established an equal format and a larger size.
+		if (requested.type == cached.info.type &&
+		    requested.extent.width >= cached.info.extent.width &&
+		    requested.extent.height >= cached.info.extent.height &&
+		    requested.extent.depth >= cached.info.extent.depth) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		// A volume allocation reused for a differently shaped volume. Neither extent
 		// contains the other, so the requested volume is a separate guest image.
 		if (requested.IsVolume() && cached.info.IsVolume()) {
