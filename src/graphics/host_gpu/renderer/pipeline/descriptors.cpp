@@ -124,7 +124,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	     .storage_bounds = static_cast<ShaderRecompiler::Spirv::StorageBounds>(graphics.storage_bounds),
 	     .storage_bounds_alignment = graphics.storage_bounds_alignment};
 	const bool device_bounds = profile.storage_bounds == ShaderRecompiler::Spirv::StorageBounds::Device;
-	if (address == 0 || size == 0) {
+	// A base in guest page 0 is a null or garbage descriptor.
+	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 		// Without shader checks only a null descriptor reads zero and drops writes.
 		if (device_bounds) return {nullptr, 0, vk::WholeSize};
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
@@ -982,7 +983,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				// still needs its full payload when NumRecords is smaller than it.
 				size = std::max(size, uint64_t {metadata.max_byte_extent});
 			}
-			if (address == 0 || size == 0) {
+			if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 				source = {};
 				continue;
 			}
