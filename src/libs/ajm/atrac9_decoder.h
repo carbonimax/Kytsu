@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -109,6 +110,14 @@ static uint32_t AjmReadLe32(const uint8_t* data) {
 	       (static_cast<uint32_t>(data[2]) << 16u) | (static_cast<uint32_t>(data[3]) << 24u);
 }
 
+// KYTY_ATRAC9_PARTIAL_INPUT=1: keep a partial superframe across jobs and report the job's input as
+// consumed, instead of PARTIAL_INPUT with nothing consumed. Off by default: hardware's consumed count
+// for a partial job is not confirmed. Read at decoder creation.
+static bool AjmAt9CarryPartialInput() {
+	const char* value = std::getenv("KYTY_ATRAC9_PARTIAL_INPUT");
+	return value != nullptr && value[0] == '1';
+}
+
 static bool AjmFourCcEquals(const uint8_t* data, char a, char b, char c, char d) {
 	return data[0] == static_cast<uint8_t>(a) && data[1] == static_cast<uint8_t>(b) &&
 	       data[2] == static_cast<uint8_t>(c) && data[3] == static_cast<uint8_t>(d);
@@ -119,7 +128,8 @@ public:
 	AjmAt9Decoder(uint32_t channels, uint32_t sample_rate, AjmSampleEncoding encoding,
 	              uint64_t flags)
 	    : AjmDecoder(channels, sample_rate, encoding),
-	      m_parse_riff_header((flags & AJM_INSTANCE_FLAG_DEC_AT9_PARSE_RIFF_HEADER) != 0) {}
+	      m_parse_riff_header((flags & AJM_INSTANCE_FLAG_DEC_AT9_PARSE_RIFF_HEADER) != 0),
+	      m_carry_partial(AjmAt9CarryPartialInput()) {}
 
 	AjmDecodeResult Initialize(const void* codec_parameters,
 	                           size_t      codec_parameters_size) override {
@@ -134,11 +144,13 @@ public:
 		if (!InitializeConfig(params->config_data, &result)) {
 			return result;
 		}
+		m_pending.clear();
 
 		return MakeResult();
 	}
 
 	void Reset() override {
+		m_pending.clear();
 		m_streams.clear();
 		m_is_initialized          = false;
 		m_num_frames              = 0;
@@ -160,25 +172,55 @@ public:
 			return result;
 		}
 
+		// With the option on, decode the kept bytes followed by this job's input. Off, m_pending stays
+		// empty and finish() returns the result unchanged.
+		const size_t pending_size = m_pending.size();
+		if (pending_size != 0) {
+			m_pending.insert(m_pending.end(), static_cast<const uint8_t*>(input),
+			                 static_cast<const uint8_t*>(input) + input_size);
+			input      = m_pending.data();
+			input_size = m_pending.size();
+		}
+		const auto finish = [&](AjmDecodeResult& done, size_t consumed, bool stash_tail) {
+			if (!m_carry_partial) {
+				return done;
+			}
+			if (stash_tail && consumed < input_size) {
+				std::vector<uint8_t> tail(static_cast<const uint8_t*>(input) + consumed,
+				                          static_cast<const uint8_t*>(input) + input_size);
+				m_pending = std::move(tail);
+				consumed  = input_size;
+			} else if (consumed < pending_size) {
+				std::vector<uint8_t> tail(static_cast<const uint8_t*>(input) + consumed,
+				                          static_cast<const uint8_t*>(input) + pending_size);
+				m_pending = std::move(tail);
+			} else {
+				m_pending.clear();
+			}
+			done.input_consumed = consumed > pending_size ? consumed - pending_size : 0;
+			return done;
+		};
+
 		const auto* input_bytes  = static_cast<const uint8_t*>(input);
 		auto*       output_bytes = static_cast<uint8_t*>(output);
 		size_t      input_offset = 0;
+		bool        stash_tail   = false;
 
 		if (m_parse_riff_header && input_size >= 12 &&
 		    AjmFourCcEquals(input_bytes, 'R', 'I', 'F', 'F')) {
 			if (!ParseRiffHeader(input_bytes, input_size, &input_offset, gapless, &result)) {
-				return result;
+				return finish(result, 0, result.result == AJM_RESULT_PARTIAL_INPUT);
 			}
 			if (input_offset >= input_size) {
 				result.input_consumed = input_offset;
 				result.result         = AJM_RESULT_PARTIAL_INPUT;
-				return result;
+				return finish(result, input_offset, false);
 			}
 		}
 
 		if (!m_is_initialized) {
 			result.result = AJM_RESULT_NOT_INITIALIZED;
-			return result;
+			return finish(result, 0, false);
 		}
 
 		for (;;) {
@@ -194,6 +236,7 @@ public:
 				if (result.frames == 0) {
 					result.result = AJM_RESULT_PARTIAL_INPUT;
 				}
+				stash_tail = true;
 				break;
 			}
 
@@ -244,7 +287,7 @@ public:
 
 		result.total_decoded_samples = m_total_decoded_samples;
 		result.format                = GetFormat();
-		return result;
+		return finish(result, input_offset, stash_tail);
 	}
 
 	void WriteCodecInfo(void* output, size_t output_size,
@@ -638,6 +681,8 @@ private:
 	}
 
 	bool                 m_parse_riff_header = false;
+	bool                 m_carry_partial     = false;
+	std::vector<uint8_t> m_pending; // Kept partial superframe, only with m_carry_partial.
 	bool                 m_is_initialized    = false;
 	bool                 m_has_config        = false;
 	struct Stream {

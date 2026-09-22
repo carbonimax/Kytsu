@@ -684,6 +684,47 @@ void TestAtrac9Discrete() {
 		          std::equal(expected.begin() + 17 * row_bytes,
 		                     expected.begin() + 717 * row_bytes, actual.begin() + 16),
 		      "ATRAC9 discrete gapless trim or superframe drain changed channel order");
+		if (encoding == AjmSampleEncoding::S16) {
+			const auto set_carry = [](const char* value) {
+#if defined(_WIN32)
+				_putenv_s("KYTY_ATRAC9_PARTIAL_INPUT", value);
+#else
+				value[0] != '\0' ? setenv("KYTY_ATRAC9_PARTIAL_INPUT", value, 1)
+				                 : unsetenv("KYTY_ATRAC9_PARTIAL_INPUT");
+#endif
+			};
+			set_carry("1");
+			AjmAt9Decoder carry(12, 48000, encoding, 0);
+			set_carry("");
+			Check(carry.Initialize(captured.data(), captured.size()).result == OK,
+			      "ATRAC9 partial-input option decoder initialization failed");
+			std::fill(actual.begin(), actual.end(), 0xa5);
+			const auto head = carry.Decode(encoded.data(), encoded.size() - 1, actual.data() + 16,
+			                               expected.size(), true, nullptr);
+			const auto last = carry.Decode(encoded.data() + encoded.size() - 1, 1, actual.data() + 16,
+			                               expected.size(), true, nullptr);
+			Check(head.result == AJM_RESULT_PARTIAL_INPUT && head.frames == 0 &&
+			          head.input_consumed == encoded.size() - 1 && head.output_written == 0 &&
+			          last.result == OK && last.frames == 4 && last.input_consumed == 1 &&
+			          last.output_written == expected.size() &&
+			          std::equal(expected.begin(), expected.end(), actual.begin() + 16),
+			      "ATRAC9 partial-input option did not carry the superframe across jobs");
+			(void)carry.Decode(encoded.data(), encoded.size() - 1, actual.data() + 16,
+			                   expected.size(), true, nullptr);
+			carry.Reset();
+			const auto after_reset = carry.Decode(encoded.data(), encoded.size(), actual.data() + 16,
+			                                      expected.size(), true, nullptr);
+			Check(after_reset.result == OK && after_reset.frames == 4 &&
+			          after_reset.input_consumed == encoded.size() &&
+			          std::equal(expected.begin(), expected.end(), actual.begin() + 16),
+			      "ATRAC9 partial-input option kept bytes across Reset");
+			AjmAt9Decoder plain(12, 48000, encoding, 0);
+			Check(plain.Initialize(captured.data(), captured.size()).result == OK &&
+			          plain.Decode(encoded.data(), encoded.size() - 1, actual.data() + 16,
+			                       expected.size(), true, nullptr)
+			                  .input_consumed == 0,
+			      "ATRAC9 decoder created after clearing the option still carries partial input");
+		}
 	}
 	for (auto invalid: {std::array<uint8_t, 4> {0x31, 0x72, 0xc0, 0xfe},
 	                   std::array<uint8_t, 4> {0x30, 0xf2, 0xc0, 0xfe},
