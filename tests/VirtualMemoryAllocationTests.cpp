@@ -2776,6 +2776,9 @@ void TestMunmapReservedSpanWithReleasedHole() {
 	        "KernelMunmap(full span with hole)");
 	ExpectUnmapped(test, base);
 	ExpectUnmapped(test, base + SceKernelPageSize * 2);
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 3) == ErrorAccess,
+	      "KernelMunmap accepted an entirely released span");
 
 	// Same with a committed mapping after the hole: it is released and its budget comes back.
 	const auto baseline = AvailableFlexibleMemory(test);
