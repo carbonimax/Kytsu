@@ -2032,6 +2032,23 @@ static void UnmapGpuRanges(const std::vector<VirtualRanges::Range>& ranges) {
 	}
 }
 
+// A span can hold pages unmapped earlier: its tracked fragments, when there is at least one and
+// every hole between them is free guest address space (an untracked address is not a mapping).
+static bool QueryTrackedFragmentsAroundFreeHoles(uint64_t vaddr, uint64_t len,
+                                                 std::vector<VirtualRanges::Range>* ranges) {
+	if (g_virtual_ranges->QueryFragments(vaddr, len, ranges) == 0) {
+		return false;
+	}
+	auto current = vaddr;
+	for (const auto& range: *ranges) {
+		if (range.start > current && !g_guest_address_space->ContainsFree(current, range.start - current)) {
+			return false;
+		}
+		current = range.start + range.size;
+	}
+	return current == vaddr + len || g_guest_address_space->ContainsFree(current, vaddr + len - current);
+}
+
 // The ABI entry point and batch operations hold g_memory_operation_mutex.
 static int UnmapMemory(uint64_t vaddr, size_t len) {
 	LOGF("\t start = 0x%016" PRIx64 "\n"
@@ -2044,7 +2061,8 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 	}
 	len = (len + page_size - 1) & ~(page_size - 1);
 	std::vector<VirtualRanges::Range> ranges;
-	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
+	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges) &&
+	    !QueryTrackedFragmentsAroundFreeHoles(vaddr, len, &ranges)) {
 		return KERNEL_ERROR_EACCES;
 	}
 	UnmapGpuRanges(ranges);

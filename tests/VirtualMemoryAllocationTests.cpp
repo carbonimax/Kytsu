@@ -2762,6 +2762,44 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestMunmapReservedSpanWithReleasedHole() {
+	const char* test = "MunmapReservedSpanWithReleasedHole";
+	void* reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 3, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle hole)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 3),
+	        "KernelMunmap(full span with hole)");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + SceKernelPageSize * 2);
+
+	// Same with a committed mapping after the hole: it is released and its budget comes back.
+	const auto baseline = AvailableFlexibleMemory(test);
+	reserve             = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 3, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange(second)");
+	const auto second = reinterpret_cast<uint64_t>(reserve);
+	void*      tail   = reinterpret_cast<void*>(second + SceKernelPageSize * 2);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &tail, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "hole_tail"),
+	        "KernelMapNamedFlexibleMemory(tail)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(second + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(second middle hole)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(second, SceKernelPageSize * 3),
+	        "KernelMunmap(span with hole and mapping)");
+	ExpectUnmapped(test, second + SceKernelPageSize * 2);
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "munmap across a hole leaked flexible budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMunmapGpuRuns() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "MunmapGpuRuns";
@@ -6510,6 +6548,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestMunmapReservedSpanWithReleasedHole);
 	RunTest(TestMunmapGpuRuns);
 	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
