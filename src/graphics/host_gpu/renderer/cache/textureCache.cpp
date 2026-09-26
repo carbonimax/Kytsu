@@ -2484,7 +2484,11 @@ bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging, bool capture
 	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
 	                                    trapped = m_readback_storage_images] {
 		download.buffer->Invalidate(download.offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		if (!LibKernel::Memory::TryWriteBacking(range.address, download.mapped, range.size)) {
+			LOGF("TextureCache: skipped GPU download write without host backing "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     range.address, range.size);
+		}
 		if (trapped) {
 			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
 			// Priority operations run in queue order, so this write-back is the oldest.
