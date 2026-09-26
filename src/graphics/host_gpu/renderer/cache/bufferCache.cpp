@@ -891,6 +891,19 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+// A download can reach past the guest mapping (unmapped holes after a VMA): only the mapped
+// prefix is written back.
+static void WriteDownloadBacking(uint64_t guest, const uint8_t* host, uint64_t size) {
+	const auto writable = Libs::LibKernel::Memory::TryClampRangeSize(guest, size);
+	if (writable == 0) {
+		LOGF("BufferCache: skipped GPU download into unmapped guest addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     guest, size);
+		return;
+	}
+	Libs::LibKernel::Memory::WriteBacking(guest, host, writable);
+}
+
 std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(Buffer&  buffer,
                                                                               uint64_t vaddr,
                                                                               uint64_t size,
@@ -940,8 +953,8 @@ std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(B
 				auto& ring = m_readback_queue->Ring();
 				ring.Invalidate(offset, Common::AlignUp(total_size, 256));
 				for (const auto& copy: copies) {
-					Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-					                                      mapped + (copy.dstOffset - offset), copy.size);
+					WriteDownloadBacking(buffer_address + copy.srcOffset,
+					                     mapped + (copy.dstOffset - offset), copy.size);
 				}
 				m_readback_queue->Release(seq);
 				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
@@ -1080,8 +1093,8 @@ void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> co
 	publish_out = [mapped, offset, total_size, buffer_address, download = &download, copies = std::move(copies)] {
 		download->Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			WriteDownloadBacking(buffer_address + copy.srcOffset, mapped + (copy.dstOffset - offset),
+			                     copy.size);
 		}
 	};
 }
