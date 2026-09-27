@@ -830,7 +830,11 @@ void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool r
 
 void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
-	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+	// GL2 prefetch: dst_sel bit 2 makes 0x0003022c a register offset, not a guest address.
+	constexpr uint64_t GL2PrefetchRegisterOffset    = 0x0003022c;
+	constexpr uint8_t  NonMemoryDestinationSelector = 0x4;
+	if (num_bytes == 0 || (dst_address_or_offset == GL2PrefetchRegisterOffset &&
+	                       (dst_sel & NonMemoryDestinationSelector) != 0)) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
