@@ -1046,7 +1046,17 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (destination.backing.samples != 1 || info.resources.layers == 0 ||
 	    info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
-		EXIT("TextureCache: invalid depth upload\n");
+		EXIT("TextureCache: invalid depth upload: stencil=%u addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64
+		     " format=%u elem_bytes=%u bytes_per_block=%u tile=%u extent=%ux%ux%u pitch=%u "
+		     "levels=%u layers=%u samples=%u backing_samples=%u\n",
+		     image.depth_id ? 1u : 0u, info.data.address, info.data.size,
+		     static_cast<uint32_t>(info.guest_format),
+		     static_cast<uint32_t>(Prospero::NumBytesPerElement(info.guest_format)),
+		     static_cast<uint32_t>(info.bytes_per_block), static_cast<uint32_t>(info.tile_mode),
+		     info.extent.width, info.extent.height, info.extent.depth, info.pitch,
+		     info.resources.levels, info.resources.layers, info.samples,
+		     destination.backing.samples);
 	}
 	const auto layers          = info.resources.layers;
 	const auto full_slice_size = info.linear_slice_stride;
