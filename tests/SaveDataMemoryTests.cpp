@@ -446,6 +446,32 @@ void TestConvert() {
 		convert.dst_blocks = blocks;
 		CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
 	}
+	// A real conversion ends at once with a CONVERT_END event; the save keeps the new size.
+	SaveDataEvent event {};
+	while (SaveDataGetEventResult(nullptr, &event) == OK) {
+	}
+	convert.dst_dir_name = nullptr;
+	convert.dst_blocks   = 128;
+	CHECK(SaveDataConvert(&convert) == OK);
+	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
+	CHECK(event.type == 5 && event.error_code == OK && std::string(event.dir_name.data) == "save");
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	// A named destination gets a copy of the save at the requested size.
+	const auto copy      = DirName("copy");
+	convert.dst_dir_name = &copy;
+	convert.dst_blocks   = 160;
+	CHECK(SaveDataConvert(&convert) == OK);
+	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
+	CHECK(event.type == 5 && event.error_code == OK && std::string(event.dir_name.data) == "copy");
+	convert.src_dir_name = &copy;
+	convert.dst_dir_name = nullptr;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	convert.src_dir_name = &source;
+	convert.dst_blocks   = 128;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	float progress = 0.0f;
+	CHECK(SaveDataGetConvertProgress(&progress) == OK && progress == 1.0f);
+	CHECK(SaveDataGetConvertProgress(nullptr) == SAVE_DATA_ERROR_PARAMETER);
 }
 
 void TestGuestSaveIsolation() {
