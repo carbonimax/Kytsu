@@ -32,8 +32,8 @@ struct Fixture {
 	AjmBatchInfo              batch {};
 
 	explicit Fixture(uint32_t channels = 1, AjmSampleEncoding encoding = AjmSampleEncoding::S16,
-	                 uint64_t flags = 0x1000)
-	    : channels(channels) {
+	                 uint64_t flags = 0x1000, uint32_t family = 0)
+	    : channels(channels), mapping_family(family) {
 		Check(AjmInstanceCreate(1, 24, flags | channels | (uint64_t(encoding) << 7), &instance) ==
 		          OK,
 		      "create Opus instance");
@@ -374,6 +374,41 @@ void MappingFamilies() {
 
 	f.mapping_family = 2;
 	f.Initialize(AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL);
+
+	// Family 1, 5.1: the Vorbis-layout multistream (4 streams, 2 coupled) decodes as six
+	// channels, a tone in the front left channel only.
+	const unsigned char surround[] {0, 4, 1, 2, 3, 5};
+	encoder = opus_multistream_encoder_create(48000, 6, 4, 2, surround, OPUS_APPLICATION_AUDIO,
+	                                          &error);
+	Check(encoder != nullptr && error == OPUS_OK, "create 5.1 test encoder");
+	std::vector<int16_t> pcm6(960 * 6);
+	for (size_t i = 0; i < 960; ++i) {
+		pcm6[i * 6] = static_cast<int16_t>(12000 * std::sin(i * 0.041));
+	}
+	std::vector<uint8_t> packet6(4096);
+	const int size6 = opus_multistream_encode(encoder, pcm6.data(), 960, packet6.data() + 2, 4094);
+	opus_multistream_encoder_destroy(encoder);
+	Check(size6 > 0, "encode 5.1 test packet");
+	packet6.resize(size6 + 2);
+	packet6[0] = static_cast<uint8_t>(size6);
+	packet6[1] = static_cast<uint8_t>(size6 >> 8);
+	Fixture f6(6, AjmSampleEncoding::S16, 0, 1);
+	std::vector<int16_t> out6(960 * 6);
+	const auto decoded6 = f6.Decode(packet6.data(), packet6.size(), out6.data(), out6.size() * 2);
+	Check(decoded6.stream.size_consumed == static_cast<int>(packet6.size()) &&
+	          decoded6.stream.size_produced == 960 * 6 * 2,
+	      "family 1 decodes a whole 5.1 multistream packet");
+	std::array<double, 6> energy {};
+	for (size_t i = 0; i < 960; ++i) {
+		for (size_t c = 0; c < 6; ++c) {
+			energy[c] += std::abs(out6[i * 6 + c]);
+		}
+	}
+	for (size_t c = 1; c < 6; ++c) {
+		Check(energy[0] > 8 * energy[c], "family 1 keeps the front left tone in channel 0");
+	}
+	f6.channels = 9;
+	f6.Initialize(AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL);
 }
 
 void Mp3ParseFrame() {
