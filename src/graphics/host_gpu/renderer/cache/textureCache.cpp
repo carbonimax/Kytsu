@@ -937,9 +937,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (keep_both) {
 			return {merged_id};
 		}
-		// Equal pitch does not imply equal mip placement: a changed extent can move
+		// Equal pitch does not imply equal mip or layer placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
+		    (requested.resources.layers < cached.info.resources.layers &&
+		     requested.data.size > cached.info.data.size) ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
 		                 cached.info.mip_layout.begin(),
