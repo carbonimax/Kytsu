@@ -4436,6 +4436,13 @@ void TestModuleSegmentsUseFlexibleMemory() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestRelocationSkipsNoneEntries() {
+	const char* test = "RelocationSkipsNoneEntries";
+	Check(test, Loader::TestRelocationSkipsNoneEntries(),
+	      "R_X86_64_NONE was not skipped or changed module memory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 volatile sig_atomic_t g_instruction_traps = 0;
 
@@ -5976,6 +5983,7 @@ int main(int argc, char** argv) {
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 	RunTest(TestModuleSegmentsUseFlexibleMemory);
+	RunTest(TestRelocationSkipsNoneEntries);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);
 #endif
