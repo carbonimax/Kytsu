@@ -191,8 +191,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 		return false;
 	}
 	// Bits 0-7 name the mip-stats counter. A clear COMPRESSION_EN disables the metadata and its
-	// settings.
-	const auto         metadata_control = descriptor.fields[6] & 0x00ffff00u;
+	// settings. MaxUncompBlkSize/MaxCompBlkSize (bits 15-18) size DCC blocks; HTILE depth ignores them.
+	constexpr uint32_t dcc_block_size_mask = 0x00078000u;
+	const auto         metadata_control    = descriptor.fields[6] & 0x00ffff00u & ~dcc_block_size_mask;
 	constexpr uint32_t pipe_aligned     = 1u << 19u;
 	if (!descriptor.MetaCompress()) {
 		return true;

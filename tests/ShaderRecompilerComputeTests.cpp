@@ -55821,6 +55821,11 @@ void CheckDepthTextureEncoding() {
   Require("DepthTextureEncoding", "compressed HTILE descriptor",
           IsSupportedDepthTextureEncoding(compressed_descriptor),
           "valid compressed depth descriptor required a prior depth target");
+  auto dcc_block_sizes = compressed_descriptor;
+  dcc_block_sizes.fields[6] |= 0x00030000u; // DCC block sizes: no meaning for HTILE
+  Require("DepthTextureEncoding", "compressed HTILE with DCC block sizes",
+          IsSupportedDepthTextureEncoding(dcc_block_sizes),
+          "HTILE depth descriptor rejected its DCC block-size bits");
 
   const ShaderTextureResource disabled_metadata{{
       0x20018100u, 0xc1600000u, 0x021bc1dfu, 0x91800204u,
