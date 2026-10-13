@@ -166,6 +166,7 @@ bool EquivalentSelectorDomain(const ResourcePlan& program,
                               const DescriptorSource::IndirectDescriptor& left,
                               const DescriptorSource::IndirectDescriptor& right) {
 	return left.selector == right.selector && left.signed_count == right.signed_count &&
+	       left.selector_nonnegative == right.selector_nonnegative &&
 	       left.workgroup_axis == right.workgroup_axis &&
 	       left.workgroup_multiplier == right.workgroup_multiplier &&
 	       left.workgroup_shift == right.workgroup_shift &&

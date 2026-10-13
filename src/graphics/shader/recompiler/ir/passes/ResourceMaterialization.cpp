@@ -554,6 +554,8 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 			key = std::min(field, selector->maximum);
 		}
 		if (selector->excluded) std::erase(keys, *selector->excluded);
+		if (indirect.selector_nonnegative)
+			std::erase_if(keys, [](uint32_t key) { return key >= 0x80000000u; });
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	}
