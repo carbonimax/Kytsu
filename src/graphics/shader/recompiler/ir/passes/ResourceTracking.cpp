@@ -2515,9 +2515,10 @@ private:
 		uint32_t offset = 0, stride = 0;
 		if (memory == nullptr || memory->offset > INT32_MAX ||
 		    !MemoryIndexBelongsTo(memory_index, *read)) return false;
+		const auto base_offset = memory->offset & ~3u;
 		const bool affine = MatchTableOffset(read->Arg(1), index, offset, stride) &&
 		    ((offset | stride | memory->offset) & 3u) == 0u &&
-		    uint64_t {offset} + memory->offset <= UINT32_MAX;
+		    uint64_t {offset} + base_offset <= UINT32_MAX;
 		if (affine) {
 			workgroup_axis = WorkgroupAxis(index, &first);
 			const auto* bound = BoundedLoop(index, read->Parent());
@@ -2528,7 +2529,10 @@ private:
 				// a bit scan of a nonzero mask load reads only the ranks its words set.
 				const auto maximum = SelectorMaximum(index);
 				if (maximum == 31u) selector.ranks = BitScanRanks(index);
-				if (maximum < MaxIndirectDescriptorProbes) count = Value(maximum + 1u);
+				// The last record offset must not wrap in 32 bits.
+				if (maximum < MaxIndirectDescriptorProbes &&
+				    uint64_t {offset} + base_offset + uint64_t {maximum} * stride <= UINT32_MAX)
+					count = Value(maximum + 1u);
 			}
 			// A record selected from a shared append list is below the list's bound.
 			const auto* lane = index.Resolve().TryInstruction();
@@ -2568,7 +2572,7 @@ private:
 			    !HasActiveLane(lane->Arg(1), lane->Parent())) return false;
 			if (selected_lane) count = SharedLoadBound(affine.index, active);
 			if (!count.IsEmpty() && ((affine.stride | affine.offset) & 3u) == 0u &&
-			    affine.offset + memory->offset <= UINT32_MAX) {
+			    affine.offset + base_offset <= UINT32_MAX) {
 				stride = static_cast<uint32_t>(affine.stride);
 				offset = static_cast<uint32_t>(affine.offset);
 			} else {
@@ -2586,7 +2590,7 @@ private:
 		if (!MakeRuntimeTableSource(*read, material_source)) return false;
 		selector.source = InternSource(material_source);
 		selector.stride = stride;
-		selector.offset = offset + (memory->offset & ~3u);
+		selector.offset = offset + base_offset;
 		indirect.selector = std::move(selector);
 		indirect.key_count = count;
 		indirect.workgroup_axis = workgroup_axis;
