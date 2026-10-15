@@ -2326,7 +2326,8 @@ void TestBoundedComputeImageLoop() {
   };
   const auto make_plan = [](Variant variant, bool material = false, uint32_t first = 0u,
                             Clamp clamp = Clamp::None, PostTest post = PostTest::None,
-                            uint32_t post_bound = 6u) {
+                            uint32_t post_bound = 6u, uint32_t proof_depth = 0u,
+                            uint32_t proof_width = 0u) {
     const bool post_test = post != PostTest::None;
     const bool diamond = variant >= Variant::GuardedDiamond;
     Fixture fixture(diamond ? ShaderType::Vertex : ShaderType::Compute);
@@ -2413,8 +2414,34 @@ void TestBoundedComputeImageLoop() {
                                        {variant == Variant::WrongGuard
                                             ? Value(0u) : key,
                                         count}, 0, compare);
-    const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
+    auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
                                              {local, Value(0u)}, 0, entry);
+    // Even-length chains preserve the lane mask but stress recursive proof
+    // evaluation. Put this operand first so excluding the bound cannot skip it.
+    for (uint32_t index = 0; index < proof_depth; ++index)
+      initial_active = fixture.Emit(ValueOpcode::LogicalNot, {initial_active}, 0, entry);
+    if (proof_width != 0u) {
+      std::vector<Value> left, right;
+      for (uint32_t index = 0; index < proof_width; ++index) {
+        left.push_back(fixture.Emit(ValueOpcode::IEqual32,
+            {fixture.UserData(3u + index), Value(0u)}, 0, entry));
+        right.push_back(fixture.Emit(ValueOpcode::IEqual32,
+            {fixture.UserData(3u + proof_width + index), Value(0u)}, 0, entry));
+      }
+      // Visit all left variables before the right variables. Equality of the
+      // two groups then has an exponential decision diagram in that order.
+      initial_active = left[0];
+      for (uint32_t index = 1; index < proof_width; ++index)
+        initial_active = fixture.Emit(ValueOpcode::LogicalOr,
+            {initial_active, left[index]}, 0, entry);
+      for (uint32_t index = 0; index < proof_width; ++index) {
+        const auto equal = fixture.Emit(ValueOpcode::SelectU1,
+            {left[index], right[index], fixture.Emit(ValueOpcode::LogicalNot,
+                {right[index]}, 0, entry)}, 0, entry);
+        initial_active = fixture.Emit(ValueOpcode::LogicalAnd,
+            {initial_active, equal}, 0, entry);
+      }
+    }
     if (forwarded && !post_test) {
       forward->AddBranch(incoming == forward ? header : incoming);
       forward->terminator = {.kind = CFG::TerminatorKind::Branch,
@@ -2524,7 +2551,10 @@ void TestBoundedComputeImageLoop() {
       const auto active = initial_active;
       const auto allowed = fixture.Emit(variant == Variant::Disjunction
                                            ? ValueOpcode::LogicalOr : ValueOpcode::LogicalAnd,
-                                        {in_range, active}, 0, header);
+                                        proof_depth == 0u && proof_width == 0u
+                                                          ? std::initializer_list<Value>{in_range, active}
+                                                          : std::initializer_list<Value>{active, in_range},
+                                        0, header);
       const bool nonzero = variant == Variant::Nonzero || variant == Variant::TrueEdge;
       auto condition = allowed;
       if (!nonzero)
@@ -2672,6 +2702,16 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::GuardedDiamond);
   make_plan(Variant::Forwarded);
   make_plan(Variant::ForwardedChain);
+  make_plan(Variant::Plain, false, 0u, Clamp::None, PostTest::None, 6u, 16u);
+  make_plan(Variant::Plain, false, 0u, Clamp::None, PostTest::None, 6u, 0u, 4u);
+  CheckFatal([&] { make_plan(Variant::Plain, false, 0u, Clamp::None, PostTest::None, 6u, 0u, 16u); },
+             "not a valid runtime value",
+             "oversized decision diagram was accepted as a loop proof");
+  for (const auto variant : {Variant::Plain, Variant::Nonzero, Variant::TrueEdge}) {
+    CheckFatal([&] { make_plan(variant, false, 0u, Clamp::None, PostTest::None, 6u, 512u); },
+               "not a valid runtime value",
+               "exhausted loop proof accepted a bound or failed to stop recursion");
+  }
   for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
                              Variant::ForwardedJoin, Variant::ForwardedBranch,
                              Variant::ForwardedIncrementBypass,
