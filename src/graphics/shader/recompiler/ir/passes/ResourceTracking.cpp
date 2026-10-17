@@ -3430,8 +3430,16 @@ private:
 					plan.retain_reads = true;
 				} else if (maximum < MaxIndirectDescriptorProbes)
 					indirect.key_count = Value(maximum + 1u);
-				else if (!ProgramLoopCount(key, indirect))
-					return false;
+				else if (!ProgramLoopCount(key, indirect)) {
+					// FF1 selects bits 0..31 or -1 for zero. When the bias equals
+					// the stride, the sentinel wraps to the first table record.
+					const auto* scan = key.Resolve().TryInstruction();
+					if (scan == nullptr || scan->GetOpcode() != ValueOpcode::FindILsb32 ||
+					    table_offset != table_stride)
+						return false;
+					indirect.selector_first = Value(UINT32_MAX);
+					indirect.key_count = Value(33u);
+				}
 			}
 			if ((table_offset & 3u) != 0u) return false;
 		} else {
