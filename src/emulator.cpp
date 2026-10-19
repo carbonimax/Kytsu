@@ -253,7 +253,8 @@ void Run(const RunOptions& options) {
 
 	MountSandboxDirs();
 
-	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
+	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id,
+	                       Common::ReadLocalEntitlements(options.app0_dir / "dlc_emu.ini", title_id));
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 
