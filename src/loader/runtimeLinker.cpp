@@ -828,6 +828,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			                           info->r11, info->r12, info->r13, info->r14, info->r15};
 			Libs::Graphics::DescribeImportFault(values, sizeof(values) / sizeof(values[0]));
 		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			uint64_t nearest_begin = 0;
+			uint64_t nearest_end   = 0;
+			if (Libs::LibKernel::Memory::DescribeNearestGpuMapping(info->access_violation_vaddr,
+			                                                     &nearest_begin, &nearest_end)) {
+				std::printf("nearest guest mapping: [0x%016" PRIx64 " .. 0x%016" PRIx64 ")\n",
+				            nearest_begin, nearest_end);
+			} else {
+				std::printf("nearest guest mapping: (none known)\n");
+			}
+		}
 		std::fflush(stdout);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Host call stack from the faulting context (unwind data only, no symbols): identifies
