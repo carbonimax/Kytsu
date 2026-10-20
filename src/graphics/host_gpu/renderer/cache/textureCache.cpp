@@ -305,10 +305,29 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	m_download_images.erase(id);
 	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
-		// Only the last image to acquire an HTile range releases its clear state.
-		const auto metadata = m_surface_metas.find(image.info.metadata.range.address);
-		if (metadata != m_surface_metas.end() && metadata->second.owner == id) {
-			m_surface_metas.erase(metadata);
+		// HTile clear state belongs to the guest depth surface, not to one native image: a title
+		// alternates D32 and D32S8 bindings with separate HTiles and clears each while the other
+		// is bound. Keep the state while another native depth image of the surface remains; a
+		// non-depth replacement still drops it.
+		const auto surface  = image.info.data.address;
+		bool       retained = false;
+		for (const auto other: FindImagesInRegion(surface, image.info.data.size)) {
+			const auto* owner = m_slot_images.try_get(other);
+			retained |= other != id && owner != nullptr && owner->registered && !owner->depth_id &&
+			            owner->info.IsDepth() && owner->info.data.address == surface;
+		}
+		const auto own = m_surface_metas.find(image.info.metadata.range.address);
+		if (!retained) {
+			std::erase_if(m_surface_metas, [&](const auto& metadata) {
+				return metadata.second.depth_address == surface;
+			});
+			// Only the last image to acquire an HTile range releases its clear state.
+			const auto metadata = m_surface_metas.find(image.info.metadata.range.address);
+			if (metadata != m_surface_metas.end() && metadata->second.owner == id) {
+				m_surface_metas.erase(metadata);
+			}
+		} else if (own != m_surface_metas.end() && own->second.depth_address != surface) {
+			m_surface_metas.erase(own);
 		}
 	}
 	UnregisterImage(id);
@@ -1952,7 +1971,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
-		metadata->second.owner = id;
+		metadata->second.owner         = id;
+		metadata->second.depth_address = desc.info.data.address;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
