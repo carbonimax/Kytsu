@@ -574,8 +574,11 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	return {source_layers, destination_layers};
 }
 
-void Image::CopyImage(Image& source) {
+void Image::CopyImage(Image& source, bool stencil) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	EXIT_IF(stencil &&
+	        (!(FullAspectMask(source.backing.format) & vk::ImageAspectFlagBits::eStencil) ||
+	         !(FullAspectMask(backing.format) & vk::ImageAspectFlagBits::eStencil)));
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	uint32_t       base_depth = source.backing.extent.depth;
@@ -585,9 +588,11 @@ void Image::CopyImage(Image& source) {
 		base_depth = backing.extent.depth;
 	}
 	const auto source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
+	            : FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
+	            : FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
