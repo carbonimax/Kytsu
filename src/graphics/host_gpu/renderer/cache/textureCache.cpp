@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -2025,8 +2026,11 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
 		// Key by the native image base; a layered binding may start at a later slice. Clear state
-		// kept for another surface does not carry over when this HTile changes surfaces.
-		if (inserted || metadata->second.depth_address != image.info.data.address) {
+		// kept for another surface, or for an HTile of another size, does not carry over.
+		const bool size_changed = metadata->second.size != desc.info.metadata.range.size;
+		metadata->second.size   = desc.info.metadata.range.size;
+		if (inserted || size_changed ||
+		    metadata->second.depth_address != image.info.data.address) {
 			metadata->second.clear_mask.reset();
 			if (image.info.htile_initial_clear) {
 				metadata->second.clear_mask.set();
@@ -2746,10 +2750,21 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return found->second.clear_mask.test(slice);
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+bool TextureCache::ClearMeta(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	if (size != 0 && found->second.size != 0 && size != found->second.size) {
+		// Validation aid: a refused HTile clear would show as a depth target left uncleared.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::fprintf(stderr,
+			             "TextureCache: compute clear size 0x%" PRIx64 " at 0x%016" PRIx64
+			             " does not match its metadata size 0x%" PRIx64 ", dispatched\n",
+			             size, address, found->second.size);
+		}
 		return false;
 	}
 	found->second.clear_mask.set();
