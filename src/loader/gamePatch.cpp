@@ -50,6 +50,19 @@ bool Fail(std::string* error, std::string message) {
 	return false;
 }
 
+int HexDigit(char c) {
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	return -1;
+}
+
 bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 	if (text.empty() || (text.size() % 2) != 0) {
 		return false;
@@ -57,8 +70,30 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 
 	bytes->resize(text.size() / 2);
 	for (size_t index = 0; index < bytes->size(); index++) {
-		(*bytes)[index] = static_cast<uint8_t>(std::stoul(text.substr(index * 2, 2), nullptr, 16));
+		const auto high = HexDigit(text[index * 2]);
+		const auto low  = HexDigit(text[index * 2 + 1]);
+		if (high < 0 || low < 0) {
+			return false;
+		}
+		(*bytes)[index] = static_cast<uint8_t>((high << 4) | low);
 	}
+	return true;
+}
+
+bool ParseHex64(const std::string& text, uint64_t* value) {
+	if (text.empty() || text.size() > 16) {
+		return false;
+	}
+
+	uint64_t result = 0;
+	for (const char c: text) {
+		const auto digit = HexDigit(c);
+		if (digit < 0) {
+			return false;
+		}
+		result = (result << 4u) | static_cast<uint64_t>(digit);
+	}
+	*value = result;
 	return true;
 }
 
@@ -70,7 +105,9 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 
 	const auto root = Json::parse(file, nullptr, false);
 	if (!root.is_object() || !root.contains("id") || !root.contains("version") ||
-	    !root.contains("process") || !root.contains("mods")) {
+	    !root.contains("process") || !root.contains("mods") || !root["id"].is_string() ||
+	    !root["version"].is_string() || !root["process"].is_string() ||
+	    !root["mods"].is_array()) {
 		return Fail(error, "expected a GoldHEN-style mods JSON file");
 	}
 	plan->title_id = root["id"].get<std::string>();
@@ -78,14 +115,26 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 	plan->process  = root["process"].get<std::string>();
 
 	for (const auto& mod: root["mods"]) {
+		if (!mod.is_object() || !mod.contains("name") || !mod["name"].is_string() ||
+		    !mod.contains("memory") || !mod["memory"].is_array() ||
+		    (mod.contains("enabled") && !mod["enabled"].is_boolean())) {
+			return Fail(error, "invalid mod entry");
+		}
 		if (!mod.value("enabled", true)) {
 			continue;
 		}
 		const auto name = mod["name"].get<std::string>();
 		plan->mod_names.push_back(name);
 		for (const auto& entry: mod["memory"]) {
+			if (!entry.is_object() || !entry.contains("offset") || !entry["offset"].is_string() ||
+			    !entry.contains("off") || !entry["off"].is_string() || !entry.contains("on") ||
+			    !entry["on"].is_string()) {
+				return Fail(error, "invalid mod memory entry");
+			}
 			Write write;
-			write.source_address = std::stoull(entry["offset"].get<std::string>(), nullptr, 16);
+			if (!ParseHex64(entry["offset"].get<std::string>(), &write.source_address)) {
+				return Fail(error, "invalid mod memory offset");
+			}
 			if (!ParseBytes(entry["off"].get<std::string>(), &write.off) ||
 			    !ParseBytes(entry["on"].get<std::string>(), &write.on) ||
 			    write.off.size() != write.on.size()) {
