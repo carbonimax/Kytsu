@@ -81,12 +81,16 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 }
 
 bool ParseHex64(const std::string& text, uint64_t* value) {
-	if (text.empty() || text.size() > 16) {
+	// Keep accepting the optional 0x/0X prefix that std::stoull(..., 16) used to skip.
+	const bool prefixed =
+	    text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+	const std::string digits = prefixed ? text.substr(2) : text;
+	if (digits.empty() || digits.size() > 16) {
 		return false;
 	}
 
 	uint64_t result = 0;
-	for (const char c: text) {
+	for (const char c: digits) {
 		const auto digit = HexDigit(c);
 		if (digit < 0) {
 			return false;
