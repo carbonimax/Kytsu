@@ -274,6 +274,12 @@ static int KYTY_SYSV_ABI SystemServiceDisableMediaPlay() {
 	return OK;
 }
 
+static int KYTY_SYSV_ABI SystemServiceReenableMediaPlay() {
+	PRINT_NAME();
+
+	return OK;
+}
+
 static int KYTY_SYSV_ABI SystemServiceReportAbnormalTermination(const void* info) {
 	PRINT_NAME();
 
@@ -606,6 +612,7 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("x1UB9bwDSOw", SystemService::SystemServiceDisableMusicPlayer);
 	LIB_FUNC("9kPCz7Or+1Y", SystemService::sceSystemServiceReenableMusicPlayer);
 	LIB_FUNC("64nkF7LGk8w", SystemService::SystemServiceDisableMediaPlay);
+	LIB_FUNC("uInYhy7xa+U", SystemService::SystemServiceReenableMediaPlay);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
 	LIB_FUNC("m5CYKX20wfg", SystemService::SystemServiceInitializePlayerDialogParam);
 	LIB_FUNC("uaieF+glFPs", SystemService::SystemServiceLaunchPlayerDialog);
