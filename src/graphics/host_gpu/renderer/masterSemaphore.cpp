@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
+#include <cinttypes>
 #include <cstdio>
 
 namespace Libs::Graphics {
@@ -51,7 +52,10 @@ void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
-		ReportSemaphoreFailure("Refresh", result, counter);
+		// Vulkan does not guarantee *counter was written on failure, so it may still read 0 here
+		// even when the GPU was well past tick 0. Report the last tick we actually confirmed
+		// instead of the possibly-stale/garbage output parameter.
+		ReportSemaphoreFailure("Refresh", result, m_gpu_tick.load(std::memory_order_acquire));
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
