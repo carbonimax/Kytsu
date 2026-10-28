@@ -110,8 +110,10 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 
 struct PageManager::Impl {
 	struct PageState {
-		uint8_t write_watchers  = 0;
-		uint8_t access_watchers = 0;
+		// Many small textures can share one guest page; a byte-sized counter overflows
+		// once more than 255 images are registered in the same page.
+		uint16_t write_watchers  = 0;
+		uint8_t  access_watchers = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -142,7 +144,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == UINT8_MAX) {
+					if (write_watchers == UINT16_MAX) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -157,7 +159,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 2);
+	static_assert(sizeof(PageState) == 4);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
