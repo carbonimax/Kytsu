@@ -790,6 +790,7 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+	const bool meta_compress = block_bytes == 0 && !resource.r128 && descriptor.MetaCompress();
 	auto& desc = out.desc;
 	desc       = {};
 	desc.info.data         = {address, 0};
@@ -802,12 +803,12 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
-		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
+		                           meta_compress, view_levels,
 		                           view_base)) {
 			// The layout stores no mip past MAX_MIP here, so a view starting in the chain ends at
 			// MAX_MIP; dynamic-mip shaders still count mips up to LAST_LEVEL.
@@ -837,7 +838,7 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
 		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
