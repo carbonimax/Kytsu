@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -464,7 +465,13 @@ bool IsOpenDescriptor(int d) {
 	return file != nullptr && file->opened;
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+bool IsUnrealCommandLinePath(const std::string& guest_path) {
+	std::string lower(guest_path.size(), '\0');
+	std::ranges::transform(guest_path, lower.begin(),
+	                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return lower == "/app0/ue4commandline.txt" || lower == "/app0/uecommandline.txt";
+}
+
 std::string AppendUnrealScreenPercentage(std::string command_line, uint32_t percentage) {
 	while (!command_line.empty() && (command_line.back() == '\n' || command_line.back() == '\r' ||
 	                                 command_line.back() == '\0')) {
@@ -475,37 +482,36 @@ std::string AppendUnrealScreenPercentage(std::string command_line, uint32_t perc
 	return command_line + " -ini:Engine:[SystemSettings]:" + option + " -dpcvars=" + option;
 }
 
-// With --unreal-screen-percentage, an Unreal Engine game reads a host copy of its command line
-// that sets r.ScreenPercentage: the engine renders its scene at that share of its output and
-// upscales it, as its own settings would. The game's files are not touched.
-static std::filesystem::path UnrealCommandLineCopy(const std::string&           guest_path,
-                                                   const std::filesystem::path& real_name) {
-	const auto percentage = Config::UnrealScreenPercentage();
-	if (percentage == 0 || !guest_path.starts_with("/app0/") ||
-	    !guest_path.ends_with("commandline.txt")) {
-		return {};
+// With --unreal-screen-percentage, what an Unreal Engine game reads from its command line file: the
+// file's text with r.ScreenPercentage appended (KernelOpen serves it through a host temp copy), so
+// that the engine renders its scene at that share of its output and upscales it, as its own
+// settings would. Nothing when the option is off, the path is another file, or the file can't be
+// read whole.
+static std::optional<std::string> UnrealCommandLine(const std::string&           guest_path,
+                                                    const std::filesystem::path& real_name) {
+	constexpr uint64_t MaxSize    = 64 * 1024;
+	const auto         percentage = Config::UnrealScreenPercentage();
+	if (percentage == 0 || !IsUnrealCommandLinePath(guest_path)) {
+		return std::nullopt;
 	}
-	std::string  content;
 	Common::File original;
-	if (original.Open(real_name, Common::File::Mode::Read)) {
-		content.resize(original.Size());
-		original.Read(content.data(), static_cast<uint32_t>(content.size()));
-		original.Close();
+	if (!original.Open(real_name, Common::File::Mode::Read)) {
+		return std::nullopt;
 	}
-	content = AppendUnrealScreenPercentage(std::move(content), percentage);
-	const auto copy_path =
-	    std::filesystem::temp_directory_path() /
-	    ("kyty-" + std::to_string(percentage) + "-" + Common::PathToString(real_name.filename()));
-	Common::File copy;
-	if (!copy.Create(copy_path)) {
-		return {};
+	const auto size = original.Size();
+	if (size > MaxSize) {
+		return std::nullopt;
 	}
-	copy.Write(content.data(), static_cast<uint32_t>(content.size()));
-	copy.Close();
-	LOGF("\t Unreal command line: %s\n", content.c_str());
-	return copy_path;
+	std::string content(size, '\0');
+	uint32_t    bytes_read = 0;
+	original.Read(content.data(), static_cast<uint32_t>(size), &bytes_read);
+	if (bytes_read != size) {
+		return std::nullopt;
+	}
+	return AppendUnrealScreenPercentage(std::move(content), percentage);
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
@@ -576,11 +582,6 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
 	}
-	if (rw_mode == Common::File::Mode::Read && !directory) {
-		if (auto copy = UnrealCommandLineCopy(file->name, file->real_name); !copy.empty()) {
-			file->real_name = std::move(copy);
-		}
-	}
 	if (Common::IsArchivePath(file->real_name) &&
 	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {
 		g_files->DeleteDescriptor(descriptor);
@@ -637,6 +638,27 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
+		} else if (auto served = rw_mode == Common::File::Mode::Read
+		                             ? UnrealCommandLine(file->name, file->real_name)
+		                             : std::nullopt) {
+			// Common::File has no in-memory mode: serve a host temp copy, one per descriptor.
+			const auto copy_path = std::filesystem::temp_directory_path() /
+			                       ("kyty-" + std::to_string(descriptor) + "-" +
+			                        Common::PathToString(file->real_name.filename()));
+			Common::File copy;
+			if (copy.Create(copy_path)) {
+				copy.Write(served->data(), static_cast<uint32_t>(served->size()));
+				copy.Close();
+				result = file->f.Open(copy_path, rw_mode);
+			}
+			if (!result) {
+				result = file->f.Open(file->real_name, rw_mode);
+			}
+
+			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red,
+			           "\tOpen: %s, served command line: %s, %s\n",
+			           Common::PathToString(file->real_name).c_str(), served->c_str(),
+			           result ? "[ok]" : "[fail]");
 		} else {
 			result = file->f.Open(file->real_name, rw_mode);
 
@@ -1243,7 +1265,14 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		return OK;
 	}
 
-	return StatHostPath(g_mount_points->ResolvePath(path), sb);
+	const auto real_file_name = g_mount_points->ResolvePath(path);
+	const int  result         = StatHostPath(real_file_name, sb);
+	if (result == OK && Config::UnrealScreenPercentage() != 0) {
+		if (const auto served = UnrealCommandLine(path, real_file_name)) {
+			SetStatSize(sb, served->size(), false);
+		}
+	}
+	return result;
 }
 
 int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {
