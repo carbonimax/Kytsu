@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h" // Fork: EopAtGpu front reads (WAIT_REG_MEM)
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/agc.h"
@@ -613,6 +614,13 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
 	GpuCapture::Touch(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
+	// KYTY_CP_PIPELINE_DISPATCH: the compare value and the buffers are front reads.
+	CpPipeline::CheckRead(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
+	CpPipeline::CheckRead(reinterpret_cast<uint64_t>(then_buffer), uint64_t {then_num_dw} * 4u);
+	if (else_buffer != nullptr) {
+		CpPipeline::CheckRead(reinterpret_cast<uint64_t>(else_buffer), uint64_t {else_num_dw} * 4u);
+	}
+
 	if (TestWaitRegMemValue(EopAtGpu::ReadFront64(compare_addr), reference, mask, function)) {
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
@@ -993,6 +1001,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	}
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
+	CpPipeline::CheckRead(reinterpret_cast<uint64_t>(indirect_buffer),
+	                      uint64_t {indirect_num_dw} * sizeof(uint32_t));
 
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 
@@ -1016,6 +1026,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// KYTY_CP_PIPELINE_DISPATCH: register pairs are front reads.
+	CpPipeline::CheckRead(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -1088,6 +1100,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
+	// KYTY_CP_PIPELINE_DISPATCH: register pairs are front reads.
+	CpPipeline::CheckRead(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -1140,6 +1154,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// KYTY_CP_PIPELINE_DISPATCH: register pairs are front reads.
+	CpPipeline::CheckRead(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);

@@ -1226,6 +1226,7 @@ static bool IsPipelinedPacket(uint32_t opcode, uint32_t custom) {
 		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
 		case Pm4::IT_SET_SH_REG_INDIRECT:
 		case Pm4::IT_SET_UCONFIG_REG_INDIRECT: return true;
+		case Pm4::IT_DISPATCH_DIRECT: return CpPipeline::DispatchEnabled();
 		default: return false;
 	}
 }
@@ -1601,7 +1602,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
+	m_renderer.GetRenderExecutor().DispatchDirect(DrawBuffer(), thread_group_x, thread_group_y,
 	                                              thread_group_z, mode, IsAsyncComputeQueue());
 }
 
