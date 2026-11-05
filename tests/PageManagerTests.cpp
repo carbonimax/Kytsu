@@ -635,6 +635,34 @@ void TestReadWriteWatcherInteractions() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestSubpageWatchersShareHostPage() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto first = address + page_size / 4;
+  const auto second = address + page_size / 2;
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchers<true>(first, 1);
+  Check(g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == address &&
+            g_protection_ranges[0].size == page_size &&
+            Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size),
+        "subpage watch did not protect exactly its host page");
+  manager.UpdatePageWatchers<true>(second, 1);
+  Check(g_protection_calls == 1,
+        "second subpage watcher changed shared host-page protection");
+  manager.UpdatePageWatchers<false>(first, 1);
+  Check(g_protection_calls == 1 && Protection(memory) == PAGE_READONLY,
+        "first subpage unwatch removed another watcher's protection");
+  manager.UpdatePageWatchers<false>(second, 1);
+  Check(g_protection_calls == 2 && IsWritable(memory) &&
+            IsWritable(memory + page_size),
+        "final subpage unwatch did not restore writes");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestConcurrentSharedWatchers() {
   constexpr size_t worker_count = 8;
   PageManager manager;
@@ -778,6 +806,12 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+  if (argc == 2 && std::strcmp(argv[1], "--host-page-granularity") == 0) {
+    TestSubpageWatchersShareHostPage();
+    std::puts("PageManagerTests: host-page granularity passed");
+    return 0;
+  }
+  TestSubpageWatchersShareHostPage();
   TestWatchAndUnwatch();
   TestWatchAndUnwatch(Libs::LibKernel::Memory::kExtendedMemoryBase);
   TestSharedWatcherCounts();
