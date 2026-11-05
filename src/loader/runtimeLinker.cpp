@@ -382,6 +382,7 @@ struct MainEntryStackTestState {
 
 static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
                                                      atexit_func_t /*atexit_func*/) {
+#if defined(__x86_64__) || defined(_M_X64)
 	auto* state = reinterpret_cast<MainEntryStackTestState*>(const_cast<char*>(params->argv[0]));
 	asm volatile("pushq %%r15\n\t"
 	             "pushq %%r14\n\t"
@@ -399,6 +400,10 @@ static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
 	             : "memory");
 #endif
 	state->called = true;
+#else
+	(void)params;
+	EXIT("x86 host-stack test callback is unavailable on this architecture\n");
+#endif
 }
 
 bool TestMainEntryUsesGuestStack() {
