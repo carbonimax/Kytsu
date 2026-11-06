@@ -689,6 +689,9 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
+add_kyty_full_emulator_test(http2_abort_request_tests
+	"${KYTY_TESTS_DIR}/Http2AbortRequestTests.cpp")
+
 add_executable(rtc_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/RtcTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libRtc.cpp"
@@ -895,6 +898,7 @@ if(BUILD_TESTING)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
+	add_test(NAME http2_abort_request COMMAND $<TARGET_FILE:http2_abort_request_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_mad_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-only)
@@ -1079,6 +1083,7 @@ if(BUILD_TESTING)
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		http2_abort_request_tests
 		rtc_tests
 		psml_tests
 	)
