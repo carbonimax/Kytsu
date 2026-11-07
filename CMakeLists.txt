@@ -483,6 +483,13 @@ if(KYTY_TARGET_X86_64_V3)
 	target_compile_definitions(build_flags_tests PRIVATE KYTY_EXPECT_X86_64_V3)
 endif()
 
+add_executable(texture_track_range_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/TextureTrackRangeTests.cpp")
+target_include_directories(texture_track_range_tests PRIVATE ${inc_headers})
+add_executable(texture_track_range_mutant_no_clamp_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TextureTrackRangeTests.cpp")
+target_include_directories(texture_track_range_mutant_no_clamp_tests PRIVATE ${inc_headers})
+target_compile_definitions(texture_track_range_mutant_no_clamp_tests PRIVATE KYTY_TRACKEDGE_MUTANT_NO_CLAMP=1)
+
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageManagerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
@@ -851,6 +858,10 @@ if(BUILD_TESTING)
 	add_test(NAME refresh_prof COMMAND $<TARGET_FILE:refresh_prof_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME texture_track_range COMMAND $<TARGET_FILE:texture_track_range_tests>)
+	add_test(NAME texture_track_range_mutant_no_clamp
+	         COMMAND $<TARGET_FILE:texture_track_range_mutant_no_clamp_tests>)
+	set_tests_properties(texture_track_range_mutant_no_clamp PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME driver_cache_policy COMMAND $<TARGET_FILE:driver_cache_policy_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
