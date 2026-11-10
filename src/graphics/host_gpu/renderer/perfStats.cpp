@@ -25,6 +25,10 @@ namespace Libs::Graphics::CmdRecord {
 void Report(double seconds); // cmdRecord.h (KYTY_CP_RECORD_THREAD)
 } // namespace Libs::Graphics::CmdRecord
 
+namespace Libs::LibKernel::IoStats {
+void Report(double seconds) noexcept; // kernel/ioStats.h
+} // namespace Libs::LibKernel::IoStats
+
 namespace Libs::Graphics::EopAtGpu {
 void Report(double seconds); // graphicsRun.cpp (KYTY_EOP_AT_GPU)
 } // namespace Libs::Graphics::EopAtGpu
@@ -387,6 +391,7 @@ void MaybeReport() noexcept {
 	LateRead::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
+	LibKernel::IoStats::Report(seconds);
 	std::fflush(stdout);
 }
 
