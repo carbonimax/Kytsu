@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/ioStats.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -1188,6 +1189,7 @@ struct Submission {
 	size_t                                   cursor = 0;
 	void*                                    result = nullptr;
 	uint32_t                                 id     = 0;
+	std::chrono::steady_clock::time_point    submitted {}; // KYTY_PERF_STATS: APR queue wait
 };
 
 static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
@@ -1260,6 +1262,12 @@ private:
 			lock.unlock();
 			int      result       = OK;
 			uint32_t error_offset = 0;
+			if (submission.cursor == 0 && LibKernel::IoStats::Enabled()) {
+				LibKernel::IoStats::NoteAprQueueWait(static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+				                                                         submission.submitted)
+				        .count()));
+			}
 			if (submission.cursor < submission.commands.size()) {
 				const auto& command = submission.commands[submission.cursor++];
 				result              = ExecuteCommand(command);
@@ -1319,7 +1327,9 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	static CommandEngine apr_engine(7);
 	static CommandEngine amm_engine(3);
 	(amm ? amm_engine : apr_engine)
-	    .Submit(priority, {std::move(state.commands), 0, result, id});
+	    .Submit(priority, {std::move(state.commands), 0, result, id,
+	                       LibKernel::IoStats::Enabled() ? std::chrono::steady_clock::now()
+	                                                     : std::chrono::steady_clock::time_point {}});
 	return OK;
 }
 
@@ -1355,10 +1365,17 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	}
 
 	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
-		LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
-		return LibKernel::KERNEL_ERROR_ENOENT;
+	{
+		LibKernel::IoStats::Timer io(LibKernel::IoStats::Api::AprOpen);
+		if (!file.Open(host_path, Common::File::Mode::Read)) {
+			LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
+			return LibKernel::KERNEL_ERROR_ENOENT;
+		}
 	}
+	if (LibKernel::IoStats::Enabled()) {
+		LibKernel::IoStats::NoteOpenedPath(LibKernel::IoStats::Api::AprOpen, std::filesystem::hash_value(host_path));
+	}
+	LibKernel::IoStats::Timer io(LibKernel::IoStats::Api::Apr);
 	const auto file_size = file.Size();
 	if (file_offset >= file_size) {
 		file.Close();
@@ -1393,6 +1410,7 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	}
 
 	file.Close();
+	io.Done(*bytes_read);
 	return OK;
 }
 
