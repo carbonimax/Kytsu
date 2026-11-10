@@ -18,7 +18,7 @@ namespace Libs::LibKernel::IoStats {
 namespace {
 
 constexpr auto ApiCount = static_cast<size_t>(Api::Count);
-constexpr std::array<const char*, ApiCount> ApiNames = {"read", "pread", "preadv", "aio", "apr", "open", "apr_open", "close"};
+constexpr std::array<const char*, ApiCount> ApiNames = {"read", "pread", "preadv", "aio", "apr", "apr_copy", "open", "apr_open", "close"};
 
 struct Slot {
 	uint64_t                                  calls  = 0;
@@ -77,6 +77,10 @@ void Note(Api api, uint64_t bytes, uint64_t ns) noexcept {
 	}
 	if (t_override != Api::Count && IsRead(api)) {
 		api = t_override;
+	}
+	if (Graphics::PerfStats::CompileLogEnabled()) {
+		Graphics::PerfStats::CompileLogLine("I %" PRIu64 " %s %" PRIu64 " %" PRIu64, Graphics::PerfStats::SteadyUs(),
+		                                    ApiNames[static_cast<size_t>(api)], bytes, ns);
 	}
 	const auto& name  = ThreadName();
 	auto&       state = Get();
