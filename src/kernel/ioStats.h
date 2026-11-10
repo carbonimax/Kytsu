@@ -8,10 +8,12 @@
 // Guest file I/O counters (measurement, KYTY_PERF_STATS=1, default off: nothing is timed), reported as
 // one "PERF io" line with the "PERF stats" lines: per API calls, bytes, wall time, longest call and the
 // thread that spent the most time in it; opens of a path already opened before; file mutex waits;
-// APR queue waits (submission to its first command) and a read size histogram.
+// APR queue waits (submission to its first command, unless that command is a guest wait) and a read size
+// histogram. With KYTY_COMPILE_LOG, one "I time api bytes ns" line per call (same clock as its other lines).
 namespace Libs::LibKernel::IoStats {
 
-enum class Api : uint32_t { Read, Pread, Preadv, Aio, Apr, Open, AprOpen, Close, Count };
+// AprCopy: the memcpy from the APR bounce buffer into guest memory (part of Apr).
+enum class Api : uint32_t { Read, Pread, Preadv, Aio, Apr, AprCopy, Open, AprOpen, Close, Count };
 
 [[nodiscard]] bool Enabled() noexcept;
 void               Note(Api api, uint64_t bytes, uint64_t ns) noexcept;

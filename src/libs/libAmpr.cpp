@@ -1262,7 +1262,9 @@ private:
 			lock.unlock();
 			int      result       = OK;
 			uint32_t error_offset = 0;
-			if (submission.cursor == 0 && LibKernel::IoStats::Enabled()) {
+			if (submission.cursor == 0 && LibKernel::IoStats::Enabled() &&
+			    (submission.commands.empty() ||
+			     !std::holds_alternative<CommandBufferState::WaitCommand>(submission.commands[0].data))) {
 				LibKernel::IoStats::NoteAprQueueWait(static_cast<uint64_t>(
 				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
 				                                                         submission.submitted)
@@ -1397,6 +1399,8 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	if (buffer.size() < buffer_size) {
 		buffer.resize(buffer_size);
 	}
+	const bool timed   = LibKernel::IoStats::Enabled();
+	uint64_t   copy_ns = 0;
 	while (*bytes_read < readable) {
 		const auto request =
 		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
@@ -1405,12 +1409,21 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		if (read == 0) {
 			break;
 		}
+		const auto copy_start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
+		if (timed) {
+			copy_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                     std::chrono::steady_clock::now() - copy_start)
+			                                     .count());
+		}
 		*bytes_read += read;
 	}
 
 	file.Close();
 	io.Done(*bytes_read);
+	if (timed) {
+		LibKernel::IoStats::Note(LibKernel::IoStats::Api::AprCopy, *bytes_read, copy_ns);
+	}
 	return OK;
 }
 
