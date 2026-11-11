@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <limits>
 #include <span>
 #include <vector>
@@ -561,7 +562,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
 	NoteCreationFeedback(result, creation_feedback, true);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("graphics pipeline creation failed: result=%s (%d) stages=0x%016" PRIx64 ",0x%016" PRIx64
+		     ",0x%016" PRIx64 " ps=0x%016" PRIx64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int32_t>(result), vertex_stages[0]->program.shader_hash,
+		     vertex_stages.size() == 3 ? vertex_stages[1]->program.shader_hash : uint64_t {0},
+		     vertex_stages.size() == 3 ? vertex_stages[2]->program.shader_hash : uint64_t {0},
+		     pixel != nullptr ? pixel->program.shader_hash : uint64_t {0});
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 
@@ -617,7 +625,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	NoteCreationFeedback(result, creation_feedback, false);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("compute pipeline creation failed: result=%s (%d) module=0x%016" PRIx64 " shader=0x%016" PRIx64
+		     " wave=%u gds=%u image_heap=%u push_descriptors=%u\n",
+		     vk::to_string(result).c_str(), static_cast<int32_t>(result), compute.handle.id,
+		     compute.program.shader_hash, wave_size, compute.program.info.uses_gds ? 1u : 0u,
+		     compute.program.info.uses_image_heap ? 1u : 0u, pipeline.uses_push_descriptors ? 1u : 0u);
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }
