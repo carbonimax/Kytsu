@@ -4731,13 +4731,16 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				if (memory.kind == (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+				// A write first takes the one bound buffer its V# Phi web carries; only without one
+				// does a GPU-selected atomic go through BDA like the indirect loads.
+				source = buffer != BufferAccess::Read ? CarriedBufferSource(*handle) : UINT32_MAX;
+				if (source == UINT32_MAX &&
+				    memory.kind == (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                       : ResourceKind::Buffer) &&
 				    memory.SupportsIndirectBufferLoad(op)) {
 					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 					return;
 				}
-				source = buffer != BufferAccess::Read ? CarriedBufferSource(*handle) : UINT32_MAX;
 				if (source == UINT32_MAX) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
