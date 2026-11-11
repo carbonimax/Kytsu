@@ -8,12 +8,13 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
+constexpr uint32_t DescriptorHeapCount = 1024;
+// Sized for layouts with large texture arrays: a set must fit in a fresh pool.
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 32768},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 8192},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 8192},
 };
 
 } // namespace
