@@ -741,6 +741,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    graphics.attachment_feedback_loop_enabled && feedback_dynamic_extension &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState == VK_TRUE;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	graphics.ray_query_enabled    = ray_query_enabled;
 	graphics.r8_srgb_views   = graphics.SamplesFiltered(vk::Format::eR8Srgb);
 	graphics.r8g8_srgb_views = graphics.SamplesFiltered(vk::Format::eR8G8Srgb);
 	constexpr auto blended_target = vk::FormatFeatureFlagBits::eColorAttachment |
