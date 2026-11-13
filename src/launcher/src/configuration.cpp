@@ -47,6 +47,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(recommended_options);
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(relaxed_shader_float);
+	KYTY_CFG_SET(native_rt);
 	KYTY_CFG_SET(shader_cache_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
@@ -120,6 +121,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(recommended_options);
 	KYTY_CFG_GET(occlusion_queries_enabled);
 	KYTY_CFG_GET(relaxed_shader_float);
+	KYTY_CFG_GET(native_rt);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
 	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
