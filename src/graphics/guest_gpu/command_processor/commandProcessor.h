@@ -71,6 +71,7 @@ public:
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
 	void Reset();
+	void ResetQueue(uint32_t op);
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
