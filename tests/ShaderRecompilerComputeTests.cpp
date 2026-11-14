@@ -245,17 +245,36 @@ struct BufferCacheTestAccess {
 };
 
 // Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
-// barriers whose only destination stage is indirect argument reads.
+// barriers whose only destination stage is indirect argument reads, and keeps the last vertex
+// buffer bindings.
 struct RecordedCommandCounter {
+  struct VertexBuffers {
+    std::vector<VkBuffer> buffers;
+    std::vector<VkDeviceSize> offsets;
+    std::vector<VkDeviceSize> sizes;
+  };
   static inline uint32_t barriers = 0;
   static inline uint32_t indirect_barriers = 0;
   static inline uint32_t copies = 0;
+  static inline VertexBuffers vertex_buffers;
   static inline PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
   static inline PFN_vkCmdCopyBuffer copy_buffer = nullptr;
+  static inline PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers = nullptr;
 
   RecordedCommandCounter() {
     auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
     barriers = indirect_barriers = copies = 0;
+    vertex_buffers = {};
+    bind_vertex_buffers = std::exchange(
+        dispatcher.vkCmdBindVertexBuffers2,
+        [](VkCommandBuffer command, uint32_t first, uint32_t count, const VkBuffer *buffers,
+           const VkDeviceSize *offsets, const VkDeviceSize *sizes,
+           const VkDeviceSize *strides) {
+          vertex_buffers = {{buffers, buffers + count},
+                            {offsets, offsets + count},
+                            {sizes, sizes + count}};
+          bind_vertex_buffers(command, first, count, buffers, offsets, sizes, strides);
+        });
     pipeline_barrier = std::exchange(dispatcher.vkCmdPipelineBarrier, [](auto... args) {
       ++barriers;
       indirect_barriers += std::get<2>(std::tie(args...)) == VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
@@ -269,6 +288,7 @@ struct RecordedCommandCounter {
   ~RecordedCommandCounter() {
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier = pipeline_barrier;
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyBuffer = copy_buffer;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBindVertexBuffers2 = bind_vertex_buffers;
   }
 };
 
