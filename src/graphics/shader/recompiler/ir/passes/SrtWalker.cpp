@@ -857,7 +857,7 @@ void WalkerCompiler::Layout() {
 		if (Thunk(index)) m_nodes[index].state = offset++;
 	}
 	if (g_count) {
-		// Zeroed with the states: an address slot stays 0 unless its load ran in the last pass.
+		// Zeroed with the states: an address slot stays 0 unless its load ran in the last pass (EmitRead).
 		offset = (offset + 7u) & ~7u;
 		m_fill = offset;
 		offset += 32u;
@@ -1140,7 +1140,11 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
-		if (g_count) c.mov(c.qword[c.rdx + node.address], c.r10);
+		if (g_count) {
+			// Bit 63 marks a load that ran, address 0 included (guest addresses fit in 48 bits).
+			c.mov(c.qword[c.rdx + node.address], c.r10);
+			c.bts(c.qword[c.rdx + node.address], 63);
+		}
 		if (WalkReuseMode() != 0) {
 			// The loaded value too, for KYTY_SRT_WALK_REUSE (validation of a later walk).
 			c.mov(c.qword[c.r8 + 8], c.rax);
@@ -1532,9 +1536,16 @@ void WalkerCompiler::Classify(const std::vector<Operand>& conditions, const std:
 		++dead;
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
-			std::printf("SRT walk dead load: shader=%016llx stage=%u pc=0x%x\n",
+			// The byte offset from its base when constant (pc is not kept by stored plans).
+			const auto& node   = m_nodes[index];
+			const auto  at     = node.inst->GetOpcode() == ValueOpcode::LoadBufferU32 ? 3u : 2u;
+			const auto  offset = at < node.args.size() && node.args[at].kind == Kind::Constant
+			    ? static_cast<long long>(node.args[at].value) +
+			          static_cast<int32_t>(m_plan.memory_info[node.inst->Flags<MemoryFlags>().index].offset)
+			    : -1ll;
+			std::printf("SRT walk dead load: shader=%016llx stage=%u pc=0x%x offset=%lld\n",
 			            static_cast<unsigned long long>(m_plan.shader_hash), static_cast<unsigned>(m_plan.stage),
-			            m_nodes[index].inst->Flags<MemoryFlags>().pc);
+			            node.inst->Flags<MemoryFlags>().pc, offset);
 			std::fflush(stdout);
 		}
 	}
@@ -1860,6 +1871,7 @@ void CountWalk(const ResourcePlan& plan, const uint64_t* captures, const uint64_
 		uint64_t address = 0;
 		std::memcpy(&address, bytes + (entry >> 2u), sizeof(address));
 		if (address == 0u) continue;
+		address &= ~(uint64_t {1} << 63u);
 		const auto kind = entry & 3u;
 		++totals.loads[kind];
 		if (kind == 2u) {

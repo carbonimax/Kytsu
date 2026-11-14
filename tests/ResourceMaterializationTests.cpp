@@ -2040,7 +2040,7 @@ void TestDeadLoadCounted(bool pinned) {
       if ((entry_word & 3u) != 2u) continue;
       uint64_t address = 0;
       std::memcpy(&address, reinterpret_cast<const uint8_t *>(plan.srt_scratch.data()) + (entry_word >> 2u), 8u);
-      Check(address == 0x101cu, "dead load did not run or recorded another address");
+      Check(address == (0x101cu | uint64_t{1} << 63u), "dead load did not run or recorded another address");
     }
   }
   Check(flats[0] == std::vector<uint32_t>{0x5678u} && flats[2] == flats[0],
@@ -2053,6 +2053,8 @@ int main(int argc, char **argv) {
   if (argc > 1 && std::string_view(argv[1]) == "--walk-count") {
     // KYTY_SRT_PROF=2 KYTY_PERF_STATS=1: these first, then every case below with counting walkers.
     for (const bool pinned : {true, false}) TestDeadLoadCounted(pinned);
+    // Their counts alone: every load address is nonzero, so captured equals the sum of loads.
+    Libs::Graphics::ShaderRecompiler::IR::ReportWalkCounts(5.0, {});
   }
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
