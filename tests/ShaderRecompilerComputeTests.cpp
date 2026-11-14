@@ -59356,11 +59356,12 @@ void CheckWaitUntilSafeForRendering() {
   auto &gpu = renderer.GetGpu();
 
   constexpr int user_system = 255;
-  constexpr int bus_main = 0;
+  // The headset port flips buffers that are not registered; a wait for a blank or black buffer
+  // waits for nothing, so the wait names buffer 0.
+  constexpr int bus_headset = 32;
   constexpr int flip_mode_vsync = 1;
-  // Special buffer indices flip without a registered surface.
-  constexpr int index_black = -2;
-  const int handle = VideoOut::VideoOutOpen(user_system, bus_main, 0, nullptr);
+  constexpr int index_shown = 0;
+  const int handle = VideoOut::VideoOutOpen(user_system, bus_headset, 0, nullptr);
   Require(name, "open", handle > 0, "video-out open failed");
   const auto wait_until = [](const auto &done) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -59371,7 +59372,7 @@ void CheckWaitUntilSafeForRendering() {
   };
   const auto address = [](const void *value) { return reinterpret_cast<uint64_t>(value); };
 
-  // Hold the graphics queue so the CPU flip of BLACK, prepared behind it, stays pending.
+  // Hold the graphics queue so the CPU flip of buffer 0, prepared behind it, stays pending.
   std::atomic_uint32_t gate{0};
   std::array<uint32_t, 7> hold{};
   hold[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
@@ -59381,19 +59382,23 @@ void CheckWaitUntilSafeForRendering() {
   hold[4] = 1;
   hold[5] = UINT32_MAX;
   gpu.Submit(hold);
-  Require(name, "flip black",
-          VideoOut::VideoOutSubmitFlip(handle, index_black, flip_mode_vsync, 0) == 0,
+  Require(name, "flip buffer 0",
+          VideoOut::VideoOutSubmitFlip(handle, index_shown, flip_mode_vsync, 0) == 0,
           "CPU flip failed");
 
   std::atomic_uint32_t rendered{0};
-  std::array<uint32_t, 12> render{};
-  render[0] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE);
-  render[1] = static_cast<uint32_t>(handle);
-  render[2] = static_cast<uint32_t>(index_black);
-  render[7] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
-  render[9] = static_cast<uint32_t>(address(&rendered));
-  render[10] = static_cast<uint32_t>(address(&rendered) >> 32u);
-  render[11] = 1;
+  std::array<uint32_t, Pm4::WAIT_FLIP_DONE_PACKET_DW + 5> render{};
+  CommandBufferLayout dcb{render.data(), render.data() + render.size(), render.data(),
+                          render.data() + render.size(), nullptr, nullptr, 0};
+  Require(name, "wait packet",
+          Gen5::AgcDcbWaitUntilSafeForRendering(reinterpret_cast<Gen5::CommandBuffer *>(&dcb),
+                                                handle, index_shown) == render.data(),
+          "the wait packet was not emitted");
+  auto *write = render.data() + Pm4::WAIT_FLIP_DONE_PACKET_DW;
+  write[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  write[2] = static_cast<uint32_t>(address(&rendered));
+  write[3] = static_cast<uint32_t>(address(&rendered) >> 32u);
+  write[4] = 1;
   gpu.SubmitCompute(0x20, render);
 
   std::binary_semaphore lane{0};
@@ -59408,7 +59413,7 @@ void CheckWaitUntilSafeForRendering() {
 
   gate.store(1);
   Require(name, "flip shown", wait_until([handle] { return VideoOut::VideoOutIsFlipPending(handle) == 0; }),
-          "the BLACK flip was not presented");
+          "the flip of buffer 0 was not presented");
   // The buffer stays on screen (no later flip), yet it is safe once its flip is presented.
   Require(name, "resume", wait_until([&] { return rendered.load() == 1; }),
           "rendering did not resume once its display buffer's flip was presented");
@@ -59420,7 +59425,10 @@ void CheckWaitUntilSafeForRendering() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// R_FLIP itself publishes the dumped occlusion counters, then flips.
+// A flip block copies GPU-written storage images back, publishes the dumped
+// occlusion counters, then flips; a wait for a shown buffer names it by its
+// label and returns once its flip is presented, and a blank one waits for
+// nothing.
 void CheckPm4Flip() {
   namespace EventQueue = LibKernel::EventQueue;
   constexpr const char *name = "Pm4Flip";
@@ -59451,9 +59459,24 @@ void CheckPm4Flip() {
               VideoOut::VideoOutAddFlipEvent(flips, handle, &udata) == 0,
           "video-out or flip event registration failed");
 
+  // A GPU-written storage image the flip's GL2 writeback copies back.
+  constexpr uint64_t image_size = 0x10000;
+  int64_t image_offset = -1;
+  void *image_memory = nullptr;
+  Require(name, "image memory",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), image_size,
+              image_size, 0, &image_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(
+                  &image_memory, image_size, 0x3, 0, image_offset,
+                  image_size) == 0,
+          "the storage image mapping failed");
+  const auto image_base = reinterpret_cast<uint64_t>(image_memory);
+  renderer.MapMemory(image_base, image_size);
+
   alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results{};
-  constexpr int64_t flip_arg = 0x777;
-  std::array<uint32_t, 14> commands{};
+  constexpr int64_t flip_arg = 0x123456789ll;
+  std::array<uint32_t, 8 + 64 + 32 + 32> commands{};
   const auto dump = [&](size_t at, const uint64_t *counter) {
     const auto address = reinterpret_cast<uint64_t>(counter);
     commands[at] = KYTY_PM4(4, Pm4::IT_EVENT_WRITE, Pm4::R_ZERO);
@@ -59461,17 +59484,76 @@ void CheckPm4Flip() {
     commands[at + 2] = static_cast<uint32_t>(address);
     commands[at + 3] = static_cast<uint32_t>(address >> 32u);
   };
-  // Begin and end z-pass dumps, then a vsync flip of the blank buffer.
+  // Begin and end z-pass dumps, a vsync flip of the blank buffer, then waits
+  // for buffer 0 and for the blank buffer.
   dump(0, &results[0]);
   dump(4, &results[1]);
-  commands[8] = KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP);
-  commands[9] = static_cast<uint32_t>(handle);
-  commands[10] = static_cast<uint32_t>(-1);
-  commands[11] = 1;
-  commands[12] = flip_arg;
+  auto *begin = commands.data() + 8;
+  auto *end = commands.data() + commands.size();
+  CommandBufferLayout dcb{begin, end, begin, end, nullptr, nullptr, 0};
+  auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&dcb);
+  int bus = -1;
+  const auto label = reinterpret_cast<uint64_t>(
+      VideoOut::VideoOutGetBufferLabels(handle, &bus));
+  const bool emitted =
+      Gen5::AgcDcbSetFlip(buffer, handle, 16, 1, 0) == nullptr &&
+      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, -3) == nullptr &&
+      Gen5::AgcDcbSetFlip(buffer, handle, -1, 1, flip_arg) == begin &&
+      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, 0) == begin + 64 &&
+      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, -1) ==
+          begin + 96 &&
+      dcb.cursor_up == end;
+  const std::array<uint32_t, 19> flip{
+      0xc0027904u, 0x342u,      0xc70101ffu, 0,           0xc0043704u,
+      0x06010000u, 0xc343u,     0,           0x23456789u, 0x1u,
+      0xc0064900u, 0x06200504u, 0x02010000u, 0,           0,
+      0,           0,           static_cast<uint32_t>(handle), 0xc02c1000u};
+  const std::array<uint32_t, 16> wait{0xc0017904u,
+                                      0x342u,
+                                      0xcb000000u,
+                                      0xc0079300u,
+                                      0x06000113u,
+                                      static_cast<uint32_t>(label),
+                                      static_cast<uint32_t>(label >> 32u),
+                                      0,
+                                      0,
+                                      0xffffffffu,
+                                      0xffffffffu,
+                                      0x40u,
+                                      0xc0017904u,
+                                      0x342u,
+                                      0xcb000020u,
+                                      0xc00f1000u};
+  const auto *blank = begin + 96;
+  Require(name, "native packets",
+          emitted && std::equal(flip.begin(), flip.end(), begin) &&
+              std::equal(wait.begin(), wait.end(), begin + 64) &&
+              blank[2] == 0xcb00001fu && blank[3] == 0xc0071000u &&
+              blank[14] == 0xcb00003fu,
+          "the flip or wait packets are not the native ones");
   bool complete = false;
   bool published = true;
+  bool queued = false;
+  bool copied = false;
   gpu.SendCommandSync([&] {
+    auto &texture_cache = renderer.GetTextureCache();
+    TextureCacheTestAccess::SetStorageReadback(texture_cache, true);
+    auto desc = VulkanHarness::MakeLinearDesc(
+        image_base, 0, vk::Format::eR32G32B32A32Sfloat,
+        Prospero::BufferFormat::k32_32_32_32Float,
+        Prospero::ImageType::kColor2D, {8, 8, 1}, 1, 16, 1);
+    desc.type = TextureCache::BindingType::Storage;
+    desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+    desc.info.pitch = 0;
+    desc.info.UpdateSize();
+    desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+    const auto image = texture_cache.FindImage(desc);
+    (void)texture_cache.FindTexture(image, desc);
+    TextureCacheTestAccess::ClearImage(
+        texture_cache, renderer.GetCommandScheduler().Current(), image,
+        {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        vk::ClearValue{vk::ClearColorValue{std::array<float, 4>{1.0f}}});
+    queued = TextureCacheTestAccess::PendingDownload(texture_cache, image);
     CommandProcessor processor(renderer, 0);
     processor.BufferInit();
     Pm4Execution execution;
@@ -59480,8 +59562,11 @@ void CheckPm4Flip() {
     for (const auto counter : results) {
       published &= (counter & OCCLUSION_QUERY_READY) != 0;
     }
+    copied = !TextureCacheTestAccess::PendingDownload(texture_cache, image);
     processor.BufferFlush();
   });
+  Require(name, "GL2 writeback", queued && copied,
+          "the flip did not copy a GPU-written storage image back");
 
   // A present stalled on the graphics queue leaves the port readable.
   std::binary_semaphore queried{0};
@@ -59509,7 +59594,7 @@ void CheckPm4Flip() {
               count == 1 &&
               VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
               flipped_arg == flip_arg,
-          "R_FLIP did not publish the occlusion counters or flip");
+          "the flip block did not publish the occlusion counters or flip");
   // The flip status reports the completed flip and nothing pending.
   std::array<uint64_t, 16> flip_status{};
   Require(name, "flip status",
@@ -59531,6 +59616,61 @@ void CheckPm4Flip() {
           EventQueue::KernelWaitEqueue(flips, &event, 1, &count, &timeout) == 0 &&
               VideoOut::VideoOutGetEventCount(&event) >= 2,
           "undelivered vblanks were queued as separate events");
+
+  // A shown buffer's flip and wait, on the headset port, which flips buffers
+  // that are not registered.
+  const int headset = VideoOut::VideoOutOpen(255, 32, 0, nullptr);
+  std::array<uint32_t, 64 + 32> shown{};
+  CommandBufferLayout shown_dcb{shown.data(), shown.data() + shown.size(),
+                                shown.data(), shown.data() + shown.size(),
+                                nullptr,      nullptr,
+                                0};
+  auto *shown_buffer = reinterpret_cast<Gen5::CommandBuffer *>(&shown_dcb);
+  const auto headset_label = reinterpret_cast<uint64_t>(
+      VideoOut::VideoOutGetBufferLabels(headset, &bus));
+  Require(name, "shown flip packet",
+          Gen5::AgcDcbSetFlip(shown_buffer, headset, 0, 1, 0) ==
+                  shown.data() &&
+              Gen5::AgcDcbWaitUntilSafeForRendering(shown_buffer, headset, 0) ==
+                  shown.data() + 64 &&
+              shown[2] == 0xc7010107u && shown[3] == 32u &&
+              shown[12] == 0x42010000u &&
+              shown[13] == static_cast<uint32_t>(headset_label) &&
+              shown[14] == static_cast<uint32_t>(headset_label >> 32u) &&
+              shown[15] == 1u,
+          "the flip packet of a shown buffer is not the native one");
+  // Fork: the wait suspends only this command processor (Blocked) while the
+  // buffer's flip is pending, and the resumed stream completes once it is
+  // presented.
+  std::optional<CommandProcessor> shown_processor;
+  Pm4Execution shown_execution;
+  auto shown_result = Pm4ProcessResult::Blocked;
+  int shown_pending = -1;
+  gpu.SendCommandSync([&] {
+    shown_processor.emplace(renderer, 0);
+    shown_processor->BufferInit();
+    shown_result = shown_processor->Process(shown_execution, shown);
+    shown_pending = VideoOut::VideoOutIsFlipPending(headset);
+    shown_processor->BufferFlush();
+  });
+  const bool shown_ordered =
+      shown_result != Pm4ProcessResult::Complete || shown_pending == 0;
+  const auto shown_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (VideoOut::VideoOutIsFlipPending(headset) != 0 &&
+         std::chrono::steady_clock::now() < shown_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  gpu.SendCommandSync([&] {
+    if (shown_result != Pm4ProcessResult::Complete) {
+      shown_result = shown_processor->Process(shown_execution, shown);
+    }
+    shown_processor->BufferFlush();
+    shown_processor.reset();
+  });
+  Require(name, "wait for a shown buffer",
+          shown_ordered && shown_result == Pm4ProcessResult::Complete,
+          "the wait returned before its buffer's flip was presented");
 
   gpu.WaitForIdle();
   // Each pre-vblank event carries the port's pre-vblank count.
@@ -59570,7 +59710,9 @@ void CheckPm4Flip() {
               VideoOut::VideoOutAllowOutputResolutionWqhdDetection(5) ==
                   invalid,
           "open-port handle checks failed");
-  Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
+  Require(name, "close",
+          VideoOut::VideoOutClose(headset) == 0 &&
+              VideoOut::VideoOutClose(handle) == 0,
           "video-out close failed");
   Require(name, "closed port",
           VideoOut::VideoOutClose(handle) == invalid &&
