@@ -1230,6 +1230,17 @@ static bool IsPipelinedPacket(uint32_t opcode, uint32_t custom) {
 	}
 }
 
+// A flip or flip-done wait block opens with a SET_UCONFIG_REG of its tag, a pipelined packet, but it
+// drains and is a sync point like any flip: labels, EOP and flips keep their point in the stream.
+static bool IsFlipBlock(uint32_t opcode, const uint32_t* packet, uint32_t remaining_dw) {
+	if (opcode != Pm4::IT_SET_UCONFIG_REG || KYTY_PM4_R(packet[0]) != 1u || remaining_dw < 3 ||
+	    packet[1] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+		return false;
+	}
+	const auto tag = packet[2] & 0xff000000u;
+	return tag == Pm4::USERDATA_TAG_FLIP || tag == Pm4::USERDATA_TAG_WAIT_FLIP_DONE;
+}
+
 // KYTY_REPROTECT_BATCH: non-pipelined packets that are guest sync points, i.e. after which the guest
 // may observe command-processor progress or the command processor waits for the guest (labels,
 // memory writes, flips and other custom packets, memory waits). Dispatches, indirect draws and cache
@@ -1313,10 +1324,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
-		CpSplitProf::Packet(opcode, KYTY_PM4_R(packet_header));
-		if (!IsPipelinedPacket(opcode, KYTY_PM4_R(packet_header))) {
+		const bool flip_block = IsFlipBlock(opcode, packet, remaining_dw);
+		if (flip_block) {
+			CpSplitProf::Drain(CpSplitProf::Cause::Flip);
+		} else {
+			CpSplitProf::Packet(opcode, KYTY_PM4_R(packet_header));
+		}
+		if (flip_block || !IsPipelinedPacket(opcode, KYTY_PM4_R(packet_header))) {
 			CpPipeline::Drain();
-			if (reprotect_batch && IsSyncPointPacket(opcode) && g_gpu_state != nullptr) {
+			if (reprotect_batch && (flip_block || IsSyncPointPacket(opcode)) &&
+			    g_gpu_state != nullptr) {
 				g_gpu_state->FlushBatchedUploads();
 			}
 		}
@@ -1632,10 +1649,9 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	m_renderer.GetRenderExecutor().DrawAuto(DrawBuffer(), args);
 }
 
-void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
+void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 	// Stall only this command processor, not the host command lane or other queues.
-	if (m_renderer.HasVideoOut() && !m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
-	                                                 static_cast<int>(display_buffer_index))) {
+	if (m_renderer.HasVideoOut() && !m_renderer.GetVideoOut().IsSafeForRendering(label)) {
 		SuspendPm4();
 	}
 }
