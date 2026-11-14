@@ -512,8 +512,6 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
 	command.pipelineBarrier2(dependency);
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
@@ -626,8 +624,6 @@ void Image::CopyImage(Image& source) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, levels, copies.data());
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
@@ -793,8 +789,6 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 			}
 		}
 	}
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer, Buffer& scratch) {
@@ -825,8 +819,6 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer, Buffer& scratch
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	CopyRegions(source, std::span {copies.data(), copy_count}, scratch, command);
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::CopyRegions(Image& source, std::span<const vk::ImageCopy> regions, Buffer& scratch,
