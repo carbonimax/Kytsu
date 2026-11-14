@@ -852,14 +852,6 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	if (DispatchChainMode() == 2) {
 		DispatchChain::Add(DispatchChain::Counter::Indirect);
 	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
