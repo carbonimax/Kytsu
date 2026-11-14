@@ -856,6 +856,11 @@ if(BUILD_TESTING)
 	set_tests_properties(shader_cfg resource_materialization resource_tracking PROPERTIES
 	                     ENVIRONMENT "KYTY_SRT_WALK_REUSE=0")
 	add_test(NAME srt_walk_reuse COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_WALK_REUSE=1 $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
+	# KYTY_SRT_PROF=2: load classes of a dead-load plan, then every walker case with counting walkers.
+	add_test(NAME srt_walk_count COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_PROF=2 KYTY_PERF_STATS=1 KYTY_SRT_WALK_REUSE=0
+	         $<TARGET_FILE:resource_materialization_tests> --walk-count)
+	add_test(NAME srt_walk_count_reuse COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_PROF=2 KYTY_PERF_STATS=1 KYTY_SRT_WALK_REUSE=1
+	         $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)

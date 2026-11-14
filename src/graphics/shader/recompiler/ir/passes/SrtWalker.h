@@ -114,6 +114,13 @@ void      EnableWalkStats() noexcept;
 [[nodiscard]] bool WalkStatsEnabled() noexcept;
 void      NoteWalkerFaultRead(bool backing) noexcept;
 WalkStats TakeWalkStats() noexcept;
+// KYTY_SRT_PROF=2 (measurement, default off; needs KYTY_PERF_STATS=1): walkers record the address of
+// each guest load and two timestamps around the flat-value fill; each real walk counts its distinct
+// 64 B lines, 4 KiB pages and 2 MiB regions per guest frame, by load class (feeds host objects, only
+// flat values, no result: a load whose every user can never be known at run time). "PERF srtcnt" line.
+[[nodiscard]] bool WalkCountEnabled() noexcept;
+void               NoteWalkFrame() noexcept; // GPU thread, at each guest frame boundary
+void               ReportWalkCounts(double seconds, const WalkStats& walk) noexcept;
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);

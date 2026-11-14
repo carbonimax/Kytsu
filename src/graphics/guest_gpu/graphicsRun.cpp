@@ -23,6 +23,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
@@ -1078,6 +1079,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			PerfStats::Add(PerfStats::Counter::Frames, 1);
+			ShaderRecompiler::IR::NoteWalkFrame();
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(

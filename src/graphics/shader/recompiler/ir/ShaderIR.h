@@ -729,6 +729,10 @@ struct ResourcePlan {
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
 	uint32_t                              srt_restart   = 0; // Scratch byte set when a walk restarted.
+	// KYTY_SRT_PROF=2 (SrtWalker.cpp): per guest load, its address slot in the scratch << 2 | its class
+	// (0 feeds host objects, 1 only flat values, 2 no result); scratch offset of the fill-phase stamps.
+	std::vector<uint32_t>                 srt_count_loads;
+	uint32_t                              srt_count_fill = 0;
 	// GPU-thread scratch for walker results and material keys.
 	mutable std::vector<uint64_t>           srt_scratch;
 	// KYTY_SRT_WALK_REUSE (SrtWalker.cpp): inputs and flat result of the last walk, whose results

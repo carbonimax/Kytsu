@@ -320,7 +320,9 @@ void MaybeReport() noexcept {
 		            n(Counter::SrtFormatSpec), ms(Counter::BindFindImageNs), ms(Counter::BindSamplerNs),
 		            ms(Counter::BindObtainNs), ms(Counter::BindUploadNs), ms(Counter::BindViewNs));
 	}
-	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0 || walk.reuse_checks != 0) {
+	const auto walk = ShaderRecompiler::IR::TakeWalkStats();
+	ShaderRecompiler::IR::ReportWalkCounts(seconds, walk);
+	if (walk.walks != 0 || walk.reuse_checks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64
 		            " fault_reads=%" PRIu64 " protected_calls=%" PRIu64 "(%.0fms,synced=%" PRIu64 ") evictions=%" PRIu64
 		            " reuse=%" PRIu64 "/%" PRIu64 "(%.0fms,diffs=%" PRIu64 ")\n",

@@ -2398,7 +2398,7 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
 	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load (the walker and its scratch), or GPU-thread walk state (KYTY_SRT_WALK_REUSE).
-	       srt_code, srt_user_data, srt_captures, srt_restart, srt_scratch, srt_memo_user_data,
+	       srt_code, srt_user_data, srt_captures, srt_restart, srt_count_loads, srt_count_fill, srt_scratch, srt_memo_user_data,
 	       srt_memo_flat, srt_memo_shader_base, srt_memo_loads, material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,

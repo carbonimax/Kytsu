@@ -8,9 +8,11 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1959,7 +1961,99 @@ void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 } // namespace Common
 
-int main() {
+// KYTY_SRT_PROF=2 (run by the srt_walk_count test): count = c != 0 ? 64 : n, then if (count <= tid)
+// skips the body, which loads a flat value. The entry reaches the Phi's 64 in every walk, so the Phi
+// is known only as 64, the bound is never 0 and the branch is never known: no result depends on n,
+// whatever it holds, though the walk loads it. With the bound n itself, n = 0 skips the body.
+void TestDeadLoadCounted(bool pinned) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 2;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  for (uint32_t i = 0; i < 5; ++i) AddValueBlock(program);
+  auto &entry = *program.blocks[0];
+  auto &count = *program.blocks[1];
+  auto &merge = *program.blocks[2];
+  auto &body = *program.blocks[3];
+  auto &exit = *program.blocks[4];
+  const auto branch = [](Block &block, Block &target, Value condition = {}, Block *other = nullptr) {
+    block.terminator.kind = other ? TerminatorKind::ConditionalBranch : TerminatorKind::Branch;
+    block.terminator.true_block = &target;
+    block.terminator.false_block = other;
+    block.condition = condition;
+    block.AddBranch(&target);
+    if (other) block.AddBranch(other);
+  };
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  const auto table = Value(&entry.AppendNewInst(ValueOpcode::GetAddressResource,
+      {Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))})),
+       Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(1))}))}));
+  const auto load = [&](Block &block, uint32_t offset) -> Inst & {
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32, {table, Value(offset), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0, .pc = offset});
+    return read;
+  };
+  Value bound;
+  if (pinned) {
+    const auto c = Value(&load(entry, 36u));
+    branch(entry, count, Value(&entry.AppendNewInst(ValueOpcode::IEqual32, {c, Value(0u)})), &merge);
+    const auto n = Value(&load(count, 0x1cu));
+    branch(count, merge);
+    auto &p = merge.AppendNewInst(ValueOpcode::Phi);
+    p.SetFlags(Type::U32);
+    p.AddPhiOperand(&entry, Value(64u));
+    p.AddPhiOperand(&count, n);
+    bound = Value(&p);
+  } else {
+    bound = Value(&load(entry, 0x1cu));
+    branch(entry, count);
+    branch(count, merge);
+  }
+  const auto tid = Value(&merge.AppendNewInst(ValueOpcode::LaneId));
+  branch(merge, exit, Value(&merge.AppendNewInst(ValueOpcode::ULessThanEqual32, {bound, tid})), &body);
+  program.srt_reads.push_back({Value(&load(body, 8u)), 0});
+  body.AppendNewInst(ValueOpcode::ReadConst, {Value(&body.AppendNewInst(ValueOpcode::GetSrtResource)), Value(0u)});
+  branch(body, exit);
+  exit.terminator.kind = TerminatorKind::Return;
+  auto plan = Extract(program);
+  CompileSrtWalker(plan);
+  // Classes by load: c feeds a condition (0), the body's load only the flat value (1), n nothing (2).
+  std::vector<uint32_t> classes;
+  for (const auto entry_word : plan.srt_count_loads) classes.push_back(entry_word & 3u);
+  std::ranges::sort(classes);
+  Check(classes == (pinned ? std::vector<uint32_t>{0u, 1u, 2u} : std::vector<uint32_t>{0u, 1u}),
+        "walk count classes: pinned bound load not dead, or direct bound load not live");
+  std::vector<std::vector<uint32_t>> flats;
+  for (uint32_t n : {0x20u, 0u, 64u}) {
+    FakeGuestMemory fake(+[](void *userdata, uint64_t address, std::span<uint32_t> words) {
+          words[0] = address == 0x101cu ? *static_cast<uint32_t *>(userdata) : address == 0x1008u ? 0x5678u : 0u;
+          return true;
+        }, &n);
+    const std::array<uint32_t, 2> user_data{0x1000u, 0u};
+    std::vector<uint32_t> flat;
+    Check(WalkSrt(plan, {.user_data = user_data}, flat, nullptr), "walk count plan did not walk");
+    flats.push_back(flat);
+    // The dead load still runs: its address slot holds what it read from.
+    for (const auto entry_word : plan.srt_count_loads) {
+      if ((entry_word & 3u) != 2u) continue;
+      uint64_t address = 0;
+      std::memcpy(&address, reinterpret_cast<const uint8_t *>(plan.srt_scratch.data()) + (entry_word >> 2u), 8u);
+      Check(address == 0x101cu, "dead load did not run or recorded another address");
+    }
+  }
+  Check(flats[0] == std::vector<uint32_t>{0x5678u} && flats[2] == flats[0],
+        "walk count plan lost its body");
+  Check(pinned ? flats[1] == flats[0] : flats[1] == std::vector<uint32_t>{0u},
+        pinned ? "a result depends on the load classified dead" : "a zero bound did not skip the body");
+}
+
+int main(int argc, char **argv) {
+  if (argc > 1 && std::string_view(argv[1]) == "--walk-count") {
+    // KYTY_SRT_PROF=2 KYTY_PERF_STATS=1: these first, then every case below with counting walkers.
+    for (const bool pinned : {true, false}) TestDeadLoadCounted(pinned);
+  }
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
@@ -1991,6 +2085,10 @@ int main() {
     for (const bool exact : {false, true}) TestIndirectImageSamplerClasses(mixed, exact);
   }
   TestShaderCacheRecords();
+  if (Libs::Graphics::ShaderRecompiler::IR::WalkCountEnabled()) {
+    // Exercises the report on the counts of every case above.
+    Libs::Graphics::ShaderRecompiler::IR::ReportWalkCounts(5.0, {});
+  }
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

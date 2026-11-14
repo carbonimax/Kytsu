@@ -6,7 +6,14 @@
 
 #include <xbyak/xbyak.h>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -15,7 +22,11 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -195,6 +206,19 @@ std::atomic<uint64_t> g_reuse_hits {0};
 std::atomic<uint64_t> g_reuse_ns {0};
 std::atomic<uint64_t> g_reuse_diffs {0};
 
+// KYTY_SRT_PROF=2: read once, before any walker is compiled.
+const bool g_count = [] {
+	const char* stats = std::getenv("KYTY_PERF_STATS");
+	const char* prof  = std::getenv("KYTY_SRT_PROF");
+	return stats != nullptr && std::atoi(stats) != 0 && prof != nullptr && std::atoi(prof) >= 2;
+}();
+// KYTY_SRT_PROF=2: the ProtectedLoad calls of the walk running on this thread (address, ns).
+thread_local std::vector<std::pair<uint64_t, uint64_t>> t_count_protected;
+// KYTY_SRT_PROF=2, since launch: compiled walkers, those with a load no result depends on, such loads.
+std::atomic<uint64_t> g_count_plans {0};
+std::atomic<uint64_t> g_count_dead_plans {0};
+std::atomic<uint64_t> g_count_dead_loads {0};
+
 bool ProtectedLoadsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SRT_PROTECTED_LOADS");
@@ -208,10 +232,15 @@ bool ProtectedLoadsEnabled() {
 // reader completed it, else 0 (the walker then loads directly, through the fault path).
 uint64_t KYTY_SYSV_ABI ProtectedLoad(uint64_t address) {
 	const bool timed = g_walk_stats.load(std::memory_order_relaxed);
-	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const auto start = timed || g_count ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const auto reader = g_protected_reader.load(std::memory_order_acquire);
 	uint32_t   value  = 0;
 	const auto result = reader != nullptr ? reader(address, &value) : ProtectedLoadKeep;
+	if (g_count) {
+		t_count_protected.emplace_back(address, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                            std::chrono::steady_clock::now() - start)
+		                                            .count()));
+	}
 	if (timed) {
 		g_protected_calls.fetch_add(1, std::memory_order_relaxed);
 		g_protected_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -503,7 +532,7 @@ private:
 		uint32_t             context = 0;
 		Operand              result;
 		std::vector<Operand> args;
-		uint32_t             slot = 0, state = 0;
+		uint32_t             slot = 0, state = 0, address = 0; // address: KYTY_SRT_PROF=2 load slot
 		Xbyak::Label         label;
 		bool                 pending = true, referenced = false, masked = false;
 	};
@@ -543,6 +572,19 @@ private:
 	void EmitRead(const Node& node);
 	void EmitStrict(const Node& node);
 
+	// KYTY_SRT_PROF=2: what a run-time value can be once known, whatever guest memory holds:
+	// never known, one constant, or anything. Never is only given on a proof; a cycle gives Any.
+	enum class Can : uint8_t { Never, One, Any };
+	struct Known {
+		Can      can   = Can::Any;
+		uint64_t value = 0;
+	};
+	Known KnownOf(const Operand& operand);
+	Known KnownOfNode(uint32_t index);
+	void  Classify(const std::vector<Operand>& conditions, const std::vector<Operand>& reads,
+	               const std::vector<std::vector<Operand>>& descriptors, const std::vector<Operand>& outputs);
+	void  Stamp(uint32_t offset);
+
 	ResourcePlan&                                     m_plan;
 	Xbyak::CodeGenerator&                             m_code;
 	std::vector<Value>                                m_masks {Value {}};
@@ -553,6 +595,12 @@ private:
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_restart = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
+	// KYTY_SRT_PROF=2: per node, Known state (0 new, 1 visiting, 2 done), value and load class;
+	// blocks every walk reaches; the fill stamps' offset (two TSC values, two capture cursors).
+	std::vector<uint8_t>  m_known_state, m_class;
+	std::vector<Known>    m_known;
+	std::vector<bool>     m_always;
+	uint32_t              m_fill = 0;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -807,6 +855,20 @@ void WalkerCompiler::Layout() {
 	m_states = offset;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) m_nodes[index].state = offset++;
+	}
+	if (g_count) {
+		// Zeroed with the states: an address slot stays 0 unless its load ran in the last pass.
+		offset = (offset + 7u) & ~7u;
+		m_fill = offset;
+		offset += 32u;
+		for (auto& node: m_nodes) {
+			if (node.result.kind != Kind::Node || &m_nodes[node.result.value] != &node) continue;
+			const auto op = node.inst->GetOpcode();
+			if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
+			    op != ValueOpcode::LoadBufferU32) continue;
+			node.address = offset;
+			offset += 8u;
+		}
 	}
 	m_states_end = offset;
 	// Captured addresses come last; EmitRead counts them.
@@ -1078,6 +1140,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
+		if (g_count) c.mov(c.qword[c.rdx + node.address], c.r10);
 		if (WalkReuseMode() != 0) {
 			// The loaded value too, for KYTY_SRT_WALK_REUSE (validation of a later walk).
 			c.mov(c.qword[c.r8 + 8], c.rax);
@@ -1312,6 +1375,174 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 	Store(node);
 }
 
+// KYTY_SRT_PROF=2: the TSC at offset and the capture cursor at offset + 16 (rdtsc clobbers rdx).
+void WalkerCompiler::Stamp(uint32_t offset) {
+	auto& c = m_code;
+	c.mov(c.r11, c.rdx);
+	c.rdtsc();
+	c.shl(c.rdx, 32);
+	c.or_(c.rax, c.rdx);
+	c.mov(c.rdx, c.r11);
+	c.mov(c.qword[c.rdx + offset], c.rax);
+	c.mov(c.qword[c.rdx + offset + 16u], c.r8);
+}
+
+WalkerCompiler::Known WalkerCompiler::KnownOf(const Operand& operand) {
+	switch (operand.kind) {
+		case Kind::Unknown: return {Can::Never};
+		case Kind::Constant: return {Can::One, operand.value};
+		case Kind::UserData:
+		case Kind::ShaderBase: return {};
+		case Kind::Node: break;
+	}
+	const auto index = static_cast<uint32_t>(operand.value);
+	if (m_known_state[index] == 1u) return {};
+	if (m_known_state[index] == 0u) {
+		m_known_state[index] = 1u;
+		m_known[index]       = KnownOfNode(index);
+		m_known_state[index] = 2u;
+	}
+	return m_known[index];
+}
+
+// Mirrors EmitNode: when a node can only end unknown, or only with one value.
+WalkerCompiler::Known WalkerCompiler::KnownOfNode(uint32_t index) {
+	const auto& node = m_nodes[index];
+	const auto& args = node.args;
+	if (node.result != Operand {Kind::Node, index}) return KnownOf(node.result);
+	const auto join = [](Known a, Known b) -> Known {
+		if (a.can == Can::Never) return b;
+		if (b.can == Can::Never) return a;
+		return a.can == Can::One && b.can == Can::One && a.value == b.value ? a : Known {};
+	};
+	const auto any_never = [&](size_t first) {
+		for (size_t i = first; i < args.size(); ++i) {
+			if (KnownOf(args[i]).can == Can::Never) return true;
+		}
+		return false;
+	};
+	const auto op = node.inst->GetOpcode();
+	switch (op) {
+		case ValueOpcode::Phi: {
+			// Reached predecessors must agree, and one every walk reaches always takes part.
+			const auto& blocks = m_plan.control_phi_predecessors.at(node.inst);
+			Known       any {Can::Never};
+			Known       pinned;
+			for (size_t i = 0; i < args.size(); ++i) {
+				const auto known = KnownOf(args[i]);
+				any              = join(any, known);
+				if (!m_always[blocks[i]]) continue;
+				if (known.can == Can::Never || (pinned.can == Can::One && known.can == Can::One && known.value != pinned.value))
+					return {Can::Never};
+				if (known.can == Can::One) pinned = known;
+			}
+			return pinned.can == Can::One ? pinned : any;
+		}
+		case ValueOpcode::LoadAddressU32:
+		case ValueOpcode::ReadConstBuffer:
+		case ValueOpcode::LoadBufferU32: {
+			if (op != ValueOpcode::LoadBufferU32) return any_never(0) ? Known {Can::Never} : Known {};
+			const auto guard = KnownOf(args[0]);
+			if (guard.can == Can::Never) return {Can::Never};
+			if (args.size() > 1u && !any_never(1)) return {};
+			// Only a disabled lane's zero read is known.
+			return guard.can == Can::One && guard.value != 0u ? Known {Can::Never} : Known {Can::One, 0u};
+		}
+		case ValueOpcode::SelectU1:
+		case ValueOpcode::SelectU32:
+		case ValueOpcode::SelectF32:
+			if (KnownOf(args[0]).can == Can::Never) return {Can::Never};
+			return join(KnownOf(args[1]), KnownOf(args[2]));
+		case ValueOpcode::ULessThan32:
+		case ValueOpcode::ULessThanEqual32: {
+			// Known when the bound is zero, else only with the other side.
+			const auto bound = KnownOf(args[0]);
+			if (bound.can == Can::Never) return {Can::Never};
+			if (KnownOf(args[1]).can != Can::Never) return {};
+			if (bound.can == Can::One && static_cast<uint32_t>(bound.value) != 0u) return {Can::Never};
+			return {Can::One, op == ValueOpcode::ULessThan32 ? 0u : 1u};
+		}
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::LogicalAnd: {
+			// Known from either side or the refined right side (args are {left, right, refined}).
+			const bool never = std::ranges::all_of(args, [&](const Operand& arg) { return KnownOf(arg).can == Can::Never; });
+			return never ? Known {Can::Never} : Known {};
+		}
+		default: return any_never(0) ? Known {Can::Never} : Known {};
+	}
+}
+
+// KYTY_SRT_PROF=2: m_class per node, 0 when a condition, descriptor or output depends on it, 1 when
+// only flat values do, 2 when no result does (every path to one passes a node that can never be known).
+void WalkerCompiler::Classify(const std::vector<Operand>& conditions, const std::vector<Operand>& reads,
+                              const std::vector<std::vector<Operand>>& descriptors,
+                              const std::vector<Operand>& outputs) {
+	const auto& blocks = m_plan.control_flow;
+	// Without conditions (a walker of values only) every block is reached.
+	m_always.assign(blocks.size(), conditions.empty());
+	if (!blocks.empty()) m_always[0] = true;
+	// More blocks always reached pin more Phis, which only proves more conditions unknown: a fixpoint.
+	m_known_state.assign(m_nodes.size(), 0u);
+	m_known.assign(m_nodes.size(), {});
+	for (bool changed = !conditions.empty(); changed;) {
+		changed = false;
+		m_known_state.assign(m_nodes.size(), 0u);
+		for (uint32_t block = 0; block < blocks.size(); ++block) {
+			if (!m_always[block]) continue;
+			const auto  known      = KnownOf(conditions[block]);
+			const auto& successors = blocks[block].successors;
+			for (uint32_t i = 0; i < successors.size(); ++i) {
+				const bool taken = known.can == Can::Never || (known.can == Can::One && i == (known.value != 0u ? 0u : 1u));
+				if (taken && !m_always[successors[i]]) {
+					m_always[successors[i]] = true;
+					changed                 = true;
+				}
+			}
+		}
+	}
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) (void)KnownOf({Kind::Node, index});
+	std::vector<uint8_t>  live(m_nodes.size(), 0u);
+	std::vector<uint32_t> stack;
+	const auto mark = [&](const Operand& root, uint8_t bit) {
+		const auto push = [&](const Operand& operand) {
+			if (operand.kind != Kind::Node || (live[operand.value] & bit) != 0u) return;
+			if (m_known[operand.value].can == Can::Never) return;
+			live[operand.value] |= bit;
+			stack.push_back(static_cast<uint32_t>(operand.value));
+		};
+		push(root);
+		while (!stack.empty()) {
+			const auto& node = m_nodes[stack.back()];
+			stack.pop_back();
+			for (const auto& arg: node.args) push(arg);
+			push(node.result);
+		}
+	};
+	for (const auto& operand: conditions) mark(operand, 1u);
+	for (const auto& words: descriptors) {
+		for (const auto& operand: words) mark(operand, 1u);
+	}
+	for (const auto& operand: outputs) mark(operand, 1u);
+	for (const auto& operand: reads) mark(operand, 2u);
+	m_class.assign(m_nodes.size(), 2u);
+	uint32_t dead = 0;
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		m_class[index] = (live[index] & 1u) != 0u ? 0u : live[index] != 0u ? 1u : 2u;
+		if (m_nodes[index].address == 0 || m_class[index] != 2u) continue;
+		++dead;
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+			std::printf("SRT walk dead load: shader=%016llx stage=%u pc=0x%x\n",
+			            static_cast<unsigned long long>(m_plan.shader_hash), static_cast<unsigned>(m_plan.stage),
+			            m_nodes[index].inst->Flags<MemoryFlags>().pc);
+			std::fflush(stdout);
+		}
+	}
+	g_count_plans.fetch_add(1, std::memory_order_relaxed);
+	g_count_dead_plans.fetch_add(dead != 0u ? 1u : 0u, std::memory_order_relaxed);
+	g_count_dead_loads.fetch_add(dead, std::memory_order_relaxed);
+}
+
 void WalkerCompiler::Compile(std::span<const Value> values) {
 	auto&       c         = m_code;
 	const auto& sources   = m_plan.descriptor_sources;
@@ -1334,6 +1565,14 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
 	Layout();
+	m_plan.srt_count_loads.clear();
+	m_plan.srt_count_fill = m_fill;
+	if (g_count) {
+		Classify(conditions, reads, descriptors, outputs);
+		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+			if (m_nodes[index].address != 0) m_plan.srt_count_loads.push_back(m_nodes[index].address << 2u | m_class[index]);
+		}
+	}
 
 	Xbyak::Label pass, fail, reset;
 	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
@@ -1402,6 +1641,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			Fetch(reads[slot], fail);
 			c.mov(c.dword[c.rsi + offset * sizeof(uint32_t)], c.eax);
 		};
+		if (g_count) Stamp(m_fill);
 		if (blocks.empty()) {
 			for (uint32_t slot = 0; slot < reads.size(); ++slot) flat(slot);
 		}
@@ -1413,6 +1653,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			for (const auto slot: blocks[block].srt_reads) flat(slot);
 			c.L(skip);
 		}
+		if (g_count) Stamp(m_fill + 8u);
 		// A source or image no block lists is always active.
 		for (uint32_t index = 0; index < sources.size() + m_plan.info.images.size(); ++index) {
 			const bool     image = index >= sources.size();
@@ -1560,6 +1801,109 @@ void LogReuseMismatch(const ResourcePlan& plan, const char* what, size_t index, 
 	}
 }
 
+// KYTY_SRT_PROF=2: one 2 MiB region of guest addresses, per guest frame: class bits of each 64 B
+// line (1 host objects, 2 flat values, 4 no result) and the 4 KiB pages touched.
+struct CountRegion {
+	uint64_t                   frame = UINT64_MAX;
+	std::array<uint8_t, 32768> lines {};
+	std::array<uint64_t, 8>    pages {};
+};
+
+// Totals since the previous report.
+struct WalkCountTotals {
+	uint64_t walks = 0, captured = 0, lines = 0, pages = 0, touched_regions = 0;
+	// Lines only value loads (only dead loads) touched in their frame; a line can leave the set after a
+	// report took it, hence signed.
+	int64_t  value_only = 0, dead_only = 0;
+	uint64_t fill_walks = 0, fill_ticks = 0, fill_loads = 0, dead_ns = 0, dead_calls = 0, dead_direct = 0;
+	std::array<uint64_t, 3> loads {}, first {};
+	// TSC calibration against the steady clock.
+	uint64_t                              tsc  = __rdtsc();
+	std::chrono::steady_clock::time_point time = std::chrono::steady_clock::now();
+};
+
+struct WalkCounts {
+	std::mutex                                                 mutex;
+	std::unordered_map<uint64_t, std::unique_ptr<CountRegion>> regions;
+	WalkCountTotals                                            totals;
+};
+
+WalkCounts& Counts() {
+	static auto* counts = new WalkCounts;
+	return *counts;
+}
+
+std::atomic<uint64_t> g_count_frame {0};
+std::atomic<uint64_t> g_count_frames {0};
+
+// KYTY_SRT_PROF=2: accounts the walk that just ran (its last pass) and clears its fill stamps, which
+// KYTY_SRT_WALK_REUSE=2 would otherwise see as scratch differences.
+void CountWalk(const ResourcePlan& plan, const uint64_t* captures, const uint64_t* end, uint32_t stride) {
+	auto*                   bytes = reinterpret_cast<uint8_t*>(plan.srt_scratch.data());
+	std::array<uint64_t, 4> fill {};
+	std::memcpy(fill.data(), bytes + plan.srt_count_fill, sizeof(fill));
+	std::memset(bytes + plan.srt_count_fill, 0, sizeof(fill));
+	auto&            counts = Counts();
+	std::scoped_lock lock(counts.mutex);
+	auto&            totals = counts.totals;
+	const auto       frame = g_count_frame.load(std::memory_order_relaxed);
+	++totals.walks;
+	totals.captured += static_cast<uint64_t>(end - captures) / stride;
+	if (fill[0] != 0u && fill[1] >= fill[0]) {
+		++totals.fill_walks;
+		totals.fill_ticks += fill[1] - fill[0];
+		totals.fill_loads += (fill[3] - fill[2]) / (stride * sizeof(uint64_t));
+	}
+	CountRegion* region = nullptr;
+	uint64_t     key    = UINT64_MAX;
+	for (const auto entry: plan.srt_count_loads) {
+		uint64_t address = 0;
+		std::memcpy(&address, bytes + (entry >> 2u), sizeof(address));
+		if (address == 0u) continue;
+		const auto kind = entry & 3u;
+		++totals.loads[kind];
+		if (kind == 2u) {
+			bool timed = false;
+			for (const auto& [loaded, ns]: t_count_protected) {
+				if (loaded != address) continue;
+				totals.dead_ns += ns;
+				++totals.dead_calls;
+				timed = true;
+			}
+			totals.dead_direct += timed ? 0u : 1u;
+		}
+		if (address >> 21u != key) {
+			key        = address >> 21u;
+			auto& slot = counts.regions[key];
+			if (slot == nullptr) slot = std::make_unique<CountRegion>();
+			region = slot.get();
+		}
+		if (region->frame != frame) {
+			region->frame = frame;
+			region->lines.fill(0u);
+			region->pages.fill(0u);
+			++totals.touched_regions;
+		}
+		const auto page = (address >> 12u) & 511u;
+		if ((region->pages[page >> 6u] >> (page & 63u) & 1u) == 0u) {
+			region->pages[page >> 6u] |= uint64_t {1} << (page & 63u);
+			++totals.pages;
+		}
+		auto&         line = region->lines[(address >> 6u) & 32767u];
+		const uint8_t bit  = static_cast<uint8_t>(1u << kind);
+		if ((line & bit) != 0u) continue;
+		if (line == 0u) {
+			++totals.lines;
+			++totals.first[kind];
+		}
+		totals.value_only -= line == 2u ? 1 : 0;
+		totals.dead_only -= line == 4u ? 1 : 0;
+		line |= bit;
+		totals.value_only += line == 2u ? 1 : 0;
+		totals.dead_only += line == 4u ? 1 : 0;
+	}
+}
+
 } // namespace
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
@@ -1598,6 +1942,8 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	plan.srt_memo_loads = UINT32_MAX;
 	flat.assign(plan.srt_reads.size(), 0u);
 	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	// After MemoLoadsHold: its validation loads are not this walk's.
+	if (g_count) t_count_protected.clear();
 	t_running_walker = plan.srt_code.get();
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
@@ -1611,6 +1957,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	}
 	if (end == nullptr) return false;
 	const auto* captures = plan.srt_scratch.data() + plan.srt_captures / 8u;
+	if (g_count) CountWalk(plan, captures, end, stride);
 	if (reads != nullptr) {
 		for (const auto* read = captures; read != end; read += stride)
 			reads->emplace_back(*read, sizeof(uint32_t));
@@ -1729,6 +2076,47 @@ WalkStats TakeWalkStats() noexcept {
 	        .reuse_hits   = g_reuse_hits.exchange(0, std::memory_order_relaxed),
 	        .reuse_ns     = g_reuse_ns.exchange(0, std::memory_order_relaxed),
 	        .reuse_diffs  = g_reuse_diffs.exchange(0, std::memory_order_relaxed)};
+}
+
+bool WalkCountEnabled() noexcept {
+	return g_count;
+}
+
+void NoteWalkFrame() noexcept {
+	if (!g_count) return;
+	g_count_frame.fetch_add(1, std::memory_order_relaxed);
+	g_count_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ReportWalkCounts(double seconds, const WalkStats& walk) noexcept {
+	if (!g_count) return;
+	auto&           counts = Counts();
+	WalkCountTotals t;
+	{
+		std::scoped_lock lock(counts.mutex);
+		std::swap(t, counts.totals);
+	}
+	// t holds the window; counts.totals starts the next one now.
+	const auto  elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t.time).count();
+	const auto  per_us  = elapsed > 0.0 ? static_cast<double>(__rdtsc() - t.tsc) / elapsed : 0.0;
+	const auto  fill_us = per_us > 0.0 ? static_cast<uint64_t>(static_cast<double>(t.fill_ticks) / per_us) : 0u;
+	// shortcut: a dead load outside ProtectedLoad costs the walk's average non-protected time per load,
+	// an upper bound (the walk's other work included).
+	const auto load_ns = t.captured != 0u && walk.ns > walk.protected_ns ? (walk.ns - walk.protected_ns) / t.captured : 0u;
+	const auto dead_us = (t.dead_ns + t.dead_direct * load_ns) / 1000u;
+	const auto frames  = g_count_frames.exchange(0, std::memory_order_relaxed);
+	const auto ull     = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+	std::printf("PERF srtcnt %.1fs: frames=%llu walks=%llu captured=%llu loads=%llu/%llu/%llu lines=%llu"
+	            " first=%llu/%llu/%llu value_only=%lld dead_only=%lld pages=%llu regions=%llu fill_us=%llu"
+	            " fill_walks=%llu fill_loads=%llu dead_prot=%llu/%lluus dead_direct=%llu load_ns=%llu dead_us=%llu"
+	            " dead_static=%llu/%llu/%llu fill_us_f=%llu dead_us_f=%llu\n",
+	            seconds, ull(frames), ull(t.walks), ull(t.captured), ull(t.loads[0]), ull(t.loads[1]), ull(t.loads[2]),
+	            ull(t.lines), ull(t.first[0]), ull(t.first[1]), ull(t.first[2]), static_cast<long long>(t.value_only),
+	            static_cast<long long>(t.dead_only), ull(t.pages), ull(t.touched_regions), ull(fill_us),
+	            ull(t.fill_walks), ull(t.fill_loads), ull(t.dead_calls), ull(t.dead_ns / 1000u), ull(t.dead_direct),
+	            ull(load_ns), ull(dead_us), ull(g_count_dead_loads.load(std::memory_order_relaxed)),
+	            ull(g_count_dead_plans.load(std::memory_order_relaxed)), ull(g_count_plans.load(std::memory_order_relaxed)),
+	            ull(frames != 0u ? fill_us / frames : 0u), ull(frames != 0u ? dead_us / frames : 0u));
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
