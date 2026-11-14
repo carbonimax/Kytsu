@@ -115,6 +115,7 @@
 #include <tuple>
 #include <variant>
 #include <vector>
+#include <xxhash.h>
 
 // Thumbnail PNGs of failing capture replays (the emulator's copy in libPngEnc.cpp is not linked here).
 #define STB_IMAGE_WRITE_STATIC
@@ -9332,6 +9333,10 @@ public:
       fault_b_desc.info.data.address = base + 0x8010;
       const auto fault_a_image = texture_cache.FindImage(fault_a_desc);
       const auto fault_b_image = texture_cache.FindImage(fault_b_desc);
+      Require(name, "guest edge hash",
+              texture_cache.GetImage(fault_a_image).HashGuestEdges() ==
+                  XXH3_64bits(&fault_a, sizeof(fault_a)),
+              "the edge hash covered bytes outside the image");
       (void)texture_cache.FindTexture(fault_a_image, fault_a_desc);
       (void)texture_cache.FindTexture(fault_b_image, fault_b_desc);
       texture_cache.MarkGpuWritten(fault_a_image);
