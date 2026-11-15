@@ -573,6 +573,8 @@ void BufferCache::DropImported(uint64_t vaddr, uint64_t size) {
 		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
 			(void)PublishImported(buffer.CpuAddress(), buffer.Size(), true, nullptr);
 		}
+		// As the garbage collector: no buffer holds these bytes any more, the next one uploads them.
+		m_memory_tracker.MarkRegionAsCpuModifiedExceptGpu(buffer.CpuAddress(), buffer.Size());
 		DeleteBuffer(id);
 		g_import_stats.dropped.fetch_add(1, std::memory_order_relaxed);
 	}
