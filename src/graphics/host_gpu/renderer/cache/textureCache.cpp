@@ -1674,12 +1674,19 @@ void TextureCache::WaitAliasPublishes(GuestRange range) {
 		uint64_t tick = 0;
 		{
 			std::scoped_lock lock {m_lock};
-			auto             begin = range.address;
-			auto             end   = range.End();
+			auto       begin = range.address;
+			auto       end   = range.End();
+			const auto add   = [&](const GuestRange& data) {
+				begin = std::min(begin, data.address);
+				end   = std::max(end, data.End());
+			};
 			for (const auto id: FindImageCandidates(range.address, range.size)) {
-				const auto& data = m_slot_images[id].info.data;
-				begin            = std::min(begin, data.address);
-				end              = std::max(end, data.End());
+				const auto& image = m_slot_images[id];
+				add(image.info.data);
+				// A search can resolve to the plane associated with a candidate.
+				if (image.depth_id) {
+					add(m_slot_images[image.depth_id].info.data);
+				}
 			}
 			tick = m_buffer_cache.WritePublishTick(begin, end - begin);
 		}
