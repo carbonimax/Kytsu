@@ -14,7 +14,7 @@ inline constexpr uint64_t ASYNC_PIPELINE_NOT_SKIPPED = UINT64_MAX;
 
 // `first_skip`: guest frame of the key's first skip (ASYNC_PIPELINE_NOT_SKIPPED: none yet, set to
 // `frame`). True while a draw of the key may still be skipped at `frame`. `uncapped`
-// (KYTY_ASYNC_TESS=1, tessellation draws): skipped until created, as a creation of seconds made
+// (KYTY_ASYNC_TESS, default on, tessellation draws): skipped until created, as a creation of seconds made
 // inline at the cap froze the draw thread for all of it.
 [[nodiscard]] constexpr bool AsyncPipelineMaySkip(uint64_t& first_skip, uint64_t frame,
                                                   bool uncapped = false) {
