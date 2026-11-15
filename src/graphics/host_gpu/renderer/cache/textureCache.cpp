@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/imageProf.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -240,7 +241,11 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	ImageId id {};
+	{
+		ImageProf::ScopedTimer timer {ImageProf::CreateNs, ImageProf::Created};
+		id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	}
 	RegisterImage(id);
 	return id;
 }
@@ -251,6 +256,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
 	m_image_index_epoch++;
+	ImageProf::NoteRegister(true);
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
@@ -264,6 +270,10 @@ void TextureCache::UnregisterImage(ImageId id) {
 	image.HeapChanged();
 	UntrackImage(id);
 	m_image_index_epoch++;
+	if (ImageProf::Enabled()) [[unlikely]] {
+		ImageProf::NoteRegister(false);
+		ImageProf::Add(ImageProf::FreedBytes, image.AccountedSize());
+	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr || !owners->Erase(id)) {
@@ -681,6 +691,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id, bool& keep_both) {
+	ImageProf::ScopedCause cause {ImageProf::Replace};
 	auto& cached = m_slot_images[cached_id];
 	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
 	    cached.info.tile_mode != requested.tile_mode) {
@@ -817,6 +828,7 @@ bool Publish(TextureCache& cache, Image& image) {
 }
 
 void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
+	ImageProf::ScopedCause cause {ImageProf::BcAlias};
 	auto& cached = cache.m_slot_images[cached_id];
 	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
 	// PS5 raw block images can span several packed BC mips. Transfer their complete
@@ -845,6 +857,7 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
+	ImageProf::ScopedCause cause {ImageProf::Overlap};
 	auto& cached = m_slot_images[cached_id];
 	if (!cached.registered) {
 		return {merged_id};
@@ -981,6 +994,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	ImageProf::ScopedCause cause {ImageProf::Expand};
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
@@ -1025,9 +1039,15 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		     image.backing.samples != 1)) {
 			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
-		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
+		const auto linear = [&] {
+			ImageProf::ScopedTimer step {ImageProf::UpDetileNs, ImageProf::Count, true};
+			return m_tiler.Detile(source.Handle(), source_offset, info);
+		}();
 		const auto copies = info.BufferCopies(linear.offset);
-		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		{
+			ImageProf::ScopedTimer step {ImageProf::UpRecordNs, ImageProf::Count, true};
+			destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;
 	}
@@ -1039,7 +1059,10 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	}
 	const auto layers          = info.resources.layers;
 	const auto full_slice_size = info.linear_slice_stride;
-	auto       linear          = m_tiler.Detile(source.Handle(), source_offset, info);
+	auto       linear          = [&] {
+		ImageProf::ScopedTimer step {ImageProf::UpDetileNs, ImageProf::Count, true};
+		return m_tiler.Detile(source.Handle(), source_offset, info);
+	}();
 	auto       copies          = info.BufferCopies(linear.offset);
 	if (image.depth_id) {
 		for (auto& copy: copies) {
@@ -1054,6 +1077,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		                     texels_per_slice > UINT64_MAX / transfer_bytes);
 		const uint64_t transfer_slice = texels_per_slice * transfer_bytes;
 		EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
+		ImageProf::ScopedTimer step {ImageProf::UpDetileNs, ImageProf::Count, true};
 		auto promoted = m_tiler.GetScratchBuffer(transfer_slice * layers, linear.buffer);
 		m_tiler.ConvertD16(
 		    linear, promoted, TileManager::D16Direction::Promote,
@@ -1073,7 +1097,10 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		copies[0].imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, 0, layers};
 		copies[0].imageExtent       = info.extent;
 	}
-	destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+	{
+		ImageProf::ScopedTimer step {ImageProf::UpRecordNs, ImageProf::Count, true};
+		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
@@ -1103,12 +1130,16 @@ void TextureCache::InitializeImage(ImageId id) {
 			}
 			start = std::chrono::steady_clock::now();
 		}
-		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
-		if (source == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+		{
+			// KYTY_BIND_PROF: upload = obtain (staging wait + guest copy + rest) + detile + copy record.
+			ImageProf::UploadScope upload_scope {image.info.data.size};
+			const auto [source, source_offset] =
+			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+			if (source == nullptr) {
+				EXIT("TextureCache: failed to obtain image upload source\n");
+			}
+			UploadImage(image, *source, source_offset);
 		}
-		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
 		if (prof) [[unlikely]] {
 			const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1404,6 +1435,7 @@ void TextureCache::RefreshImage(ImageId id, const ImageViewInfo* view) {
 }
 
 ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
+	ImageProf::ScopedCause cause {ImageProf::Stencil};
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
 	}
@@ -1448,6 +1480,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			depth.stencil_ids.push_back(association);
 		}
 		m_image_index_epoch++;
+		ImageProf::Add(ImageProf::Epoch, 1);
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1488,11 +1521,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 			const auto* kept = m_slot_images.try_get(memo->id);
 			memo_hit         = kept != nullptr && kept->registered;
 		}
+		// KYTY_BIND_PROF: a stale memo (older epoch) whose search keeps the same image again is a miss
+		// only the global epoch caused.
+		const bool prof     = memo_mode != 0 && ImageProf::Enabled();
+		const auto stale_id = prof && memo->id && memo->epoch != m_image_index_epoch ? memo->id : ImageId {};
+		if (prof) [[unlikely]] {
+			m_memo_prof[0]++;
+			m_memo_prof[1] += memo_hit ? 1 : 0;
+			m_memo_prof[2] += stale_id ? 1 : 0;
+		}
 		if (memo_hit && memo_mode == 1) {
 			result = memo->id;
 		} else {
 			const auto kept_id = memo_hit ? memo->id : ImageId {};
 			result = FindImageLocked(command, desc, exact_format, memo_mode != 0 ? memo : nullptr);
+			if (stale_id && result == stale_id && memo->id == result) [[unlikely]] {
+				m_memo_prof[3]++;
+			}
 			if (memo_hit && (kept_id != result || memo->id != result)) {
 				EXIT("KYTY_FIND_IMAGE_MEMO=2: kept image %u, search gives %u (keepable %d) "
 				     "addr=0x%010" PRIx64 " size=0x%" PRIx64 "\n",
@@ -1734,11 +1779,13 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
+				ImageProf::ScopedCause cause {ImageProf::Lookup};
 				FreeImage(result);
 				result = {};
 			}
 		}
 		if (!result) {
+			ImageProf::ScopedCause cause {ImageProf::Lookup};
 			keepable       = false;
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
@@ -1972,6 +2019,7 @@ void TextureCache::DropGuestSiblings(Image& image) {
 	if (!image.guest_siblings) {
 		return;
 	}
+	ImageProf::ScopedCause cause {ImageProf::Sibling};
 	image.guest_siblings = false;
 	for (const auto id: FindImagesInRegion(image.info.data.address, image.info.data.size)) {
 		auto& sibling = m_slot_images[id];
@@ -2655,6 +2703,7 @@ bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
+	ImageProf::ScopedCause cause {ImageProf::Unmap};
 	std::scoped_lock lock {m_lock};
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
@@ -2669,10 +2718,21 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
+	ImageProf::ScopedCause cause {ImageProf::Gc};
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	if (ImageProf::Enabled()) [[unlikely]] {
+		const auto memo = std::exchange(m_memo_prof, {});
+		ImageProf::Add(ImageProf::Lookups, memo[0]);
+		ImageProf::Add(ImageProf::MemoHits, memo[1]);
+		ImageProf::Add(ImageProf::MemoStale, memo[2]);
+		ImageProf::Add(ImageProf::MemoStaleSame, memo[3]);
+		ImageProf::NoteMemory(m_total_used_memory,
+		                      m_graphics.CanReportMemoryUsage() ? m_graphics.GetTotalMemoryBudget() : 0,
+		                      m_trigger_gc_memory);
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
@@ -2712,6 +2772,10 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			--deletions;
+			if (ImageProf::Enabled()) [[unlikely]] {
+				ImageProf::Add(ImageProf::Evicted, 1);
+				ImageProf::Add(ImageProf::EvictedBytes, owner->AccountedSize());
+			}
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
+#include "graphics/host_gpu/renderer/imageProf.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -2950,6 +2951,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
+		ImageProf::ScopedTimer step {ImageProf::UpCopyNs, ImageProf::Count, true};
 		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
 			EXIT("BufferCache: failed to read mapped guest image backing\n");
 		}

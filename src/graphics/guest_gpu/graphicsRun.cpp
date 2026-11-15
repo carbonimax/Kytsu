@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssrProf.h"
+#include "graphics/host_gpu/renderer/imageProf.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1101,6 +1102,7 @@ bool GuestGpu::Process(Submission& submission) {
 			PerfStats::Add(PerfStats::Counter::Frames, 1);
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
+			ImageProf::EndFrame();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();

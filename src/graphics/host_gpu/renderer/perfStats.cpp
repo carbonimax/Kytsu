@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/imageProf.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/shaderPretranslate.h"
@@ -353,6 +354,7 @@ void MaybeReport() noexcept {
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);
 	BufferCache::ReportImport(seconds);
+	ImageProf::Report(seconds);
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));

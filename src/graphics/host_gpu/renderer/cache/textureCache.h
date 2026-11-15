@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <bitset>
 #include <map>
 #include <mutex>
@@ -288,6 +289,9 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	uint64_t         m_image_index_epoch      = 1;
+	// KYTY_BIND_PROF: memo lookups, hits, stale (epoch moved), stale_same (stale, same image found);
+	// counted under m_lock, handed to ImageProf by the GC once per frame.
+	std::array<uint64_t, 4> m_memo_prof {};
 	struct CandidateCacheEntry {
 		uint64_t             address = 0;
 		uint64_t             size    = 0;

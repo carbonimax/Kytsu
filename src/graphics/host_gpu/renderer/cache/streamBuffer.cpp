@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/stagingMemoryPolicy.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/imageProf.h"
 
 #include <array>
 #include <cinttypes>
@@ -364,8 +365,13 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	auto invalidation_mark =
 	    wrap ? std::optional<size_t> {m_current_watch_cursor} : m_invalidation_mark;
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
-	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
-	                           allow_wait, wait_priority, wait_cursor, wait_bound)) {
+	bool ready = false;
+	{
+		ImageProf::ScopedTimer step {ImageProf::UpWaitNs, ImageProf::Count, true};
+		ready = WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
+		                              allow_wait, wait_priority, wait_cursor, wait_bound);
+	}
+	if (!ready) {
 		return {nullptr, 0};
 	}
 
