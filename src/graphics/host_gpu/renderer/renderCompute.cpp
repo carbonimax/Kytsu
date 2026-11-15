@@ -109,9 +109,9 @@ static void NoteCrwdMetaClear(const Stage& stage, const Resources& resources, Te
 		const auto key = program.shader_hash ^ (registered * 0x9E3779B97F4A7C15ull) ^ (bytes << 1u) ^ (unbounded ? 1 : 0);
 		if (sizes_seen.size() < 64 && sizes_seen.emplace(key, true).second) {
 			std::printf("CRWD meta_size cs=%016" PRIx64 " addr=%012" PRIx64 " htile=%" PRIu64 " written=%" PRIu64
-			            " num_records=%u%s\n",
+			            " num_records=%u%s next_meta=%d\n",
 			            program.shader_hash, written.Base48(), registered, bytes, written.NumRecords(),
-			            unbounded ? " unbounded" : "");
+			            unbounded ? " unbounded" : "", cache.IsMeta(written.Base48() + registered) ? 1 : 0);
 		}
 	}
 }
@@ -143,6 +143,23 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				if (cache.ClearMeta(descriptor.Base48())) {
 					if (PerfStats::CrwdProfEnabled()) [[unlikely]] {
 						NoteCrwdMetaClear(input.stage, resources, cache, descriptor);
+					}
+					// KYTY_META_CLEAR_STRICT=1 (test, off by default): a bounded write past the registered HTile
+					// size reaches other memory, so also clear metadata there and run the dispatch.
+					static const bool strict = [] {
+						const char* env = std::getenv("KYTY_META_CLEAR_STRICT");
+						return env != nullptr && env[0] == '1';
+					}();
+					const auto size = strict ? cache.MetaSize(descriptor.Base48()) : 0;
+					if (size != 0 && descriptor.NumRecords() != UINT32_MAX && descriptor.GetSize() > size) {
+						const bool next = cache.ClearMeta(descriptor.Base48() + size);
+						static std::atomic_bool logged {false};
+						if (!logged.exchange(true)) {
+							std::printf("CRWD meta_strict: dispatch run, addr=%012" PRIx64 " htile=%" PRIu64
+							            " written=%" PRIu64 " next_meta=%d\n",
+							            descriptor.Base48(), size, descriptor.GetSize(), next ? 1 : 0);
+						}
+						return false;
 					}
 					return true;
 				}
