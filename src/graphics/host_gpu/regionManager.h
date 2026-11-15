@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #if defined(_MSC_VER)
@@ -27,14 +29,29 @@
 
 namespace Libs::Graphics {
 
+// KYTY_SPIN_YIELD=N (unset or 0: off): a TrackingSpinLock waiter that spun N rounds gives its core
+// back to the OS at each further round, since the holder may be blocked on another thread.
+// Reads 0 (off) before static initialization.
+inline const uint32_t g_spin_yield = [] {
+	const char* value = std::getenv("KYTY_SPIN_YIELD");
+	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+}();
+
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+			const auto yield_after = g_spin_yield;
+			uint32_t   spins       = 0;
 			// Wait on reads, so the holder's cache line is not written until the lock is free.
 			while (m_lock.test(std::memory_order_relaxed)) {
+				if (yield_after != 0 && spins >= yield_after) [[unlikely]] {
+					std::this_thread::yield();
+					continue;
+				}
+				spins++;
 #if defined(__x86_64__) || defined(_M_X64)
 				_mm_pause();
 #elif defined(_M_ARM64)
