@@ -211,7 +211,7 @@ private:
 };
 
 static bool g_pad_prof  = false;
-static bool g_pad_latch = false;
+static bool g_pad_latch = true;
 
 static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_players;
 // Each player's special port (wheels, guitars, ...); no host device feeds it.
@@ -486,9 +486,9 @@ void Initialize() {
 
 	const char* prof = std::getenv("KYTY_PAD_PROF");
 	g_pad_prof       = prof != nullptr && prof[0] == '1';
-	// A game that only reads the current state misses a press released between two of its reads.
+	// A game that only reads the current state misses a press released between two of its reads (on unless =0).
 	const char* latch = std::getenv("KYTY_PAD_LATCH");
-	g_pad_latch       = latch != nullptr && latch[0] == '1';
+	g_pad_latch       = latch == nullptr || latch[0] != '0';
 
 	for (int i = 0; i < Config::MAX_PLAYERS; i++) {
 		g_players[i]       = std::make_unique<GameController>(i, PAD_PORT_TYPE_STANDARD);
