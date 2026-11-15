@@ -975,6 +975,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME gpu_capture_replay
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-only)
+	add_test(NAME gpu_capture_replay_loop
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-loop-only)
 	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); where it is unset, generated synthetic
 	# captures (a replayable one and one with an unmappable range) take the same file path.
 	add_test(NAME gpu_capture_replay_local
