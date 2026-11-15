@@ -1332,6 +1332,14 @@ int main(int argc, char **argv) {
     TestHostReadIntoCleanTrackedPage();
     return 0;
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+  // Needs no PageManager, so it also runs on hosts whose page size the tracker refuses.
+  if (argc == 2 && std::strcmp(argv[1], "--protected-stack-only") == 0) {
+    TestFaultOnProtectedStack();
+    std::puts("MemoryTrackerTests: protected stack case passed");
+    return 0;
+  }
+#endif
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
