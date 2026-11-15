@@ -4222,7 +4222,8 @@ void TestCompactScalarImageTable() {
       if (sharing != Sharing::None)
         std::copy_n(at, width, memory.words.begin() + (0x1000u + row * stride + image_offset) / 4u);
     }
-    const std::array poison{0x00fff000u, 0x09500000u, 0u, 0x900003acu};
+    // k8SScaled: named but unsampled, so it is read and still fails (a gap format now binds null).
+    const std::array poison{0x00fff000u, 0x00400000u, 0u, 0x900003acu};
     if (member == 0x16cu)
       std::copy(poison.begin(), poison.end(), memory.words.begin() + (0x1000u + 0x17cu) / 4u);
     memory.fail_address = 0x2000u + bytes; // Last descriptor ends at the readable boundary.
