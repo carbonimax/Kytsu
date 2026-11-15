@@ -78,6 +78,9 @@ constexpr uint32_t R_POP_MARKER     = 0x0C;
 // Fork: cpSplitProf names these packets' drain causes.
 constexpr uint32_t R_WRITE_DATA     = 0x15;
 constexpr uint32_t R_DMA_DATA       = 0x19;
+// Fork: flips of GPU captures taken before the native flip blocks (replayed only).
+constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
+constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
 constexpr uint32_t R_PSSR           = 0x1B;
 

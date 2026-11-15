@@ -162,6 +162,8 @@ void Packet(uint32_t opcode, uint32_t custom) noexcept {
 	switch (opcode) {
 		case Pm4::IT_NOP:
 			switch (custom) {
+				case Pm4::R_FLIP:
+				case Pm4::R_WAIT_FLIP_DONE: cause = Cause::Flip; break;
 				case Pm4::R_WRITE_DATA: cause = Cause::WriteData; break;
 				case Pm4::R_DMA_DATA: cause = Cause::DmaData; break;
 				default: break;
