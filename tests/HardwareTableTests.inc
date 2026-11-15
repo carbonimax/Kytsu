@@ -182,15 +182,21 @@ void CheckRcp(VulkanHarness &vulkan) {
   }
   const std::array<u32, 1> opcodes{0x2au};
   const auto got = RunVop1(vulkan, name, opcodes, inputs)[0];
-  u32 exact = 0, worst = 0;
+  // Count every input before failing, so a failing run still reports how far the host is from RDNA 2.
+  u32 exact = 0, worst = 0, failed = 0;
+  std::string first;
   for (size_t i = 0; i < inputs.size(); i++) {
     const auto ulps = UlpDistance(got[i], expected[i]);
     exact += ulps == 0 ? 1 : 0;
     worst = std::max(worst, ulps);
-    Require(name, ExactRequired() ? "RDNA 2 bits" : "1 ulp of RDNA 2", ulps <= (ExactRequired() ? 0u : 1u),
-            fmt::format("v_rcp_f32 of {:#010x} is {:#010x}, RDNA 2 gives {:#010x}", inputs[i], got[i], expected[i]));
+    if (ulps > (ExactRequired() ? 0u : 1u) && failed++ == 0) {
+      first = fmt::format("v_rcp_f32 of {:#010x} is {:#010x}, RDNA 2 gives {:#010x}", inputs[i], got[i], expected[i]);
+    }
   }
-  std::printf("[compute] %-32s ok (%u/%zu with the RDNA 2 bits, worst %u ulp)\n", name, exact, inputs.size(), worst);
+  std::printf("[compute] %s: %u/%zu with the RDNA 2 bits, worst %u ulp, %u over the bound\n", name, exact,
+              inputs.size(), worst, failed);
+  Require(name, ExactRequired() ? "RDNA 2 bits" : "1 ulp of RDNA 2", failed == 0, first);
+  std::printf("[compute] %-32s ok\n", name);
 }
 
 // v_sin_f32 / v_cos_f32: zero and infinite results exact, NaN a NaN; the others within 2^-10 (relative) of
@@ -214,7 +220,7 @@ void CheckSinCos(VulkanHarness &vulkan) {
     std::printf("[compute] %s: host sin/cos not within 2^-10 of RDNA 2 on small positive inputs, only zero, "
                 "infinite and NaN results checked\n", name);
   }
-  u32 exact = 0;
+  u32 exact = 0, failed = 0;
   for (size_t i = 0; i < kSinCos.size(); i++) {
     for (u32 k = 0; k < 2; k++) {
       const auto want = k == 0 ? kSinCos[i].sin : kSinCos[i].cos;
@@ -224,13 +230,18 @@ void CheckSinCos(VulkanHarness &vulkan) {
       // Any NaN for a NaN (the payload is the host's) unless every bit is required.
       const bool nan = std::isnan(value) && !ExactRequired();
       exact += have == want ? 1 : 0;
-      Require(name, bits ? "RDNA 2 bits" : "2^-10 of RDNA 2",
-              nan ? std::isnan(std::bit_cast<float>(have)) : bits ? have == want : !accurate || within(have, want),
-              fmt::format("{} of {:#010x} is {:#010x}, RDNA 2 gives {:#010x}", k == 0 ? "v_sin_f32" : "v_cos_f32",
-                          kSinCos[i].x, have, want));
+      const bool ok = nan ? std::isnan(std::bit_cast<float>(have)) : bits ? have == want : !accurate || within(have, want);
+      if (!ok) {
+        // Every failing result, then one failure: the run shows the whole gap.
+        std::printf("[compute] %s: %s of %#010x is %#010x, RDNA 2 gives %#010x (%s)\n", name,
+                    k == 0 ? "v_sin_f32" : "v_cos_f32", kSinCos[i].x, have, want, bits ? "bits" : "2^-10");
+        failed++;
+      }
     }
   }
-  std::printf("[compute] %-32s ok (%u/%zu with the RDNA 2 bits)\n", name, exact, 2 * kSinCos.size());
+  std::printf("[compute] %s: %u/%zu with the RDNA 2 bits, %u over the bound\n", name, exact, 2 * kSinCos.size(), failed);
+  Require(name, "RDNA 2 table", failed == 0, fmt::format("{} results over the bound", failed));
+  std::printf("[compute] %-32s ok\n", name);
 }
 
 } // namespace HardwareTables
