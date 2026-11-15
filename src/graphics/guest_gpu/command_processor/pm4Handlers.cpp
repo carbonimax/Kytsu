@@ -1320,6 +1320,28 @@ static uint32_t CpWaitFlipDone(CommandProcessor& cp, const uint32_t* block, uint
 	return Pm4::WAIT_FLIP_DONE_PACKET_DW - 1u;
 }
 
+// Fork: GPU captures taken before the native flip blocks hold the old IT_NOP flips. Only replays
+// run them, and a replay has no video out: the flip publishes the occlusion counters and the wait
+// waits for nothing.
+KYTY_CP_OP_PARSER(CpOpLegacyFlip) {
+	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
+
+	cp.Flip(static_cast<int>(buffer[0]), static_cast<int>(buffer[1]), static_cast<int>(buffer[2]),
+	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
+	return 5;
+}
+
+KYTY_CP_OP_PARSER(CpOpLegacyWaitFlipDone) {
+	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0051018);
+	return 6;
+}
+
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 

@@ -89,6 +89,8 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	std::array<cp_op_parser_func_t, Pm4::R_NUM> table {};
 
 	table[Pm4::R_DISPATCH_RESET] = CpOpDispatchReset;
+	table[Pm4::R_WAIT_FLIP_DONE] = CpOpLegacyWaitFlipDone;
+	table[Pm4::R_FLIP]           = CpOpLegacyFlip;
 	table[Pm4::R_PUSH_MARKER]    = CpOpPushMarker;
 	table[Pm4::R_POP_MARKER]     = CpOpPopMarker;
 	table[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
