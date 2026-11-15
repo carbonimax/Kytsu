@@ -61012,6 +61012,8 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+#include "HardwareTableTests.inc"
+
 } // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
@@ -61123,6 +61125,15 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, DsFloatMinMaxClasses(false));
       RunCase(&vulkan, DsFloatMinMaxClasses(true));
     } else return 2;
+    return 0;
+  }
+  // FO-11 hardware-measured tables, one per run (HardwareTableTests.inc).
+  if (argc == 3 && std::strcmp(argv[1], "--hw-table-only") == 0) {
+    const std::string_view name = argv[2];
+    VulkanHarness vulkan;
+    if (name == "rcp") HardwareTables::CheckRcp(vulkan);
+    else if (name == "sincos") HardwareTables::CheckSinCos(vulkan);
+    else return 2;
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-u16-only") == 0) {
