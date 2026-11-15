@@ -900,6 +900,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_hw_rcp COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only rcp)
 	add_test(NAME shader_recompiler_f16_store_rtz COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-float16-store-only)
 	set_tests_properties(shader_recompiler_f16_store_rtz PROPERTIES ENVIRONMENT KYTY_F16_STORE_RTZ=1)
+	add_test(NAME shader_recompiler_hw_sincos COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only sincos)
 	add_test(NAME shader_recompiler_helper_quad
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-append-helper-quad-only)
 	add_test(NAME shader_recompiler_tessellation
