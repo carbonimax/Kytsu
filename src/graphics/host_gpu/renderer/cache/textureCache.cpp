@@ -1522,8 +1522,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 			memo_hit         = kept != nullptr && kept->registered;
 		}
 		// KYTY_BIND_PROF: a stale memo (older epoch) whose search keeps the same image again is a miss
-		// only the global epoch caused.
-		const bool prof     = memo_mode != 0 && ImageProf::Enabled();
+		// only the global epoch caused. Resource lookups only: KYTY_BIND_PROF itself memoizes target finds.
+		const bool prof = memo_mode != 0 && ImageProf::Enabled() && desc.type != BindingType::RenderTarget &&
+		                  desc.type != BindingType::DepthTarget;
 		const auto stale_id = prof && memo->id && memo->epoch != m_image_index_epoch ? memo->id : ImageId {};
 		if (prof) [[unlikely]] {
 			m_memo_prof[0]++;
