@@ -185,9 +185,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 	EXIT_IF(size == 0 || imported.memory == nullptr);
 	const ImportedBufferInfo create(graphics, flags, size);
 	const auto created = graphics.device.createBuffer(&create.info, nullptr, &m_buffer);
-	const auto bound   = created == vk::Result::eSuccess
-	                         ? graphics.device.bindBufferMemory(m_buffer, imported.memory, imported.offset)
-	                         : created;
+	vk::BindBufferMemoryInfo bind {};
+	bind.buffer       = m_buffer;
+	bind.memory       = imported.memory;
+	bind.memoryOffset = imported.offset;
+	// The pointer form returns the result unchecked; the enhanced bindBufferMemory asserts on failure.
+	const auto bound = created == vk::Result::eSuccess ? graphics.device.bindBufferMemory2(1, &bind) : created;
 	if (bound != vk::Result::eSuccess) {
 		// Refused by the driver: device memory, as for a refused import (IsImported() stays false).
 		if (created == vk::Result::eSuccess) {
