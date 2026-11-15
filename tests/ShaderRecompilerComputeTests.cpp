@@ -23544,6 +23544,19 @@ public:
         };
         check("indexed embedded fetch", fetch_vs, true, 0);
         check("auto embedded fetch", fetch_vs, false, 4);
+        // Programs are selected again on an already filled state (aliased color targets, single-sample
+        // retry): the embedded fetch inputs are rebuilt, not appended (the vertex input info reset).
+        {
+          DrawRenderState reused{};
+          context.GetPipelineCache().GetGraphicsPrograms(scheduler.Current(), reused);
+          const auto first_resources = reused.vertex_info[0].resources_num;
+          const auto *first_module = reused.vertex_info[0].stage.module;
+          context.GetPipelineCache().GetGraphicsPrograms(scheduler.Current(), reused);
+          Require("GpuIndirectDraw", "programs selected twice",
+                  first_resources >= 1 && reused.vertex_info[0].resources_num == first_resources &&
+                      first_module != nullptr && reused.vertex_info[0].stage.module == first_module,
+                  "a second program selection on the same state appended the vertex inputs again");
+        }
         check("indexed native fetch", vertex_address, true, 2);
         check("auto native fetch", vertex_address, false, 6);
       }
