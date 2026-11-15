@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_ASYNCPIPELINEPOLICY_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_ASYNCPIPELINEPOLICY_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 
@@ -26,12 +27,17 @@ inline constexpr uint64_t ASYNC_PIPELINE_NOT_SKIPPED = UINT64_MAX;
 
 // The next job for a pipeline worker: the skipped keys first, in first-skip order (the nearest cap
 // first), then the predicted ones. LIFO among skipped keys left the oldest queued until their cap,
-// and the draw then created it inline. One of the queues is not empty.
-template <class Queue>
-[[nodiscard]] typename Queue::value_type AsyncPipelinePop(Queue& skipped, Queue& predicted) {
-	auto& from = skipped.empty() ? predicted : skipped;
-	auto  job  = std::move(from.front());
-	from.pop_front();
+// and the draw then created it inline. `uncapped(job)` (KYTY_ASYNC_TESS, tessellation): such skipped
+// keys go after the capped ones, as they have no cap to miss; ahead of them, their creations of
+// seconds held every worker while capped keys reached their cap. One of the queues is not empty.
+template <class Queue, class Uncapped>
+[[nodiscard]] constexpr typename Queue::value_type AsyncPipelinePop(Queue& skipped, Queue& predicted,
+                                                                    Uncapped uncapped) {
+	const auto capped = std::find_if_not(skipped.begin(), skipped.end(), uncapped);
+	auto&      from   = skipped.empty() ? predicted : skipped;
+	const auto next   = capped != skipped.end() ? capped : from.begin();
+	auto       job    = std::move(*next);
+	from.erase(next);
 	return job;
 }
 
