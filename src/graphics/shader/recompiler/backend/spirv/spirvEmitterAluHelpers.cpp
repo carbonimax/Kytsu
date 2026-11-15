@@ -171,20 +171,13 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	              Binary(state, spv::OpFMul, TypeF32(state), value, ConstantF32(state, 0)), value);
 }
 
-uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
-	// Finite values of magnitude 2^23 and above are integers, so fract already gives them +0.
-	const auto fract = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), fract, GlslStd450(state),
-	                          GLSLstd450Fract, src);
-	if (!preserve_signed_zero) {
-		return fract;
-	}
-	const auto abs_bits = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-	                             Unary(state, spv::OpBitcast, TypeU32(state), src),
-	                             ConstantU32(state, 0x7fffffffu));
-	return Select(state, TypeF32(state),
-	              Binary(state, spv::OpIEqual, TypeBool(state), abs_bits, ConstantU32(state, 0)),
-	              src, fract);
+uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src) {
+	// x - roundeven(x) in [-0.5, 0.5] is exact: tiny negative inputs keep their bits (fract rounds
+	// them to 1.0), integers (all finite values from 2^23 up) give +0 and infinities NaN.
+	const auto whole = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), whole, GlslStd450(state),
+	                          GLSLstd450RoundEven, src);
+	return Binary(state, spv::OpFSub, TypeF32(state), src, whole);
 }
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {
