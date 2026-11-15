@@ -29,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -483,8 +484,21 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
+// KYTY_FLIP_RATE=N (0-2): flip every N+1 vblanks whatever rate the game sets; unset = the game's rate.
+static int ForcedFlipRate() {
+	static const int rate = [] {
+		const char* value = std::getenv("KYTY_FLIP_RATE");
+		if (value == nullptr || value[0] < '0' || value[0] > '2' || value[1] != '\0') {
+			return -1;
+		}
+		return value[0] - '0';
+	}();
+	return rate;
+}
+
 static bool IsFlipDueLocked(const VideoOutConfig& cfg) {
-	const int interval = cfg.flip_rate + 1;
+	const int forced   = ForcedFlipRate();
+	const int interval = (forced >= 0 ? forced : cfg.flip_rate) + 1;
 
 	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
 }
