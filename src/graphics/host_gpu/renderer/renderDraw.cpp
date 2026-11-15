@@ -1298,8 +1298,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		CpSplitProf::LookupScope lookup;
 		RefreshShaders(buffer, state, GuessSingleSample(ps_address));
 	}
-	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
-	// compiled.
+	// Vertex programs the host cannot run are not compiled.
 	if (!state.vertex_info[0].stage) {
 		return false;
 	}
