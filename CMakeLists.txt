@@ -897,6 +897,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_negative_offset COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only negative-offset)
 	add_test(NAME shader_recompiler_div_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only div-f32)
 	add_test(NAME shader_recompiler_ds_minmax COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only ds-minmax)
+	add_test(NAME shader_recompiler_hw_rcp COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only rcp)
+	add_test(NAME shader_recompiler_hw_sincos COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only sincos)
 	add_test(NAME shader_recompiler_helper_quad
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-append-helper-quad-only)
 	add_test(NAME shader_recompiler_tessellation
