@@ -330,6 +330,8 @@ private:
 	PendingPipeline* StartPending(const GraphicsPipelineKey& key, const DrawRenderState& state, bool first);
 	// KYTY_COMPILE_LOG: a skipped key's age and queue position (A/Q/X lines).
 	void LogSkip(PendingPipeline& job, bool may_skip);
+	// KYTY_ASYNC_TESS: a tessellation key, skipped without cap and queued after the capped ones.
+	[[nodiscard]] bool AsyncUncapped(const PendingPipeline& job) const;
 	// The pipeline of a pending key: created inline if no worker took it yet, else waited for.
 	void TakePending(PendingPipeline& job);
 	// Loads the shader store: its modules, then its pipelines, created on several threads.
