@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/renderer/whatIf.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -1078,6 +1079,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			PerfStats::Add(PerfStats::Counter::Frames, 1);
+			WhatIf::NoteFrame();
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(

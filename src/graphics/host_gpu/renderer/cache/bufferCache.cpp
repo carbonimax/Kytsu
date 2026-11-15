@@ -10,9 +10,11 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/whatIf.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
@@ -1385,6 +1387,10 @@ bool BufferCache::BeginDeferredUploads() {
 void BufferCache::FlushDeferredUploads() {
 	// One flush at a time: the protections of everything recorded so far, then all their copies.
 	std::lock_guard lock(m_deferred_mutex);
+	// PF-1 front slope: flushes with copies only (empty ones do no work), not the CP back thread.
+	if (WhatIf::On(WhatIf::Site::DefUpload) && !m_deferred_copies.empty() && !CpPipeline::IsBackThread()) {
+		WhatIf::Spin(WhatIf::Site::DefUpload);
+	}
 	PageManager::FlushDeferredProtect();
 	PerfStats::ScopedTimer timer(PerfStats::Counter::StagingWriteNs);
 	for (const auto& copy: m_deferred_copies) {

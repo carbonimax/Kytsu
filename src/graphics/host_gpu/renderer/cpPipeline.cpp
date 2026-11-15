@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/whatIf.h"
 
 #include <atomic>
 #include <chrono>
@@ -144,6 +145,7 @@ void BackThread() {
 			}
 		}
 		const auto start = NowNs();
+		WhatIf::Spin(WhatIf::Site::Back);
 		s.execute(s.context, Slot(tail));
 		s.back_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
 		s.tail.store(tail + 1, std::memory_order_seq_cst);

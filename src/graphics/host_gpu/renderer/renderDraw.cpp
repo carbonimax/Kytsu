@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/whatIf.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -2450,6 +2451,7 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	CopySnapshots(record);
 	CpPipeline::Note(CpPipeline::Stat::Queued);
 	CpPipeline::Publish();
+	WhatIf::Spin(WhatIf::Site::Front);
 	return true;
 }
 
