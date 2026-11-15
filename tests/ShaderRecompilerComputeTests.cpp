@@ -15716,6 +15716,8 @@ public:
     int map = 0;
   };
   ReplayUnmappable m_replay_unmappable;
+  // Replays of each capture in one context (--gpu-replay-loop N, R5G-7); 1 = a single replay.
+  uint32_t m_replay_loops = 1;
   // Owned by no host: between the guest user range (HOST_USER_MAX) and extended memory, on every platform.
   static constexpr uint64_t kUnmappableAddress = 0x000000fe00000000ull;
   // The synthetic capture with one more range at kUnmappableAddress.
@@ -15895,63 +15897,74 @@ public:
     // 1 s with every queue blocked, the Updates are written anyway.
     // shortcut: no WaitValue breaker yet, so a blocked queue may then read them too early.
     constexpr uint32_t idle_timeout_ms = 1000;
-    // The command processor state each queue had when the recording started (compute queues across
-    // frames, every queue for a scope starting after submission 0). KYTY_REPLAY_NO_CP_STATE=1
-    // (diagnostics) replays from reset processors, as before the record existed.
-    static const bool no_cp_state = std::getenv("KYTY_REPLAY_NO_CP_STATE") != nullptr;
-    uint32_t cp_states = 0;
-    for (const auto &record : capture.records) {
-      if (const auto *state = std::get_if<GpuCapture::CpState>(&record); state != nullptr && !no_cp_state) {
-        Require(name, "cp state", gpu.RestoreCpState(state->queue, state->bytes),
-                fmt::format("the CP state of queue 0x{:x} has another layout (capture from another build)", state->queue));
-        cp_states++;
-      }
-    }
-    if (cp_states != 0) std::printf("[gpu]     %s %u queue states restored\n", name, cp_states);
-    uint32_t busy = 0;
-    size_t submit_index = 0;
-    for (const auto &record : capture.records) {
-      if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
-        const auto &pending = updates[submit_index++];
-        if (!pending.empty() && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
-        for (const auto *update : pending) {
-          std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
-                      update->bytes.size());
-        }
-        const std::span commands{reinterpret_cast<const uint32_t *>(submit->address),
-                                 submit->dword_count};
-        if (submit->queue == 0) {
-          gpu.Submit(commands);
-        } else {
-          gpu.SubmitCompute(submit->queue, commands);
-        }
-        // KYTY_REPLAY_SERIAL=1 (diagnostics): no queue overlap, each submission runs alone in capture order.
-        static const bool serial = std::getenv("KYTY_REPLAY_SERIAL") != nullptr;
-        if (serial && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
-      } else if (std::holds_alternative<GpuCapture::FrameEnd>(record)) {
-        gpu.SuspendPoint();
-      }
-    }
-    const bool blocked_at_end = !gpu.WaitForIdle(10 * idle_timeout_ms, in_flight);
-    busy += blocked_at_end ? 1 : 0;
-    if (busy != 0) std::printf("[gpu]     %s %u updates or the end while a queue still waits\n", name, busy);
-    const auto queued = gpu.DescribeQueued();
-    if (!queued.empty()) std::printf("[gpu]     %s queued at the end:\n%s", name, queued.c_str());
-    if (!blocked_at_end && !in_flight.empty()) {
-      std::printf("[gpu]     %s in flight at the frame end: %zu captured, %u left blocked and dropped\n", name,
-                  in_flight.size(), gpu.DropQueued());
-    }
     auto &scheduler = context.GetCommandScheduler();
-    gpu.SendCommandSync([&] {
-      scheduler.Finish();
-      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
-    });
-    // Outputs are published as the capture published them.
     std::vector<GpuCapture::Unpublished> unpublished;
-    gpu.SendCommandSync([&] {
-      context.GetTextureCache().DownloadGpuModified(&unpublished);
-      context.GetBufferCache().ReadGpuModified();
-    });
+    // Time of the last run_frame(), from the CP state restore to the scheduler finish (the publish is not in it).
+    double frame_ms = 0;
+    // One replay of the frame from the captured CP state, then the publish; true when a queue is still
+    // blocked at the end.
+    const auto run_frame = [&] {
+      const auto frame_start = std::chrono::steady_clock::now();
+      // The command processor state each queue had when the recording started (compute queues across
+      // frames, every queue for a scope starting after submission 0). KYTY_REPLAY_NO_CP_STATE=1
+      // (diagnostics) replays from reset processors, as before the record existed.
+      static const bool no_cp_state = std::getenv("KYTY_REPLAY_NO_CP_STATE") != nullptr;
+      uint32_t cp_states = 0;
+      for (const auto &record : capture.records) {
+        if (const auto *state = std::get_if<GpuCapture::CpState>(&record); state != nullptr && !no_cp_state) {
+          Require(name, "cp state", gpu.RestoreCpState(state->queue, state->bytes),
+                  fmt::format("the CP state of queue 0x{:x} has another layout (capture from another build)", state->queue));
+          cp_states++;
+        }
+      }
+      if (cp_states != 0) std::printf("[gpu]     %s %u queue states restored\n", name, cp_states);
+      uint32_t busy = 0;
+      size_t submit_index = 0;
+      for (const auto &record : capture.records) {
+        if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
+          const auto &pending = updates[submit_index++];
+          if (!pending.empty() && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
+          for (const auto *update : pending) {
+            std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
+                        update->bytes.size());
+          }
+          const std::span commands{reinterpret_cast<const uint32_t *>(submit->address),
+                                   submit->dword_count};
+          if (submit->queue == 0) {
+            gpu.Submit(commands);
+          } else {
+            gpu.SubmitCompute(submit->queue, commands);
+          }
+          // KYTY_REPLAY_SERIAL=1 (diagnostics): no queue overlap, each submission runs alone in capture order.
+          static const bool serial = std::getenv("KYTY_REPLAY_SERIAL") != nullptr;
+          if (serial && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
+        } else if (std::holds_alternative<GpuCapture::FrameEnd>(record)) {
+          gpu.SuspendPoint();
+        }
+      }
+      const bool blocked = !gpu.WaitForIdle(10 * idle_timeout_ms, in_flight);
+      busy += blocked ? 1 : 0;
+      if (busy != 0) std::printf("[gpu]     %s %u updates or the end while a queue still waits\n", name, busy);
+      const auto queued = gpu.DescribeQueued();
+      if (!queued.empty()) std::printf("[gpu]     %s queued at the end:\n%s", name, queued.c_str());
+      if (!blocked && !in_flight.empty()) {
+        std::printf("[gpu]     %s in flight at the frame end: %zu captured, %u left blocked and dropped\n", name,
+                    in_flight.size(), gpu.DropQueued());
+      }
+      gpu.SendCommandSync([&] {
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      });
+      frame_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frame_start).count();
+      // Outputs are published as the capture published them.
+      unpublished.clear();
+      gpu.SendCommandSync([&] {
+        context.GetTextureCache().DownloadGpuModified(&unpublished);
+        context.GetBufferCache().ReadGpuModified();
+      });
+      return blocked;
+    };
+    const bool blocked_at_end = run_frame();
     const auto platform = CurrentPlatform();
     const GpuCapture::Platform *own = nullptr;
     bool other_platforms = false;
@@ -15974,6 +15987,7 @@ public:
                   own != nullptr ? "own hashes" : by_thumbnail ? "no hashes of its own, color Expects by thumbnail" : "capture hashes",
                   thumbs.size());
     }
+    std::vector<uint64_t> first_hashes;
     uint32_t mismatches = 0, accepted = 0;
     size_t expect_index = 0;
     for (size_t record_index = 0; record_index < capture.records.size(); record_index++) {
@@ -15988,6 +16002,7 @@ public:
         std::vector<uint8_t> bytes(expect->size);
         const bool read = Memory::TryReadBacking(expect->address, bytes.data(), bytes.size());
         const auto hash = read ? XXH3_64bits(bytes.data(), bytes.size()) : 0;
+        first_hashes.push_back(hash);
         auto expected = expect->hash;
         if (own != nullptr) {
           const auto it = std::ranges::find_if(own->hashes, [&](const GpuCapture::Expect &e) {
@@ -16054,11 +16069,59 @@ public:
       }
     }
     if (accepted != 0) std::printf("[gpu]     %s %u known nondeterministic Expects accepted\n", name, accepted);
+    if (m_replay_loops > 1) std::printf("[gpu]     %s loop 0 ms=%.3f (first replay: cold pipelines)\n", name, frame_ms);
     if (blocked_at_end) {
       // The blocked queue keeps polling guest memory, so it cannot be unmapped: leave the process.
       std::printf("[gpu]     %s mismatches=%u, a queue is still blocked: exit without unmapping\n", name, mismatches);
       std::fflush(stdout);
       std::_Exit(2);
+    }
+    // --gpu-replay-loop N (R5G-7): N - 1 more replays of the frame in this context (warm pipelines and
+    // caches), each from the captured memory again, as a screen for GPU-side changes; never a final gate
+    // (no front, no guest). Every replay must give the first one's hashes, else the loop is not faithful.
+    // shortcut: wall time only (back and GPU overlap), no GPU timestamps; add them if the screen needs the split.
+    if (m_replay_loops > 1) {
+      std::vector<double> warm;
+      for (uint32_t iteration = 1; iteration < m_replay_loops; iteration++) {
+        for (const auto &[begin, end] : merged) {
+          std::memset(reinterpret_cast<void *>(begin), 0, end - begin);
+        }
+        for (const auto &record : capture.records) {
+          if (const auto *memory = std::get_if<GpuCapture::Memory>(&record)) {
+            std::memcpy(reinterpret_cast<void *>(memory->address), memory->bytes.data(), memory->bytes.size());
+          }
+        }
+        if (run_frame()) {
+          std::printf("[gpu]     %s loop %u INVALID: a queue is still blocked at the end\n", name, iteration);
+          std::fflush(stdout);
+          std::_Exit(2);
+        }
+        uint32_t differ = 0;
+        size_t index = 0;
+        for (const auto &record : capture.records) {
+          const auto *expect = std::get_if<GpuCapture::Expect>(&record);
+          if (expect == nullptr) continue;
+          const auto first = first_hashes[index++];
+          if (nondet.contains(expect->address)) continue;
+          context.GetBufferCache().ReadMemory(expect->address, expect->size);
+          std::vector<uint8_t> bytes(expect->size);
+          const bool read = Memory::TryReadBacking(expect->address, bytes.data(), bytes.size());
+          differ += (read ? XXH3_64bits(bytes.data(), bytes.size()) : 0) == first ? 0 : 1;
+        }
+        std::printf("[gpu]     %s loop %u ms=%.3f%s\n", name, iteration, frame_ms, differ == 0 ? "" : " INVALID");
+        Require(name, "loop", differ == 0,
+                fmt::format("replay {} gave other hashes than the first one on {} Expects: the loop does not "
+                            "restore the frame", iteration, differ));
+        warm.push_back(frame_ms);
+      }
+      const auto n = static_cast<double>(warm.size());
+      double mean = 0, sd = 0;
+      for (const auto ms : warm) mean += ms / n;
+      for (const auto ms : warm) sd += (ms - mean) * (ms - mean);
+      sd = warm.size() > 1 ? std::sqrt(sd / (n - 1)) : 0;
+      std::ranges::sort(warm);
+      std::printf("[gpu]     %s loop warm n=%zu mean=%.3f sd=%.3f (%.2f %%) min=%.3f median=%.3f\n", name,
+                  warm.size(), mean, sd, mean > 0 ? 100 * sd / mean : 0, warm.front(), warm[warm.size() / 2]);
     }
     gpu.SendCommandSync([&] {
       // Cache buffers are rounded and grown past the captured blocks (unmapped here, mapped in the
@@ -60823,6 +60886,29 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCaptureReplay();
     return 0;
+  }
+  // The synthetic capture replayed 3 times in one context: every replay restores the frame (R5G-7).
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-capture-replay-loop-only") == 0) {
+    VulkanHarness vulkan;
+    GpuCapture::Capture capture;
+    vulkan.CheckGpuCaptureReplay(&capture);
+    vulkan.m_replay_loops = 3;
+    Require("GpuReplayLoop", "replay", vulkan.ReplayGpuCapture("GpuReplayLoop", capture) == 0,
+            "replayed output differs");
+    std::printf("[gpu]     %-32s ok\n", "GpuReplayLoop");
+    return 0;
+  }
+  // --gpu-replay-loop <N> <file>: the capture replayed N times in one context, one time line per replay
+  // and the warm mean and spread (replays 2..N); a screen for GPU-side changes, never a final gate.
+  if (argc == 4 && std::strcmp(argv[1], "--gpu-replay-loop") == 0) {
+    const auto loops = std::strtoul(argv[2], nullptr, 10);
+    if (loops < 2 || loops > 1000) {
+      std::fprintf(stderr, "--gpu-replay-loop: N must be 2..1000\n");
+      return 2;
+    }
+    VulkanHarness vulkan;
+    vulkan.m_replay_loops = static_cast<uint32_t>(loops);
+    return vulkan.ReplayGpuCaptureFile(argv[3]);
   }
   if (argc == 3 && (std::strcmp(argv[1], "--gpu-replay") == 0 || std::strcmp(argv[1], "--gpu-replay-record") == 0)) {
     VulkanHarness vulkan;
