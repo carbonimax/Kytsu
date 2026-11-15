@@ -1808,24 +1808,25 @@ void TestUndefinedImageFormatBindsNull() {
                            Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k4_4_4_4UNorm,
                            Prospero::BufferFormat::kFmask8_S2_F1, Prospero::BufferFormat::kBc7Srgb})
     Check(Prospero::IsDefinedBufferFormat(named), "a named format counts as undefined");
-  const auto make_plan = [](const std::array<uint32_t, 8> &dwords) {
-    Program program;
-    program.stage = ShaderType::Compute;
-    program.srt_plan_complete = program.resource_tracking_complete = true;
-    AddValueBlock(program);
-    DescriptorSource image;
-    image.dword_count = 8u;
-    for (uint32_t i = 0; i < 8u; ++i) image.dwords[i] = Value(dwords[i]);
-    program.descriptor_sources.push_back(image);
-    program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Sampled, .read = true});
-    return ExtractResourcePlan(program);
-  };
+  // The T# comes from user data, so the walk reads it the way a draw does.
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 8u;
+  auto &block = AddValueBlock(program);
+  DescriptorSource image;
+  image.dword_count = 8u;
+  for (uint32_t i = 0; i < 8u; ++i)
+    image.dwords[i] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(i))}));
+  program.descriptor_sources.push_back(image);
+  program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Sampled, .read = true});
+  const auto plan = ExtractResourcePlan(program);
   ShaderTextureResource input{};
   std::copy_n(words.begin(), 8, input.fields);
   Check(!input.IsNull(), "the recorded descriptor is already null, the format check would not be what rejects it");
-  const auto plan = make_plan(words);
+  auto data = words;
   for (const bool native_null : {false, true}) {
-    SrtRuntime runtime{.null_descriptor_supported = native_null};
+    SrtRuntime runtime{.user_data = data, .null_descriptor_supported = native_null};
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     // Twice: the second rejection of the same format must not log again (checked by eye on stderr).
@@ -1838,15 +1839,16 @@ void TestUndefinedImageFormatBindsNull() {
       Check(specialization.images[0].null_fallback == !native_null, "the null image did not follow null descriptor support");
     }
   }
-  // Control: a defined format keeps its descriptor untouched.
-  std::array<uint32_t, 8> defined{};
-  defined[0] = 0x1000u;
-  defined[1] = uint32_t(Prospero::BufferFormat::k32Float) << 20u;
-  defined[3] = DstSel(4, 5, 6, 7) | (uint32_t(Prospero::ImageType::kColor2D) << 28u);
+  // Control, same plan: a defined format keeps its descriptor untouched, so the walk did read the T#.
+  data = {};
+  data[0] = 0x1000u;
+  data[1] = uint32_t(Prospero::BufferFormat::k32Float) << 20u;
+  data[3] = DstSel(4, 5, 6, 7) | (uint32_t(Prospero::ImageType::kColor2D) << 28u);
+  const SrtRuntime runtime{.user_data = data};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(make_plan(defined), {}, snapshot, specialization) &&
-            std::ranges::equal(snapshot.images[0].dwords, defined) && !specialization.images[0].null_fallback,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            std::ranges::equal(snapshot.images[0].dwords, data) && !specialization.images[0].null_fallback,
         "a defined format was rejected or altered");
 }
 

@@ -354,9 +354,10 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
   };
   put(16u, 0u);
   put(64u, 1u);
-  // A structurally valid but unsupported format at an unreachable DWORD start.
+  // A structurally valid but unsupported format (k8SScaled, named but unsampled) at an
+  // unreachable DWORD start. A gap format would now bind null instead of failing when read.
   const std::array<uint32_t, 8> unreachable{
-      0x00fff000u, 0x09500000u, 0u, 0x900003acu, 0u, 0u, 0u, 0u};
+      0x00fff000u, 0x00400000u, 0u, 0x900003acu, 0u, 0u, 0u, 0u};
   std::copy(unreachable.begin(), unreachable.end(), memory.words.begin() + 0x1064u / 4u);
   SrtRuntime runtime{.user_data = data, .userdata = &memory,
                      .read_specialization_memory = ReadLinearTestMemory};
