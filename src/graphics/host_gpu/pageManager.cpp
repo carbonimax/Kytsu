@@ -420,6 +420,10 @@ PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
 
+uint64_t PageManager::GetPageSize() const {
+	return PAGE_SIZE;
+}
+
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);
