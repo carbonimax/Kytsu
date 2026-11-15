@@ -22602,12 +22602,18 @@ public:
         }
       }
       depth.depth_test_enable = false;
+      // Without the dynamic loop state `filled` bakes the feedback loop of the writing draws, and
+      // these read-only draws select the pipeline without it: compare against that one.
+      const auto bounds_reference = pipeline(true, 2, 2).pipeline;
+      Require(name, "read-only pipeline",
+              (bounds_reference == filled.pipeline) == m_feedback_loop_dynamic,
+              "the baked feedback loop did not follow the depth writes");
       for (uint32_t pass = 0; pass < 3; pass++) {
         depth.depth_bounds_test_enable = pass != 2;
         registers.SetDepthBoundsMin(pass == 0 ? 0.5f : 0.625f);
         registers.SetDepthBoundsMax(pass == 0 ? 0.5625f : 0.6875f);
         Require(name, "dynamic depth bounds pipeline reuse",
-                pipeline(true, 2, 2).pipeline == filled.pipeline,
+                pipeline(true, 2, 2).pipeline == bounds_reference,
                 "changing depth bounds or their enable state created another pipeline");
         draw(filled);
         const auto bounded_pixels = read_color();
