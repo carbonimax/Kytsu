@@ -1498,6 +1498,13 @@ bool Track(State& st, uint64_t vaddr, uint64_t size, Make&& make) {
 
 // GPU thread or CP back thread, inside ObtainBuffer of a read. True: a new watched range (protect it).
 bool Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, uint64_t buffer_size = 0) {
+	// shortcut: only the four Scope sites are watched (vertex, index, indirect arguments, storage
+	// descriptors). Imported reads never watched: texture sources (TextureCache upload), color
+	// metadata checks bound for reading, DMA copy sources, ObtainBufferForImage, device-address reads
+	// (SynchronizeBda), and any range with a GPU-modified page (ObtainBuffer). A guest rewrite there
+	// under the GPU is neither seen nor demoted. Upgrade (a default site for reads outside a Scope)
+	// once such a rewrite is measured, or before listing a title that streams textures from imported
+	// memory.
 	if (t_site == Site::None) {
 		return false;
 	}
