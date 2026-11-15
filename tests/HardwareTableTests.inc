@@ -2,8 +2,8 @@
 // The table data comes from AnyPS5 (github.com/boykopovar/AnyPS5 at 342b06eb3a, GPL-2.0):
 // core/libs/prx/libSceAgcDriver/tests/execution/RcpHardware.cpp and SinCosReduction.cpp. The drivers
 // and the checks below are ours. The recompiler does not reproduce RDNA 2 bit for bit (V_RCP_F32 is an
-// OpFDiv, V_SIN_F32/V_COS_F32 use GLSL Sin/Cos), so each table checks a bound, prints how many results
-// hold the hardware bits, and KYTY_HW_TABLE_EXACT=1 requires every bit.
+// OpFDiv, V_SIN_F32/V_COS_F32 fold turns exactly, then use GLSL Sin), so each table checks a bound, prints
+// how many results hold the hardware bits, and KYTY_HW_TABLE_EXACT=1 requires every bit.
 
 namespace HardwareTables {
 

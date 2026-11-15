@@ -33978,7 +33978,7 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
-  test.required_spirv = {" Fract ", " Cos "};
+  test.required_spirv = {" RoundEven ", " Sin "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -34024,7 +34024,7 @@ TestCase VectorSinF16SdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
-  test.required_spirv = {" Fract ", " Sin "};
+  test.required_spirv = {" RoundEven ", " Sin "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -60705,6 +60705,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorSpecialF16Ops());
     RunCase(&vulkan, VectorCosF16CapturedSdwaAndEdges());
     RunCase(&vulkan, VectorSinF16SdwaAndEdges());
+    RunCase(&vulkan, VectorSinCosMaxFiniteSpecialCases());
     RunCase(&vulkan, VectorFloatConversionOps());
     return 0;
   }
