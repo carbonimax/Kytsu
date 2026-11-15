@@ -423,16 +423,23 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	// Events are gathered into host memory and copied to the guest after the queue mutex is released:
+	// a write fault on `ev` under that mutex can wait for the GPU thread while the priority thread
+	// (TriggerEvent) waits for the mutex and the GPU thread waits for the priority thread.
+	std::vector<KernelEvent> events(static_cast<size_t>(num));
 	if (timo == nullptr) {
-		*out = owner->WaitForEvents(ev, num, 0);
+		*out = owner->WaitForEvents(events.data(), num, 0);
 	}
 
 	if (timo != nullptr) {
 		if (*timo == 0) {
-			*out = owner->GetTriggeredEvents(ev, num);
+			*out = owner->GetTriggeredEvents(events.data(), num);
 		} else {
-			*out = owner->WaitForEvents(ev, num, *timo);
+			*out = owner->WaitForEvents(events.data(), num, *timo);
 		}
+	}
+	if (*out > 0) {
+		std::copy_n(events.begin(), *out, ev);
 	}
 
 	if (*out == KERNEL_ERROR_EBADF) {
