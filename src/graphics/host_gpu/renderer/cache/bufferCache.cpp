@@ -2448,7 +2448,8 @@ static bool ImportExcluded(uint64_t vaddr, uint64_t size) {
 void BufferCache::DemoteImported(uint64_t vaddr, uint64_t size) {
 	m_import_demoted.emplace_back(vaddr, vaddr + size);
 	DropImported(vaddr, size);
-	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	// The key may be stale: a device buffer now holds the range, some pages GPU-written since.
+	m_memory_tracker.MarkRegionAsCpuModifiedExceptGpu(vaddr, size);
 }
 
 // KYTY_MEM_IMPORT_GPU_WRITES=1 keeps GPU-written buffers on imported memory (device lost in game A:
