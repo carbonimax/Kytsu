@@ -6702,6 +6702,46 @@ public:
         Require(name, "unpinned change", pending() == unpinned,
                 "an image no heap pins queued a heap change");
       }
+      // A pinned depth image left in its read layout widens its tracked access with each
+      // read-only depth test (KYTY_RO_DEPTH_ELIDE); leaving that layout must still queue it. The
+      // depth-only image takes the read-only attachment use KYTY_DEPTH_LAYOUT_KEEP keeps.
+      for (const bool with_stencil : {true, false}) {
+        const uint64_t address = base + (with_stencil ? 0x80000u : 0x90000u);
+        auto desc = MakeLinearDesc(
+            address, 16u * 16u * 4u,
+            with_stencil ? vk::Format::eD32SfloatS8Uint : vk::Format::eD32Sfloat,
+            Format::k32Float, Prospero::ImageType::kColor2D, {16, 16, 1}, 1, 4, 1);
+        desc.type = TextureCache::BindingType::DepthTarget;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        if (with_stencil) {
+          desc.info.stencil = {address + 0x8000u, 16u * 16u};
+          desc.view_info.aspect |= vk::ImageAspectFlagBits::eStencil;
+        }
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        auto &depth = textures.GetImage(textures.FindImage(desc));
+        const auto depth_queued = [&] {
+          std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+          return std::ranges::count(Libs::Graphics::Image::heap_changes, depth.serial,
+                                    &Libs::Graphics::Image::HeapChange::serial);
+        };
+        constexpr auto attachment = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+        const auto commands = scheduler.Current().Handle();
+        depth.heap_refs.fetch_add(1u);
+        depth.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                      vk::AccessFlagBits2::eShaderRead, {}, commands);
+        depth.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal, attachment, {}, commands);
+        const auto widened = depth_queued();
+        depth.Transit(vk::ImageLayout::eDepthStencilAttachmentOptimal, attachment, {}, commands);
+        Require(name, with_stencil ? "read-only depth/stencil exit" : "read-only depth exit",
+                depth_queued() == widened + 1,
+                "a pinned depth image left its read layout unqueued after a read-only depth test");
+        depth.heap_refs.fetch_sub(1u);
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        std::erase_if(Libs::Graphics::Image::heap_changes, [&](const auto &change) {
+          return change.serial == depth.serial;
+        });
+      }
       // One element serves a descriptor in every table. A table the guest republishes at a new
       // base takes over the copy that idled a frame, with its views and slots.
       constexpr uint64_t copy_table = base + 0x1c0000;
@@ -8902,8 +8942,27 @@ public:
                                         ms_stencil_size};
       const auto switched_ms_depth_id =
           texture_cache.FindImage(switched_ms_depth);
+      // A heap may pin the ordinary image that becomes the association.
+      const auto stencil_serial = texture_cache.GetImage(stencil_storage_image).serial;
+      const auto stencil_queued = [&] {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        return std::ranges::count(Libs::Graphics::Image::heap_changes, stencil_serial,
+                                  &Libs::Graphics::Image::HeapChange::serial);
+      };
+      texture_cache.GetImage(stencil_storage_image).heap_refs.fetch_add(1u);
+      const auto before_association = stencil_queued();
       TextureCacheTestAccess::AssociateStencil(
           texture_cache, switched_ms_depth_id, switched_ms_depth.info.stencil);
+      Require(name, "pinned stencil association",
+              stencil_queued() == before_association + 1,
+              "a pinned image became a stencil association without a heap change");
+      texture_cache.GetImage(stencil_storage_image).heap_refs.fetch_sub(1u);
+      {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        std::erase_if(Libs::Graphics::Image::heap_changes, [&](const auto &change) {
+          return change.serial == stencil_serial;
+        });
+      }
       const auto second_stencil_association = texture_cache.FindImageFromRange(
           base + second_stencil_offset, ms_stencil_size, false);
       Require(name, "stencil association switch",

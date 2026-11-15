@@ -138,7 +138,7 @@ public:
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept {
+	void               MarkBufferModified() {
 		m_buffer_modified = true;
 		refresh_note.fault_only = false;
 		HeapChanged();

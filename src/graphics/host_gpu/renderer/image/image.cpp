@@ -441,10 +441,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
-	// Resident heaps sample their images in the read state; only leaving it invalidates them.
+	// Resident heaps sample their images in the read state; only leaving it invalidates them. Not
+	// keyed on the access: ElideReadOnlyDepthBarrier widens a read-only depth image's access.
 	if (std::ranges::any_of(barriers, [&](const vk::ImageMemoryBarrier2& barrier) {
-		    return barrier.oldLayout == ReadLayout() &&
-		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
+		    return barrier.oldLayout == ReadLayout();
 	    })) {
 		HeapChanged();
 	}
