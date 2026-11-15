@@ -209,6 +209,12 @@
               <property name="text"><string>Relaxed shader float math</string></property>
              </widget>
             </item>
+            <item row="13" column="1">
+             <widget class="QCheckBox" name="checkBox_recommended_options">
+              <property name="toolTip"><string>Add the recommended environment variables and arguments for this game from presets.json next to the launcher, or from the file in KYTY_PRESETS. Your own settings and environment variables win.</string></property>
+              <property name="text"><string>Use recommended options</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

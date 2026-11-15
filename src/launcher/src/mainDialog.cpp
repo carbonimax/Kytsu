@@ -6,6 +6,7 @@
 #include "configurationListWidget.h"
 #include "controllerPreview.h"
 #include "gameContent.h"
+#include "presets.h"
 #include "titleSound.h"
 #include "updateChecker.h"
 
@@ -425,6 +426,31 @@ static QString CmdCommand(const QString& interpreter, const QStringList& args,
 }
 #endif
 
+// A missing or malformed file only logs a warning: the game starts without presets.
+static void ApplyPresets(const Configuration& info, QProcessEnvironment& environment,
+                         QStringList& args) {
+#if defined(__APPLE__)
+	const auto dir = QCoreApplication::applicationDirPath() + "/../Resources";
+#else
+	const auto dir = QCoreApplication::applicationDirPath();
+#endif
+	const auto path = Presets::FilePath(dir);
+	QFile      file(path);
+	if (!file.open(QIODevice::ReadOnly)) {
+		qWarning().noquote() << "Recommended options: cannot read" << path << "-" << file.errorString();
+		return;
+	}
+	Presets::Preset preset;
+	QString         error;
+	if (!Presets::Parse(file.readAll(), info.title_id.trimmed().toUpper(), preset, error)) {
+		qWarning().noquote() << "Recommended options: ignoring" << path << "-" << error;
+		return;
+	}
+	const auto applied = Presets::Apply(preset, environment, args);
+	qInfo().noquote() << "Recommended options from" << path << "applied:"
+	                  << (applied.isEmpty() ? QStringLiteral("(none)") : applied.join(' '));
+}
+
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
 	const auto& interpreter = m_p->GetInterpreter();
 
@@ -434,6 +460,26 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 		QApplication::quit();
 		return;
 	}
+
+	// Presets come last so the dialog settings and the user's environment win.
+	auto environment = QProcessEnvironment::systemEnvironment();
+#if defined(__APPLE__)
+	QString error;
+	if (!info.MacEnvironment(environment, error)) {
+		QMessageBox::critical(this, tr("Error"), error);
+		return;
+	}
+#endif
+	if (info.recommended_options) {
+		ApplyPresets(info, environment, args);
+	}
+#if defined(__APPLE__)
+	process->setProcessEnvironment(environment);
+#else
+	if (info.recommended_options) {
+		process->setProcessEnvironment(environment);
+	}
+#endif
 
 	// Without a terminal, the emulator runs directly.
 	process->setProgram(interpreter);
@@ -453,13 +499,6 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
 #endif
 #if defined(__APPLE__)
-	auto environment = QProcessEnvironment::systemEnvironment();
-	QString error;
-	if (!info.MacEnvironment(environment, error)) {
-		QMessageBox::critical(this, tr("Error"), error);
-		return;
-	}
-	process->setProcessEnvironment(environment);
 	const auto runtime = Configuration::MacRuntimeDirectory();
 	if (!QDir().mkpath(runtime)) {
 		QMessageBox::critical(this, tr("Error"), tr("Cannot create runtime folder: %1").arg(runtime));
