@@ -1,5 +1,5 @@
 {
-  description = "KytyPS5 development shell";
+  description = "Kytsu development shell";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
