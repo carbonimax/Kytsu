@@ -752,6 +752,42 @@ void TestUnreadPressSurvivesStickBurst() {
 	      "a stick move after a read did not add a sample");
 }
 
+void SetLatch(const char* value) {
+#ifdef _WIN32
+	_putenv_s("KYTY_PAD_LATCH", value);
+#else
+	setenv("KYTY_PAD_LATCH", value, 1);
+#endif
+}
+
+// A game polling only the current state at a low frame rate misses a short press without the latch.
+void TestPressBetweenStateReads() {
+	PadData data {};
+	{
+		Controller controller;
+		SetButton(1, PAD_BUTTON_CROSS, true);
+		SetButton(1, PAD_BUTTON_CROSS, false);
+		Check(PadReadState(1, &data) == OK && data.buttons == 0, "the current state kept a released press");
+	}
+	SetLatch("1");
+	{
+		Controller controller;
+		SetButton(1, PAD_BUTTON_CROSS, true);
+		SetButton(1, PAD_BUTTON_CROSS, false);
+		Check(PadReadState(1, &data) == OK && data.buttons == PAD_BUTTON_CROSS,
+		      "a press released between two reads was lost");
+		Check(PadReadState(1, &data) == OK && data.buttons == 0, "a latched press was reported twice");
+		std::array<PadData, 64> history {};
+		Check(PadRead(1, history.data(), 64) == 2, "the current-state reads consumed the history");
+		SetButton(1, PAD_BUTTON_CIRCLE, true);
+		SetButton(1, PAD_BUTTON_CIRCLE, false);
+		Check(PadRead(1, history.data(), 64) == 2 && history[0].buttons == PAD_BUTTON_CIRCLE &&
+		          history[1].buttons == 0 && PadReadState(1, &data) == OK && data.buttons == 0,
+		      "a press returned by the history was latched again");
+	}
+	SetLatch("");
+}
+
 void TestTouchWithoutClick() {
 	Controller controller;
 	PadData    data {};
@@ -779,6 +815,7 @@ int main() {
 	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
 	TestUnreadPressSurvivesStickBurst();
+	TestPressBetweenStateReads();
 	TestTouchWithoutClick();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();

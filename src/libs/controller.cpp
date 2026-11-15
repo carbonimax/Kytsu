@@ -16,7 +16,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -142,6 +144,7 @@ public:
 	float GetSettingScale(Setting setting) const;
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
+	void ProfileRead(bool history, int num, int history_num, const PadData* data, int data_num);
 
 private:
 	static constexpr uint32_t STATES_MAX = 64;
@@ -160,6 +163,7 @@ private:
 	void ApplyVibration();
 	bool SendTriggerEffect(const PadTriggerEffectParam& param);
 	void UpdateTriggerEffectState();
+	void ProfileButtons(uint32_t before);
 
 	Common::Mutex    m_mutex;
 	PortState        m_port_state      = PortState::Uninitialized;
@@ -180,6 +184,9 @@ private:
 	uint32_t         m_states_num    = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
+	// KYTY_PAD_LATCH: buttons pressed since the last current-state read.
+	// shortcut: only Button() edges, not the L2/R2 bits from Axis() or the touch click; add them if a game drops those.
+	uint32_t         m_latched       = 0;
 	// The game's last requests, re-sent when their intensity setting changes.
 	std::array<uint8_t, 2> m_vibration {};
 	uint64_t               m_vibration_until = 0;
@@ -187,7 +194,24 @@ private:
 	PadTriggerEffectStateInformation m_trigger_state {};
 	// Setting changes share the output lock; audio only needs an atomic scale snapshot.
 	std::array<std::atomic<uint32_t>, 3> m_setting_steps {};
+	// KYTY_PAD_PROF: guest read counts per second, and each host press followed until a read returns it.
+	struct PadProfile {
+		uint64_t second          = 0;
+		uint32_t state_reads     = 0;
+		uint32_t history_reads   = 0;
+		uint32_t history_samples = 0;
+		uint32_t history_empty   = 0;
+		int      history_max     = 0;
+		int      num             = 0;
+		uint32_t pending         = 0;
+		uint32_t released        = 0;
+		std::array<uint64_t, 32> down {};
+		std::array<uint64_t, 32> up {};
+	} m_prof;
 };
+
+static bool g_pad_prof  = false;
+static bool g_pad_latch = false;
 
 static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_players;
 // Each player's special port (wheels, guitars, ...); no host device feeds it.
@@ -460,6 +484,12 @@ static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int va
 void Initialize() {
 	EXIT_IF(g_players[0] != nullptr);
 
+	const char* prof = std::getenv("KYTY_PAD_PROF");
+	g_pad_prof       = prof != nullptr && prof[0] == '1';
+	// A game that only reads the current state misses a press released between two of its reads.
+	const char* latch = std::getenv("KYTY_PAD_LATCH");
+	g_pad_latch       = latch != nullptr && latch[0] == '1';
+
 	for (int i = 0; i < Config::MAX_PLAYERS; i++) {
 		g_players[i]       = std::make_unique<GameController>(i, PAD_PORT_TYPE_STANDARD);
 		g_special_ports[i] = std::make_unique<GameController>(i, PAD_PORT_TYPE_SPECIAL);
@@ -532,6 +562,7 @@ void GameController::SetDevices(int active_id) {
 	m_up_reference_valid = false;
 	m_states_num    = 0;
 	m_first_state   = 0;
+	m_latched       = 0;
 	m_next_touch_id = 1;
 	m_vibration          = {};
 	m_vibration_until    = 0;
@@ -571,9 +602,16 @@ void GameController::Button(int id, uint32_t button, bool down) {
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
+		const uint32_t before = m_state.buttons;
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
 
 		AddState();
+		if (g_pad_latch) {
+			m_latched |= m_state.buttons & ~before;
+		}
+		if (g_pad_prof) {
+			ProfileButtons(before);
+		}
 	}
 }
 
@@ -848,6 +886,7 @@ void GameController::ResetInputState() {
 	m_state.time    = LibKernel::KernelGetProcessTime();
 	m_states_num    = 0;
 	m_first_state   = 0;
+	m_latched       = 0;
 	m_next_touch_id = 1;
 	AddState();
 }
@@ -998,6 +1037,10 @@ void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 	*flag  = m_connected;
 	*count = m_connected_count;
 	*state = m_state;
+	if (g_pad_latch) {
+		state->buttons |= m_latched;
+		m_latched = 0;
+	}
 }
 
 int GameController::ReadStates(ControllerState* states, int states_num, bool* flag, int* count) {
@@ -1010,6 +1053,11 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 
 	*flag  = m_connected;
 	*count = m_connected_count;
+
+	if (g_pad_latch) {
+		// The history keeps every press, so a later current-state read must not repeat one.
+		m_latched = 0;
+	}
 
 	int ret_num = 0;
 
@@ -1030,6 +1078,76 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 	}
 
 	return ret_num;
+}
+
+// Caller holds m_mutex.
+void GameController::ProfileButtons(uint32_t before) {
+	const uint64_t now = m_state.time;
+	for (uint32_t bits = m_state.buttons ^ before; bits != 0; bits &= bits - 1) {
+		const int      bit  = std::countr_zero(bits);
+		const uint32_t mask = 1u << bit;
+		if ((m_state.buttons & mask) != 0) {
+			m_prof.pending |= mask;
+			m_prof.released &= ~mask;
+			m_prof.down[bit] = now;
+			LOGF("PAD_PROF host press 0x%x\n", mask);
+		} else if ((m_prof.pending & mask) != 0) {
+			m_prof.released |= mask;
+			m_prof.up[bit] = now;
+			LOGF("PAD_PROF host release 0x%x after %d ms, not read yet\n", mask,
+			     static_cast<int>((now - m_prof.down[bit]) / 1000));
+		}
+	}
+}
+
+void GameController::ProfileRead(bool history, int num, int history_num, const PadData* data, int data_num) {
+	Common::LockGuard lock(m_mutex);
+
+	const uint64_t now = LibKernel::KernelGetProcessTime();
+	const char*    api = history ? "PadRead" : "PadReadState";
+	auto&          p   = m_prof;
+	if (history) {
+		p.history_reads++;
+		p.history_samples += history_num;
+		p.history_empty += history_num == 0 ? 1 : 0;
+		p.history_max = std::max(p.history_max, history_num);
+		p.num         = num;
+	} else {
+		p.state_reads++;
+	}
+	for (int i = 0; i < data_num; i++) {
+		for (uint32_t seen = p.pending & data[i].buttons; seen != 0; seen &= seen - 1) {
+			const int bit = std::countr_zero(seen);
+			LOGF("PAD_PROF %s returned press 0x%x %d ms after it (sample %d of %d, %s)\n", api, 1u << bit,
+			     static_cast<int>((now - p.down[bit]) / 1000), i, data_num,
+			     (p.released & (1u << bit)) != 0 ? "already released" : "still held");
+		}
+		p.pending &= ~data[i].buttons;
+	}
+	// A released press is lost once a read misses it and no unread sample still holds it.
+	for (uint32_t gone = p.pending & p.released; gone != 0; gone &= gone - 1) {
+		const int      bit    = std::countr_zero(gone);
+		const uint32_t mask   = 1u << bit;
+		bool           unread = false;
+		for (uint32_t i = 0; history && i < m_states_num; i++) {
+			const auto index = (m_first_state + i) % STATES_MAX;
+			unread           = unread || (!m_obtained[index] && (m_states[index].buttons & mask) != 0);
+		}
+		if (!unread) {
+			LOGF("PAD_PROF LOST press 0x%x: held %d ms, released %d ms before this %s\n", mask,
+			     static_cast<int>((p.up[bit] - p.down[bit]) / 1000), static_cast<int>((now - p.up[bit]) / 1000),
+			     api);
+			p.pending &= ~mask;
+		}
+	}
+	if (now - p.second >= 1000000) {
+		if (p.second != 0) {
+			LOGF("PAD_PROF handle %d %.1f s: PadReadState %u, PadRead %u (num %d, samples %u, empty %u, max %d)\n",
+			     Handle(), static_cast<double>(now - p.second) / 1e6, p.state_reads, p.history_reads, p.num,
+			     p.history_samples, p.history_empty, p.history_max);
+		}
+		p = {.second = now, .pending = p.pending, .released = p.released, .down = p.down, .up = p.up};
+	}
 }
 
 // Keep every opened pad, including those waiting for a free player slot.
@@ -1415,6 +1533,9 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PlayerForHandle(handle)->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
+	if (g_pad_prof) {
+		PlayerForHandle(handle)->ProfileRead(false, 1, 1, data, 1);
+	}
 
 	return OK;
 }
@@ -1438,6 +1559,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 	auto* player  = PlayerForHandle(handle);
 	int   ret_num = player->ReadStates(states, num, &connected, &connected_count);
+	const int history_num = ret_num;
 
 	if (!connected || ret_num == 0) {
 		if (connected) {
@@ -1448,6 +1570,9 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 	for (int i = 0; i < ret_num; i++) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);
+	}
+	if (g_pad_prof) {
+		player->ProfileRead(true, num, history_num, data, ret_num);
 	}
 
 	return ret_num;
