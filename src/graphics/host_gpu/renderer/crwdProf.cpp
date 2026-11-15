@@ -5,6 +5,8 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +16,36 @@
 namespace Libs::Graphics::CrwdProf {
 
 namespace {
+
+// KYTY_CRWD_PROF=3 log, little-endian, records back to back. `ns` = steady_clock (QueryPerformanceCounter
+// on Windows, the clock of Python's perf_counter).
+// Frame: FrameHeader, then `keys` KeyRecords (every (VS, PS, indirect) drawn in that frame).
+// Present: PresentRecord.
+struct FrameHeader {
+	uint32_t magic = 0x33465243; // "CRF3"
+	uint32_t keys  = 0;
+	uint64_t frame = 0; // index, from 0
+	uint64_t ns    = 0;
+	uint64_t write_ns = 0; // time the previous frame's record took to write (log overhead)
+};
+struct KeyRecord {
+	uint64_t vs = 0, ps = 0;
+	uint64_t instances = 0; // direct: instance sum; indirect: record count sum
+	uint64_t params    = 0; // order-independent sum of mixed per-draw params
+	uint32_t draws = 0, indirect = 0;
+};
+struct PresentRecord {
+	uint32_t magic = 0x33505243; // "CRP3"
+	uint32_t pad   = 0;
+	uint64_t presented = 0, frame = 0, ns = 0;
+};
+static_assert(sizeof(FrameHeader) == 32 && sizeof(KeyRecord) == 40 && sizeof(PresentRecord) == 32);
+
+uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
 
 struct Tables {
 	std::mutex  mutex;
@@ -26,6 +58,12 @@ struct Tables {
 	ToggleTable side {false}; // (address, size) of GPU-written bytes read back: content
 	uint64_t    frames = 0;
 	uint64_t    side_bytes = 0;
+	// KYTY_CRWD_PROF=3
+	std::unordered_map<uint64_t, KeyRecord> log;
+	std::vector<KeyRecord>                  log_out;
+	std::FILE*                              file     = nullptr;
+	uint64_t                                write_ns = 0;
+	std::atomic<uint64_t>                   frame_index {0};
 };
 
 Tables& Get() {
@@ -47,12 +85,54 @@ bool Enabled() noexcept {
 	return enabled;
 }
 
-void NoteDraw(uint64_t vs_hash, uint64_t ps_hash, uint32_t instances, bool indirect) noexcept {
+bool LogEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CRWD_PROF");
+		return Enabled() && std::atoi(value) >= 3;
+	}();
+	return enabled;
+}
+
+// Called with the mutex held.
+static std::FILE* LogFile(Tables& t) {
+	if (t.file == nullptr) {
+		const char* path = std::getenv("KYTY_CRWD_LOG");
+		t.file           = std::fopen(path != nullptr && *path != 0 ? path : "crwd3.bin", "wb");
+		if (t.file != nullptr) std::setvbuf(t.file, nullptr, _IOFBF, size_t {1} << 20u);
+	}
+	return t.file;
+}
+
+void NoteDraw(uint64_t vs_hash, uint64_t ps_hash, uint32_t instances, bool indirect, uint64_t params) noexcept {
 	auto&           t = Get();
 	std::lock_guard lock(t.mutex);
+	const auto      key = Mix(vs_hash, ps_hash);
 	// Draw count in the high bits, instance sum in the low 40.
 	(indirect ? t.drwi : t.draw)
-	    .AddSum(Mix(vs_hash, ps_hash), vs_hash, ps_hash, (uint64_t {1} << 40u) + (indirect ? 0 : instances));
+	    .AddSum(key, vs_hash, ps_hash, (uint64_t {1} << 40u) + (indirect ? 0 : instances));
+	if (LogEnabled()) {
+		auto& r = t.log[key ^ (indirect ? 1u : 0u)];
+		r.vs    = vs_hash;
+		r.ps    = ps_hash;
+		r.draws++;
+		r.indirect = indirect ? 1 : 0;
+		r.instances += instances;
+		// A sum: the same draws submitted in another order give the same value.
+		r.params += Mix(params, instances);
+	}
+}
+
+uint64_t CurrentFrame() noexcept {
+	return Get().frame_index.load(std::memory_order_relaxed);
+}
+
+void NotePresent(uint64_t presented, uint64_t frame) noexcept {
+	auto&           t = Get();
+	std::lock_guard lock(t.mutex);
+	if (auto* f = LogFile(t)) {
+		const PresentRecord r {.presented = presented, .frame = frame, .ns = NowNs()};
+		std::fwrite(&r, sizeof(r), 1, f);
+	}
 }
 
 void NoteIndirect(uint64_t args_addr, uint32_t count, bool cpu, uint64_t records_hash) noexcept {
@@ -83,6 +163,25 @@ void EndFrame() noexcept {
 	t.side.EndFrame();
 	t.icpu_next = t.igpu_next = 0;
 	t.frames++;
+	if (LogEnabled()) {
+		const auto start = NowNs();
+		const auto frame = t.frame_index.load(std::memory_order_relaxed);
+		if (auto* f = LogFile(t)) {
+			t.log_out.clear();
+			for (const auto& [key, r]: t.log) t.log_out.push_back(r);
+			const FrameHeader h {.keys     = static_cast<uint32_t>(t.log_out.size()),
+			                     .frame    = frame,
+			                     .ns       = start,
+			                     .write_ns = t.write_ns};
+			std::fwrite(&h, sizeof(h), 1, f);
+			std::fwrite(t.log_out.data(), sizeof(KeyRecord), t.log_out.size(), f);
+			// shortcut: no flush at exit, up to 32 frames (~1.5 s) lost at the end of a session.
+			if ((frame & 31u) == 31u) std::fflush(f);
+		}
+		t.log.clear();
+		t.write_ns = NowNs() - start;
+	}
+	t.frame_index.store(t.frame_index.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 void Report(std::string& out, std::string& hot) noexcept {

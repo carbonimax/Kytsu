@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
+#include "graphics/host_gpu/renderer/cache/refreshProf.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/crwdProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -2090,9 +2091,19 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 	if (CrwdProf::Enabled()) [[unlikely]] {
+		const bool indirect = emit.indirect.address != 0;
+		// Frame log value: the counts, or the GPU-read records as guest memory shows them (stale if
+		// the GPU wrote them). Ring addresses stay out: they change every frame.
+		uint64_t params = 0;
+		if (CrwdProf::LogEnabled()) {
+			params = indirect ? RefreshProf::HashGuest(emit.indirect.address,
+			                                           uint64_t {emit.indirect.count} * emit.indirect.stride)
+			                  : (uint64_t {draw.index_count} << 32u) ^ emit.first_instance ^
+			                        (uint64_t {static_cast<uint32_t>(emit.vertex_offset)} << 16u);
+		}
 		CrwdProf::NoteDraw(state.vertex_info[0].stage.program->shader_hash,
 		                   state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
-		                   draw.instance_count, emit.indirect.address != 0);
+		                   indirect ? emit.indirect.count : draw.instance_count, indirect, params);
 	}
 
 	if (chain_writes) {

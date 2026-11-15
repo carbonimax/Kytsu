@@ -12,8 +12,18 @@
 namespace Libs::Graphics::CrwdProf {
 
 [[nodiscard]] bool Enabled() noexcept;
-// One draw. `indirect`: the instance count comes from GPU records and is not known here.
-void NoteDraw(uint64_t vs_hash, uint64_t ps_hash, uint32_t instances, bool indirect) noexcept;
+// KYTY_CRWD_PROF=3: also writes one binary record per frame and per present to KYTY_CRWD_LOG
+// (default crwd3.bin), to line draws up with presented frames. Format: crwdProf.cpp.
+[[nodiscard]] bool LogEnabled() noexcept;
+// One draw. `indirect`: the instance count comes from GPU records and is not known here; `instances`
+// is then the record count read. `params`: the frame log's per-draw value (counts, or the records'
+// guest hash for an indirect draw); the toggle tables ignore it.
+void NoteDraw(uint64_t vs_hash, uint64_t ps_hash, uint32_t instances, bool indirect,
+              uint64_t params = 0) noexcept;
+// Frames ended so far: a flip prepared now shows the draws of this frame index.
+[[nodiscard]] uint64_t CurrentFrame() noexcept;
+// One present: `presented` = the window title's frame number, `frame` = CurrentFrame() at its flip.
+void NotePresent(uint64_t presented, uint64_t frame) noexcept;
 // One indirect draw packet: the count read and, when the CPU read the records (`cpu`), a hash of them.
 // The GPU reads the other packets' records itself: guest memory does not show them.
 void NoteIndirect(uint64_t args_addr, uint32_t count, bool cpu, uint64_t records_hash) noexcept;

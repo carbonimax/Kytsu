@@ -8,6 +8,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/crwdProf.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -57,6 +58,7 @@ struct Presenter::Frame {
 	bool          busy         = false;
 	bool          hdr          = false;
 	bool          blank        = false;
+	uint64_t      crwd_frame   = 0; // KYTY_CRWD_PROF=3: GPU frame index at the flip
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -1035,8 +1037,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	frame->hdr   = hdr;
-	frame->blank = false;
+	frame->hdr        = hdr;
+	frame->blank      = false;
+	frame->crwd_frame = CrwdProf::CurrentFrame();
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -1059,8 +1062,9 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	frame->hdr   = false;
-	frame->blank = true;
+	frame->hdr        = false;
+	frame->blank      = true;
+	frame->crwd_frame = CrwdProf::CurrentFrame();
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1176,8 +1180,11 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		const auto presented = window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed) + 1;
 		PerfStats::NotePresentedFrame();
+		if (CrwdProf::LogEnabled() && main_frame != nullptr) [[unlikely]] {
+			CrwdProf::NotePresent(presented, main_frame->crwd_frame);
+		}
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
