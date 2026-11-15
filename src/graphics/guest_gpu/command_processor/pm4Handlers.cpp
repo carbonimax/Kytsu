@@ -1345,15 +1345,15 @@ KYTY_CP_OP_PARSER(CpOpLegacyWaitFlipDone) {
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
+	// Fork: ProcessPm4 drains the CP pipeline before every block Pm4::IsFlipBlock names.
+	if (Pm4::IsFlipBlock(cmd_id, buffer)) {
+		return (buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_FLIP ? CpFlip(cp, buffer, dw)
+		                                                          : CpWaitFlipDone(cp, buffer, dw);
+	}
 	if (KYTY_PM4_R(cmd_id) == 1u && buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
-		// Fork: ProcessPm4 (IsFlipBlock) drains the CP pipeline before the flip and wait blocks.
-		switch (buffer[1] & 0xff000000u) {
-			case Pm4::USERDATA_TAG_FLIP: return CpFlip(cp, buffer, dw);
-			case Pm4::USERDATA_TAG_WAIT_FLIP_DONE: return CpWaitFlipDone(cp, buffer, dw);
-			case Pm4::USERDATA_TAG_RESET_QUEUE:
-				cp.ResetQueue(buffer[1]);
-				return KYTY_PM4_LEN(cmd_id) - 1u;
-			default: break;
+		if ((buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_RESET_QUEUE) {
+			cp.ResetQueue(buffer[1]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
 		}
 		if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
 			return KYTY_PM4_LEN(cmd_id) - 1u;

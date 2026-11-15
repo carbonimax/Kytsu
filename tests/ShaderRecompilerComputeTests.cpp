@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -59833,6 +59834,77 @@ void CheckPm4Flip() {
   Require(name, "wait for a shown buffer",
           shown_ordered && shown_result == Pm4ProcessResult::Complete,
           "the wait returned before its buffer's flip was presented");
+
+  // Fork (KYTY_CP_PIPELINE=1): a flip block drains the draws queued before it.
+  // A record the back thread runs for 100 ms sees no flip of the port
+  // reserved (pending or done) until it finishes. Nothing else on the flip
+  // path drains here: no occlusion dump, storage readback off.
+  Require(name, "CP pipeline mode", CpPipeline::Mode() == 1,
+          "the flip drain check needs KYTY_CP_PIPELINE unset or 1");
+  Require(name, "CP pipeline unused", CpPipeline::Published() == 0,
+          "a draw registered the renderer's CP pipeline callbacks first");
+  struct DrainWitness {
+    int port = 0;
+    int64_t before = -1;
+    std::atomic<int64_t> at_draw_end{-1};
+    [[nodiscard]] int64_t Reserved() const {
+      std::array<uint64_t, 16> status{};
+      const int pending = VideoOut::VideoOutIsFlipPending(port);
+      VideoOut::VideoOutGetFlipStatus(
+          port, reinterpret_cast<VideoOut::VideoOutFlipStatus *>(status.data()));
+      return static_cast<int64_t>(status[0]) + pending;
+    }
+  };
+  // The back thread keeps the callbacks and their context for the process.
+  static DrainWitness witness;
+  witness.port = headset;
+  std::array<uint32_t, Pm4::FLIP_PACKET_DW> drain_flip{};
+  CommandBufferLayout drain_dcb{drain_flip.data(),
+                                drain_flip.data() + drain_flip.size(),
+                                drain_flip.data(),
+                                drain_flip.data() + drain_flip.size(),
+                                nullptr,
+                                nullptr,
+                                0};
+  Require(name, "drain flip packet",
+          Gen5::AgcDcbSetFlip(
+              reinterpret_cast<Gen5::CommandBuffer *>(&drain_dcb), headset, 0,
+              1, 0) == drain_flip.data(),
+          "the flip packet was not emitted");
+  bool drain_complete = false;
+  gpu.SendCommandSync([&] {
+    TextureCacheTestAccess::SetStorageReadback(renderer.GetTextureCache(),
+                                               false);
+    CpPipeline::Init(
+        &witness,
+        [](void *context, CpPipeline::DrawRecord &) {
+          auto &w = *static_cast<DrainWitness *>(context);
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          w.at_draw_end.store(w.Reserved());
+        },
+        [](void *, CpPipeline::DrawRecord &) {},
+        [](void *, const CpPipeline::DrawRecord &) {});
+    witness.before = witness.Reserved();
+    (void)CpPipeline::Acquire();
+    CpPipeline::Publish();
+    CommandProcessor processor(renderer, 0);
+    processor.BufferInit();
+    Pm4Execution execution;
+    drain_complete = processor.Process(execution, drain_flip) ==
+                     Pm4ProcessResult::Complete;
+    CpPipeline::Drain();
+    processor.BufferFlush();
+  });
+  Require(name, "flip after queued draws",
+          drain_complete && witness.before >= 0 &&
+              witness.at_draw_end.load() == witness.before,
+          "the flip was reserved while a draw queued before it still ran");
+  const auto drain_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (VideoOut::VideoOutIsFlipPending(headset) != 0 &&
+         std::chrono::steady_clock::now() < drain_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 
   gpu.WaitForIdle();
   // Each pre-vblank event carries the port's pre-vblank count.

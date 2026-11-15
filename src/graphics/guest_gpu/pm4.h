@@ -910,6 +910,18 @@ constexpr uint32_t USERDATA_TAG_RESET_QUEUE    = 0xCE000000;
 constexpr uint32_t FLIP_PACKET_DW              = 64;
 constexpr uint32_t WAIT_FLIP_DONE_PACKET_DW    = 32;
 
+// Fork: a flip or flip-done wait block (cmd_id, then at least 2 payload dw). The SET_UCONFIG_REG
+// handler runs exactly these blocks and ProcessPm4 drains the CP pipeline before them.
+constexpr bool IsFlipBlock(uint32_t cmd_id, const uint32_t* payload) {
+	const auto op = (cmd_id >> 8u) & 0xffu;
+	if ((op != IT_SET_UCONFIG_REG && op != IT_SET_UCONFIG_REG_INDEX) || KYTY_PM4_R(cmd_id) != 1u ||
+	    payload[0] != SQ_THREAD_TRACE_USERDATA_2) {
+		return false;
+	}
+	const auto tag = payload[1] & 0xff000000u;
+	return tag == USERDATA_TAG_FLIP || tag == USERDATA_TAG_WAIT_FLIP_DONE;
+}
+
 namespace ResetQueueOp {
 constexpr uint32_t CxState              = 1u << 0u;
 constexpr uint32_t ShState              = 1u << 1u;
