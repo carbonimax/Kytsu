@@ -95,6 +95,9 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// KYTY_TC_LOCK_ORDER (GPU thread): the tick up to which ObtainBuffer(vaddr, size, true) would
+	// wait for priority operations (queued main-queue fault publications), or 0. Never blocks.
+	[[nodiscard]] uint64_t WritePublishTick(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;

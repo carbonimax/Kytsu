@@ -1267,6 +1267,14 @@ TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, c
 			result.check = check;
 			return result;
 		}
+		const bool expand = desc.type != BindingType::VideoOut;
+		// KYTY_TC_LOCK_ORDER: the write binding below waits for priority operations, which deliver
+		// labels through m_lock. Wait for them here, without m_lock.
+		if (expand && TcLockOrder()) [[unlikely]] {
+			if (const auto tick = m_buffer_cache.WritePublishTick(viewed.address, viewed.size)) {
+				m_scheduler.WaitPriorityOperations(tick);
+			}
+		}
 		{
 			std::scoped_lock lock {m_lock};
 			auto&            image = m_slot_images[id];
@@ -1280,11 +1288,12 @@ TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, c
 			    (m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
 			     vk::FormatFeatureFlagBits::eColorAttachment) &&
 			    (desc.info.metadata.compression == VideoOutCompression::Uncompressed ||
-			     native_current)) {
+			     native_current) &&
+			    // Still pending (not expected, see WritePublishTick): read the metadata instead.
+			    !(expand && TcLockOrder() && m_buffer_cache.WritePublishTick(viewed.address, viewed.size) != 0)) {
 				// The GPU selects each slice's clear, so the CPU never waits for the metadata.
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorMetadataChecks);
 				InitializeImage(id);
-				const bool expand = desc.type != BindingType::VideoOut;
 				const auto [buffer, offset] =
 				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
 				const auto predicates = m_tiler.CheckColorClear(
@@ -1480,6 +1489,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 	const auto memo_mode           = memo != nullptr ? FindImageMemoMode() : 0u;
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
+	if (TcLockOrder()) [[unlikely]] {
+		WaitAliasPublishes(desc.info.data);
+	}
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
@@ -1651,6 +1663,31 @@ uint32_t TextureCache::KeptColorClears(std::span<const KeptFind> finds) {
 		}
 	}
 	return keep;
+}
+
+// KYTY_TC_LOCK_ORDER: BcAlias::Publish binds alias images for writing under m_lock, which waits
+// for priority operations, and those deliver labels through m_lock. Wait first, without m_lock,
+// for the publications over the description and its candidates: the only ranges Publish binds.
+// None appears during the search (see BufferCache::WritePublishTick).
+void TextureCache::WaitAliasPublishes(GuestRange range) {
+	while (m_buffer_cache.WritePublishTick(0, UINT64_MAX) != 0) {
+		uint64_t tick = 0;
+		{
+			std::scoped_lock lock {m_lock};
+			auto             begin = range.address;
+			auto             end   = range.End();
+			for (const auto id: FindImageCandidates(range.address, range.size)) {
+				const auto& data = m_slot_images[id].info.data;
+				begin            = std::min(begin, data.address);
+				end              = std::max(end, data.End());
+			}
+			tick = m_buffer_cache.WritePublishTick(begin, end - begin);
+		}
+		if (tick == 0) {
+			return;
+		}
+		m_scheduler.WaitPriorityOperations(tick);
+	}
 }
 
 // The search of FindImage, under m_lock. Returns an empty id when an image heap must wait for
