@@ -2846,13 +2846,16 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		// No wait for ring space here (a wait submits): such uploads take the immediate path.
 		const auto [mapped, offset] = m_staging_buffer.Map(total_size, 4, false);
 		if (mapped != nullptr) {
-			std::lock_guard lock(m_deferred_mutex);
-			for (auto& copy: copies) {
-				m_deferred_copies.push_back(
-				    {buffer.CpuAddress() + copy.dstOffset, mapped + copy.srcOffset, copy.size});
-				copy.srcOffset += offset;
+			{
+				std::lock_guard lock(m_deferred_mutex);
+				for (auto& copy: copies) {
+					m_deferred_copies.push_back(
+					    {buffer.CpuAddress() + copy.dstOffset, mapped + copy.srcOffset, copy.size});
+					copy.srcOffset += offset;
+				}
+				m_staging_buffer.Commit(); // coherent: no flush to order after the copies
 			}
-			m_staging_buffer.Commit(); // coherent: no flush to order after the copies
+			PageManager::KickDeferredProtect();
 			return m_staging_buffer.Handle();
 		}
 		// Immediate path: everything recorded so far is applied first, in order.

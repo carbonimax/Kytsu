@@ -1117,11 +1117,49 @@ void TestFullRegionGpuUnmarkBatching() {
     lock.lock();
     std::thread worker([&] { lock.unlock(); });
     worker.join();
+  } else if (std::strcmp(name, "deferred-protect-helper") == 0) {
+    // Not a death (KYTY_DEFUPLOAD_THREAD=1): exits 0 when every page recorded before a flush is
+    // read-only once the flush returns, while another deferring thread records and kicks.
+    constexpr uint64_t pages = 64;
+    auto *base = Allocate(pages * 2);
+    const auto page_at = [&](uint64_t i) {
+      return reinterpret_cast<uint64_t>(base) + i * page_size;
+    };
+    const auto record = [&](uint64_t i) {
+      tracker.MarkRegionAsCpuModified(page_at(i), page_size);
+      tracker.ForEachUploadRange(
+          page_at(i), page_size, false, [](uint64_t, uint64_t) noexcept {},
+          []() noexcept {});
+      PageManager::KickDeferredProtect();
+    };
+    std::atomic<bool> stop{false};
+    std::thread other([&] {
+      PageManager::BeginDeferredProtect();
+      for (uint64_t i = 0; !stop.load(std::memory_order_relaxed); i++) {
+        record(pages + i % pages);
+      }
+      PageManager::EndDeferredProtect();
+    });
+    PageManager::BeginDeferredProtect();
+    bool ok = true;
+    for (int round = 0; round < 200 && ok; round++) {
+      for (uint64_t i = 0; i < pages; i++) {
+        record(i);
+      }
+      PageManager::FlushDeferredProtect();
+      for (uint64_t i = 0; i < pages; i++) {
+        ok = ok && Protection(reinterpret_cast<void *>(page_at(i))) == PAGE_READONLY;
+      }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    other.join();
+    PageManager::EndDeferredProtect();
+    std::_Exit(ok ? 0 : 1);
   }
   std::_Exit(0x7f);
 }
 
-void CheckDeathCase(const char *name) {
+void CheckDeathCase(const char *name, bool fatal = true) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
   Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -1140,7 +1178,8 @@ void CheckDeathCase(const char *name) {
   DWORD exit_code = 0;
   Check(
       GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
-          (exit_code == 321 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION),
+          (fatal ? exit_code == 321 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION
+                 : exit_code == 0),
       "MemoryTracker death path used the wrong exit");
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
@@ -1168,8 +1207,18 @@ void CheckDeathCase(const char *name) {
   Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
   const bool fatal_exit =
       WIFEXITED(status) && WEXITSTATUS(status) == (321 & 0xff);
-  Check(fatal_exit || WIFSIGNALED(status),
+  Check(fatal ? fatal_exit || WIFSIGNALED(status)
+              : WIFEXITED(status) && WEXITSTATUS(status) == 0,
         "MemoryTracker death path used the wrong exit");
+#endif
+}
+
+void SetTestEnv(const char *name, const char *value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  Check(_putenv_s(name, value != nullptr ? value : "") == 0, "_putenv_s failed");
+#else
+  Check((value != nullptr ? ::setenv(name, value, 1) : ::unsetenv(name)) == 0,
+        "setenv failed");
 #endif
 }
 
@@ -1178,6 +1227,13 @@ void TestFatalPaths() {
                            "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
     CheckDeathCase(name);
   }
+  // KYTY_DEFUPLOAD_THREAD is read once per process, so the helper runs in a child.
+  CheckDeathCase("deferred-protect-helper", false); // helper off: same postcondition
+  SetTestEnv("KYTY_DEFUPLOAD_THREAD", "1");
+  SetTestEnv("KYTY_DEFUPLOAD_THREAD_SPANS", "1"); // a kick per recorded page
+  CheckDeathCase("deferred-protect-helper", false);
+  SetTestEnv("KYTY_DEFUPLOAD_THREAD_SPANS", nullptr);
+  SetTestEnv("KYTY_DEFUPLOAD_THREAD", nullptr);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX

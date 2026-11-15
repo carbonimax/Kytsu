@@ -41,6 +41,9 @@ public:
 	static void FlushDeferredProtect() noexcept;
 	static void EndDeferredProtect() noexcept;
 	[[nodiscard]] static bool DeferringProtect() noexcept;
+	// KYTY_DEFUPLOAD_THREAD=1: wakes the helper that applies recorded spans before the next Flush
+	// once enough are pending (no-op otherwise). Call outside tracker, region and staging locks.
+	static void KickDeferredProtect() noexcept;
 	// KYTY_REPROTECT_BATCH=2: Flush reads back the host protection of the pages it applied.
 	struct DeferredVerifyStats {
 		uint64_t checked  = 0;

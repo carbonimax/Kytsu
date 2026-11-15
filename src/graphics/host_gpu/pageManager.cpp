@@ -10,11 +10,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -93,6 +95,33 @@ thread_local DeferredProtect t_deferred;
 std::atomic_flag          g_deferred_lock = ATOMIC_FLAG_INIT;
 std::vector<DeferredSpan> g_deferred_spans;
 std::atomic<bool>         g_deferred_any {false};
+std::atomic<size_t>       g_deferred_pending {0}; // g_deferred_spans.size(), read without the lock
+
+// KYTY_DEFUPLOAD_THREAD=1 (measurement, default 0): a helper thread applies the recorded spans in
+// the background between flushes, once KYTY_DEFUPLOAD_THREAD_SPANS (default 16) are pending; a
+// flush waits for the batch in flight, then applies the rest itself, so it still returns with
+// every span recorded before it applied. The helper only protects: it never reads guest memory
+// (a read fault off the GPU threads is served by the GPU thread, which may be the one waiting).
+struct DeferHelper {
+	DeferHelper() {
+		const char* value = std::getenv("KYTY_DEFUPLOAD_THREAD");
+		enabled           = value != nullptr && std::strtol(value, nullptr, 10) != 0;
+		if (const char* spans = std::getenv("KYTY_DEFUPLOAD_THREAD_SPANS"); spans != nullptr) {
+			min_spans = std::max<size_t>(1, std::strtoull(spans, nullptr, 10));
+		}
+	}
+	bool                    enabled   = false;
+	size_t                  min_spans = 16;
+	std::mutex              apply_mutex; // one application at a time: helper batch or flush
+	std::mutex              kick_mutex;
+	std::condition_variable kick_cv;
+	std::atomic<bool>       kicked {false};
+	std::once_flag          started;
+};
+DeferHelper& Helper() {
+	static DeferHelper helper;
+	return helper;
+}
 
 // KYTY_REPROTECT_BATCH=2: after a flush, the host protection of every page it was asked to protect
 // is read back (VirtualQuery) and compared with the page state.
@@ -233,6 +262,7 @@ struct PageManager::Impl {
 			} else {
 				spans.push_back({this, vaddr, vaddr + size, mode});
 			}
+			g_deferred_pending.store(spans.size(), std::memory_order_relaxed);
 			g_deferred_any.store(true, std::memory_order_relaxed);
 			return;
 		}
@@ -418,7 +448,11 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 
 PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
-PageManager::~PageManager() = default;
+PageManager::~PageManager() {
+	if (auto& h = Helper(); h.enabled) {
+		std::lock_guard apply(h.apply_mutex); // a helper batch may still use this manager's regions
+	}
+}
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
@@ -467,8 +501,40 @@ template void PageManager::UpdatePageWatchers<true, false>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false, true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t);
 
+namespace {
+
+void HelperThread() {
+	auto& h = Helper();
+	MemTrackProf::SetThreadKind(MemTrackProf::ThreadKind::Deferred, "defprotect");
+	for (;;) {
+		{
+			std::unique_lock lock(h.kick_mutex);
+			h.kick_cv.wait(lock, [&h] { return h.kicked.load(std::memory_order_acquire); });
+		}
+		// Cleared before the swap: spans recorded after it kick the next batch.
+		h.kicked.store(false, std::memory_order_release);
+		PageManager::FlushDeferredProtect();
+	}
+}
+
+} // namespace
+
 void PageManager::BeginDeferredProtect() noexcept {
 	t_deferred.active = true;
+	if (auto& h = Helper(); h.enabled) {
+		std::call_once(h.started, [] { std::thread(HelperThread).detach(); });
+	}
+}
+
+void PageManager::KickDeferredProtect() noexcept {
+	auto& h = Helper();
+	if (!h.enabled || g_deferred_pending.load(std::memory_order_relaxed) < h.min_spans ||
+	    h.kicked.load(std::memory_order_relaxed) || h.kicked.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	// Pairs with the helper's predicate check under kick_mutex: the notification cannot be lost.
+	{ std::lock_guard lock(h.kick_mutex); }
+	h.kick_cv.notify_one();
 }
 
 PageManager::DeferCapture::DeferCapture() noexcept: m_previous(t_deferred.capture) {
@@ -484,6 +550,12 @@ bool PageManager::DeferringProtect() noexcept {
 }
 
 void PageManager::FlushDeferredProtect() noexcept {
+	// KYTY_DEFUPLOAD_THREAD: lock before the early-out, since g_deferred_any is already false
+	// while the helper applies a batch it swapped out.
+	std::unique_lock<std::mutex> apply;
+	if (auto& h = Helper(); h.enabled) {
+		apply = std::unique_lock(h.apply_mutex);
+	}
 	if (!g_deferred_any.load(std::memory_order_acquire)) {
 		return;
 	}
@@ -493,6 +565,7 @@ void PageManager::FlushDeferredProtect() noexcept {
 	{
 		SpinGuard lock(g_deferred_lock);
 		std::swap(spans, g_deferred_spans);
+		g_deferred_pending.store(0, std::memory_order_relaxed);
 		g_deferred_any.store(false, std::memory_order_relaxed);
 	}
 	// ApplyDeferred's protections are made at once.
