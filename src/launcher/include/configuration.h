@@ -79,6 +79,9 @@ public:
 	static constexpr int MIN_SCREEN_SIZE = 320;
 	static constexpr int MAX_SCREEN_SIZE = 16384;
 
+	// Written with every configuration; 1 = shader store on by default.
+	static constexpr int SETTINGS_VERSION = 1;
+
 	static QString NormalizeResolution(const QString& text);
 
 	enum class PresentMode { Fifo, Mailbox, Immediate };
@@ -127,7 +130,7 @@ public:
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
-	bool                   shader_cache_enabled        = false;
+	bool                   shader_cache_enabled        = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;

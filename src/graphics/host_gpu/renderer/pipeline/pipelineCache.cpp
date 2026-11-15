@@ -1421,7 +1421,10 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	    "{} modules, {} graphics and {} compute pipelines in {} ms (read {} ms, {} modules created "
 	    "for them, {} workers, {} pipelines used in fewer launches left for later){}{}{}",
 	    contents.header_match ? "loaded" : "started over", mb(contents.file_bytes), contents.launch,
-	    mb(contents.live_bytes), contents.dead_records, contents.compacting ? ", compacting" : "",
+	    mb(contents.live_bytes), contents.dead_records,
+	    contents.compacting
+	        ? (contents.over_cap ? ", over the size cap, compacting" : ", compacting")
+	        : "",
 	    cache.programs.size(), module_count, created_graphics, created_compute, elapsed(), read_ms,
 	    created_modules.load(), workers, later_pipelines,
 	    contents.kept_bytes != 0 && contents.kept_bytes != contents.file_bytes
