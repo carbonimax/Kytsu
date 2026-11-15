@@ -35,6 +35,12 @@ int main() {
 	Check(AsyncPipelineMaySkip(from_zero, 0) && from_zero == 0, "frame 0 was not a valid start");
 	Check(!AsyncPipelineMaySkip(from_zero, ASYNC_PIPELINE_SKIP_FRAMES), "the cap from frame 0 was not applied");
 
+	uint64_t tess = ASYNC_PIPELINE_NOT_SKIPPED;
+	Check(AsyncPipelineMaySkip(tess, 7, true) && tess == 7, "an uncapped skip did not start the clock");
+	Check(AsyncPipelineMaySkip(tess, 7 + 100 * ASYNC_PIPELINE_SKIP_FRAMES, true),
+	      "an uncapped draw was refused past the cap");
+	Check(!AsyncPipelineMaySkip(tess, 7 + ASYNC_PIPELINE_SKIP_FRAMES), "the cap was lost after uncapped skips");
+
 	std::deque<int> skipped {1, 2};
 	std::deque<int> predicted {10, 11};
 	Check(AsyncPipelinePop(skipped, predicted) == 1, "the oldest skipped key was not first");
