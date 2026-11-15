@@ -15807,6 +15807,14 @@ public:
                     memory->bytes.size());
       }
     }
+    // --gpu-replay-loop: the blocks as the frame starts, restored page by page between replays.
+    std::vector<std::vector<uint8_t>> start_blocks;
+    if (m_replay_loops > 1) {
+      for (const auto &[begin, end] : merged) {
+        const auto *bytes = reinterpret_cast<const uint8_t *>(begin);
+        start_blocks.emplace_back(bytes, bytes + (end - begin));
+      }
+    }
     // Diagnostics: each Expect's bytes before the frame, to tell a range one side left unchanged.
     std::vector<uint64_t> initial;
     for (const auto &record : capture.records) {
@@ -16083,14 +16091,24 @@ public:
     if (m_replay_loops > 1) {
       std::vector<double> warm;
       for (uint32_t iteration = 1; iteration < m_replay_loops; iteration++) {
-        for (const auto &[begin, end] : merged) {
-          std::memset(reinterpret_cast<void *>(begin), 0, end - begin);
-        }
-        for (const auto &record : capture.records) {
-          if (const auto *memory = std::get_if<GpuCapture::Memory>(&record)) {
-            std::memcpy(reinterpret_cast<void *>(memory->address), memory->bytes.data(), memory->bytes.size());
+        // Only pages that differ from the frame start are written: a CPU write fault refreshes the whole image
+        // it falls in, so rewriting every page would re-upload every texture in each timed replay.
+        // Pages are read from the backing, as the Expects are, so a protected page does not fault here.
+        uint64_t restored = 0;
+        std::array<uint8_t, 0x1000> current{};
+        for (size_t b = 0; b < merged.size(); b++) {
+          auto *guest = reinterpret_cast<uint8_t *>(merged[b].first);
+          const auto &start = start_blocks[b];
+          for (size_t page = 0; page < start.size(); page += 0x1000) {
+            const auto bytes = std::min<size_t>(0x1000, start.size() - page);
+            if (!Memory::TryReadBacking(merged[b].first + page, current.data(), bytes) ||
+                std::memcmp(current.data(), start.data() + page, bytes) != 0) {
+              std::memcpy(guest + page, start.data() + page, bytes);
+              restored++;
+            }
           }
         }
+        std::printf("[gpu]     %s loop %u: %" PRIu64 " pages restored\n", name, iteration, restored);
         if (run_frame()) {
           std::printf("[gpu]     %s loop %u INVALID: a queue is still blocked at the end\n", name, iteration);
           std::fflush(stdout);
