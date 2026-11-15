@@ -51,6 +51,10 @@ struct ThreadState {
 	bool  in_fault     = false;
 	bool  buffer_hit   = false;
 	bool  texture_hit  = false;
+	// TrackingSpinLock acquisitions not yet added to g_counters (a shared atomic per lock would
+	// cost more than the lock).
+	uint32_t locks           = 0;
+	uint32_t locks_contended = 0;
 };
 thread_local ThreadState t_state;
 
@@ -194,6 +198,33 @@ void NoteProtect(Prot mode, uint64_t bytes, uint64_t ns) noexcept {
 	}
 }
 
+} // namespace Libs::Graphics::MemTrackProf
+
+namespace Libs::Graphics {
+
+// regionManager.h (TrackingSpinLock). Zero (default path) for locks taken before static init.
+extern const uint32_t g_tracking_lock_flags;
+const uint32_t        g_tracking_lock_flags = [] {
+    const char* mode = std::getenv("KYTY_TRACKING_LOCK");
+    const int   m    = mode != nullptr ? std::atoi(mode) : 0;
+    return (m == 1 || m == 2 ? static_cast<uint32_t>(m) : 0u) | (MemTrackProf::Enabled() ? 16u : 0u);
+}();
+
+} // namespace Libs::Graphics
+
+namespace Libs::Graphics::MemTrackProf {
+
+void NoteTrackingLock(bool contended) noexcept {
+	auto& t = t_state;
+	t.locks_contended += contended ? 1u : 0u;
+	if (++t.locks == 1024) {
+		Bump(g_counters[static_cast<size_t>(Counter::TrackingLocks)], t.locks);
+		Bump(g_counters[static_cast<size_t>(Counter::TrackingLockContended)], t.locks_contended);
+		t.locks           = 0;
+		t.locks_contended = 0;
+	}
+}
+
 void Report(double seconds, uint64_t frames) noexcept {
 	if (!Enabled() || seconds <= 0.0) {
 		return;
@@ -262,13 +293,16 @@ void Report(double seconds, uint64_t frames) noexcept {
 	// Units: counts per second, times in ms per frame, bytes in MiB per frame.
 	std::printf("PERF memtrack %.1fs frames=%" PRIu64 " (counts /s, ms and MiB /frame): sync=%.2fms(%.0f) upload=%.2fMiB(%.0f copies,"
 	            " copy=%.2fms) download=%.2fMiB(%.0f) dl_sync_wait=%.2fms(%.0f) fault_cmd=%.2fms(%.0f) fault_send=%.2fms"
-	            " fault_wait=%.2fms(%.0f) write_flush=%.0f invalidate=%.0f(%.2fMiB) readahead_pages=%.0f\n",
+	            " fault_wait=%.2fms(%.0f) write_flush=%.0f invalidate=%.0f(%.2fMiB) readahead_pages=%.0f"
+	            " tracking_locks=%.0f/f(%.0f/f contended)\n",
 	            seconds, frames, ms(cn(Counter::SyncNs)), ps(cn(Counter::SyncCount)), mib(cn(Counter::UploadBytes)),
 	            ps(cn(Counter::UploadCopies)), ms(cn(Counter::UploadCopyNs)), mib(cn(Counter::DownloadBytes)),
 	            ps(cn(Counter::DownloadCount)), ms(cn(Counter::DownloadSyncNs)), ps(cn(Counter::DownloadSyncCount)),
 	            ms(cn(Counter::FaultCmdNs)), ps(cn(Counter::FaultCmdCount)), ms(cn(Counter::FaultSendNs)),
 	            ms(cn(Counter::FaultWaitNs)), ps(cn(Counter::FaultWaitCount)), ps(cn(Counter::WriteFlushCount)),
-	            ps(cn(Counter::InvalidateCount)), mib(cn(Counter::InvalidateBytes)), ps(cn(Counter::ReadAheadPages)));
+	            ps(cn(Counter::InvalidateCount)), mib(cn(Counter::InvalidateBytes)), ps(cn(Counter::ReadAheadPages)),
+	            static_cast<double>(cn(Counter::TrackingLocks)) / fr,
+	            static_cast<double>(cn(Counter::TrackingLockContended)) / fr);
 	for (size_t k = 0; k < by_kind.size(); k++) {
 		const auto& t = by_kind[k];
 		uint64_t    any = t.prot_calls[0] + t.prot_calls[1] + t.prot_calls[2] + t.wait_ns;
