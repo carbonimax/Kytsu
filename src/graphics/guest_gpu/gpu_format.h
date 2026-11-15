@@ -40,6 +40,8 @@ uint32_t                   BlockCompressedBytesPerBlock(BufferFormat format);
 uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
 bool                       IsSrgbFormat(BufferFormat format);
+/// Whether the value names a format: false for kInvalid, the gaps 78..127 and 137..155, and past kBc7Srgb.
+bool                       IsDefinedBufferFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
 

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -84,6 +85,21 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
 	    format > Prospero::BufferFormat::kBc7Srgb) {
+		return false;
+	}
+	// A format in a gap of the encoding names nothing: bind a null image instead of failing
+	// specialization (upstream #1019). Logged once per format value, not per draw.
+	if (!Prospero::IsDefinedBufferFormat(format)) {
+		static std::array<std::atomic<uint64_t>, 8> reported {};
+		const auto value = static_cast<uint32_t>(format);
+		const auto bit   = uint64_t {1} << (value & 63u);
+		if ((reported[value >> 6u].fetch_or(bit, std::memory_order_relaxed) & bit) == 0u) {
+			std::fprintf(stderr,
+			             "image descriptor with undefined format %u is not a descriptor, binding null: "
+			             "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			             value, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+			             words[7]);
+		}
 		return false;
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
