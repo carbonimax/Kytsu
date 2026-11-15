@@ -233,8 +233,8 @@ uint64_t FirstFrameAfterLatePoll(const char* skip) {
 }
 
 void CheckSkipLateVideo() {
-	Check(FirstFrameAfterLatePoll("") == 0, "by default a late poll gets the oldest ready frame");
-	Check(FirstFrameAfterLatePoll("1") >= 100, "KYTY_AVPLAYER_SKIP_LATE=1 gets the newest due frame");
+	Check(FirstFrameAfterLatePoll("0") == 0, "KYTY_AVPLAYER_SKIP_LATE=0 gets the oldest ready frame");
+	Check(FirstFrameAfterLatePoll("") >= 100, "by default a late poll gets the newest due frame");
 }
 
 void CheckFileUriSource() {
