@@ -2502,13 +2502,23 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 	// KYTY_MEM_IMPORT: a range mapped from one run of direct memory gets the guest's own bytes.
 	std::optional<ImportedMemory> imported;
+	uint64_t                      host = 0;
 	if (m_import) {
-		const auto host = ImportExcludedRange(overlap.begin, bytes)
-		                      ? 0
-		                      : LibKernel::Memory::BackingHostAddress(overlap.begin, bytes);
+		host = ImportExcludedRange(overlap.begin, bytes) ? 0
+		                                                 : LibKernel::Memory::BackingHostAddress(overlap.begin, bytes);
 		if (host != 0) {
 			imported = m_import->Acquire(host, bytes, flags);
 		}
+	}
+	const auto id =
+	    imported ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags, bytes, *imported)
+	             : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+	                                     overlap.begin, flags, bytes);
+	auto& buffer = m_slot_buffers[id];
+	if (!buffer.IsImported()) {
+		imported.reset(); // the buffer refused the imported memory: device memory (Buffer)
+	}
+	if (m_import) {
 		(imported ? g_import_stats.imported : host != 0 ? g_import_stats.failed : g_import_stats.device)
 		    .fetch_add(1, std::memory_order_relaxed);
 		static std::atomic<uint32_t> logged {0};
@@ -2524,11 +2534,6 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 			     overlap.begin, bytes, static_cast<int>(overlap.has_stream_leap));
 		}
 	}
-	const auto id =
-	    imported ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags, bytes, *imported)
-	             : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
-	                                     overlap.begin, flags, bytes);
-	auto& buffer  = m_slot_buffers[id];
 	buffer.leaped = overlap.has_stream_leap;
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer{}[guest=0x{:016x} size=0x{:x}]",
