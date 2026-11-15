@@ -68,12 +68,15 @@ static thread_local GuestGpu*     g_gpu_state         = nullptr;
 // that overlays agree with memory. Counters: "PERF eop" lines (KYTY_PERF_STATS=1).
 namespace {
 
+// EopAtGpu::WithdrawTitleDefault: the title list's EOP mode is off, its import being unavailable.
+std::atomic<bool> g_eop_withdrawn {false};
+
 int EopAtGpuMode() {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_EOP_AT_GPU");
 		return value != nullptr ? static_cast<int>(std::strtol(value, nullptr, 10)) : 0;
 	}();
-	return mode;
+	return g_eop_withdrawn.load(std::memory_order_relaxed) ? 0 : mode;
 }
 
 // KYTY_EOP_AT_GPU_FLUSH=1 (with KYTY_EOP_AT_GPU=1, default 0): submit the command buffer after
@@ -335,6 +338,14 @@ uint64_t ReadFront64(const volatile uint64_t* address) noexcept {
 
 bool Enabled() noexcept {
 	return EopAtGpuMode() != 0;
+}
+
+bool WithdrawTitleDefault() noexcept {
+	if (std::getenv("KYTY_EOP_AT_GPU_FROM_TITLE") == nullptr) {
+		return false;
+	}
+	g_eop_withdrawn.store(true, std::memory_order_relaxed);
+	return true;
 }
 
 void Report(double seconds) {

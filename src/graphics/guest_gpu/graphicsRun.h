@@ -130,6 +130,10 @@ private:
 namespace EopAtGpu {
 // KYTY_EOP_AT_GPU is 1 or 2.
 [[nodiscard]] bool Enabled() noexcept;
+// The import turned out unavailable (device creation or BufferCache, before any label is released):
+// the KYTY_EOP_AT_GPU=1 that KYTY_MEM_IMPORT_TITLES set for it goes back to 0. True if it was set so;
+// an explicit KYTY_EOP_AT_GPU stays.
+bool WithdrawTitleDefault() noexcept;
 // GPU thread: `bytes` holds a copy of guest memory [address, address + size) about to be used by
 // GPU work recorded now; overlays the pending label bytes (as if written at release). Returns true
 // when it changed something.

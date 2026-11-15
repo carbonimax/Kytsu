@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/deviceFault.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
@@ -1339,7 +1340,11 @@ void WindowContext::CreateVulkan() {
 			Log::WriteToConsoleAndLog(
 			    eop_ok && ext_ok ? "GPU: KYTY_MEM_IMPORT on: buffers over guest direct memory use imported host memory.\n"
 			    : !eop_ok        ? "GPU: KYTY_MEM_IMPORT unavailable: needs KYTY_EOP_AT_GPU=1; buffers stay in device memory.\n"
-			                     : "GPU: KYTY_MEM_IMPORT unavailable: no VK_EXT_external_memory_host; buffers stay in device memory.\n");
+			    : EopAtGpu::WithdrawTitleDefault()
+			        ? "GPU: KYTY_MEM_IMPORT unavailable: no VK_EXT_external_memory_host; buffers stay in device memory, "
+			          "KYTY_EOP_AT_GPU of the title list off.\n"
+			        : "GPU: KYTY_MEM_IMPORT unavailable: no VK_EXT_external_memory_host; buffers stay in device memory, "
+			          "explicit KYTY_EOP_AT_GPU kept.\n");
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 		Dlss::AppendExtensions(device_extensions, available_extensions, true);

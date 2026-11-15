@@ -1135,6 +1135,13 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_import = std::make_unique<HostImport>(graphics);
 		if (!m_import->Valid()) {
 			m_import.reset();
+			graphics.host_memory_import_enabled = false; // no host barrier at each submission
+			Log::WriteToConsoleAndLog(
+			    EopAtGpu::WithdrawTitleDefault()
+			        ? "GPU: KYTY_MEM_IMPORT unavailable: no guest memory backing; buffers stay in device memory, "
+			          "KYTY_EOP_AT_GPU of the title list off.\n"
+			        : "GPU: KYTY_MEM_IMPORT unavailable: no guest memory backing; buffers stay in device memory, "
+			          "explicit KYTY_EOP_AT_GPU kept.\n");
 		}
 	}
 	if (m_import && LateRead::WatchMode() != 0) {
@@ -1711,8 +1718,9 @@ void DelayWriteFault() {
 
 } // namespace
 
+// As the import safety net only (KYTY_LATE_READ_PROF unset): while the import is really on.
 bool Enabled() noexcept {
-	return SamplePeriod() != 0;
+	return SamplePeriod() != 0 && (!NetOnly() || g_import_cache.load(std::memory_order_relaxed) != nullptr);
 }
 
 int WatchMode() noexcept {
