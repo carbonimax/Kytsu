@@ -319,6 +319,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_readback_storage->setChecked(info.readback_storage_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
+	m_ui->checkBox_recommended_options->setChecked(info.recommended_options);
 	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries_enabled);
 	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
 	m_ui->checkBox_shader_cache->setChecked(info.shader_cache_enabled);
@@ -574,6 +575,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.readback_storage_images   = ui.checkBox_readback_storage->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
+	info.recommended_options       = ui.checkBox_recommended_options->isChecked();
 	info.occlusion_queries_enabled = ui.checkBox_occlusion_queries->isChecked();
 	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
 	info.shader_cache_enabled      = ui.checkBox_shader_cache->isChecked();
