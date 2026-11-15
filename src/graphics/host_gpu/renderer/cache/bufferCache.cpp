@@ -1308,7 +1308,7 @@ uint64_t NowNs() {
 }
 
 // Stream: small CPU-modified read copied into the stream buffer. Ring: cache buffer created or grown
-// by a stream leap (the CPU-written rings of 13.90). Fixed: any other cache buffer.
+// by a stream leap (rings the CPU keeps writing). Fixed: any other cache buffer.
 enum Path : uint8_t { PathStream, PathRing, PathFixed, PathCount };
 constexpr std::array<const char*, PathCount> PathNames {"stream", "ring", "fixed"};
 constexpr std::array<const char*, static_cast<size_t>(Site::Count)> SiteNames {"-", "vtx", "idx", "desc",
@@ -2174,8 +2174,8 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 
 // KYTY_MEM_IMPORT_OWNED_READS=0|1|2 (default 2): CPU reads of imported bytes that a command-processor
 // WRITE_DATA put in the command stream (WriteGpuOwned) still running on the GPU. 0: read the old bytes
-// (device lost in game A: the walker binds the previous frame's descriptors); 1: the bytes count as
-// GPU-dirty, readers wait for the GPU; 2: readers see the written bytes (OverlayOwnedWrites).
+// (device lost seen on one title: the walker binds the previous frame's descriptors); 1: the bytes
+// count as GPU-dirty, readers wait for the GPU; 2: readers see the written bytes (OverlayOwnedWrites).
 static uint32_t ImportOwnedReads() {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_MEM_IMPORT_OWNED_READS");
@@ -2459,8 +2459,8 @@ void BufferCache::DemoteImported(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.MarkRegionAsCpuModifiedExceptGpu(vaddr, size);
 }
 
-// KYTY_MEM_IMPORT_GPU_WRITES=1 keeps GPU-written buffers on imported memory (device lost in game A:
-// a compute shader then never completes); by default they go back to device memory at their first
+// KYTY_MEM_IMPORT_GPU_WRITES=1 keeps GPU-written buffers on imported memory (device lost seen on one
+// title: a compute shader then never completes); by default they go back to device memory at their first
 // write binding, and only buffers the GPU reads use guest memory.
 static bool ImportGpuWrites() {
 	static const bool keep = [] {
