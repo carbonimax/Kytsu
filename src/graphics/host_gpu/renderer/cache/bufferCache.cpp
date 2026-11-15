@@ -1387,10 +1387,6 @@ bool BufferCache::BeginDeferredUploads() {
 void BufferCache::FlushDeferredUploads() {
 	// One flush at a time: the protections of everything recorded so far, then all their copies.
 	std::lock_guard lock(m_deferred_mutex);
-	// PF-1 front slope: flushes with copies only (empty ones do no work), not the CP back thread.
-	if (WhatIf::On(WhatIf::Site::DefUpload) && !m_deferred_copies.empty() && !CpPipeline::IsBackThread()) {
-		WhatIf::Spin(WhatIf::Site::DefUpload);
-	}
 	PageManager::FlushDeferredProtect();
 	PerfStats::ScopedTimer timer(PerfStats::Counter::StagingWriteNs);
 	for (const auto& copy: m_deferred_copies) {
@@ -1412,6 +1408,11 @@ void BufferCache::FlushDeferredUploads() {
 			            flushes, copies, stats.checked, stats.mismatch);
 			std::fflush(stdout);
 		}
+	}
+	// Front slope what-if: after the protections and copies (no wider unprotected window), flushes
+	// with copies only (empty ones do no work), not on the CP back thread.
+	if (WhatIf::On(WhatIf::Site::DefUpload) && !m_deferred_copies.empty() && !CpPipeline::IsBackThread()) {
+		WhatIf::Spin(WhatIf::Site::DefUpload);
 	}
 	m_deferred_copies.clear();
 }
