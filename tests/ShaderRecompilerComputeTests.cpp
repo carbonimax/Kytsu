@@ -242,6 +242,18 @@ struct BufferCacheTestAccess {
   }
 
   static void DeleteBuffer(BufferCache &cache, BufferId id) { cache.DeleteBuffer(id); }
+
+  static void AddPendingPublish(BufferCache &cache, uint64_t begin, uint64_t end,
+                                uint64_t tick, bool side) {
+    std::lock_guard lock(cache.m_pending_mutex);
+    cache.m_pending_publishes.push_back(
+        {begin, end, tick, std::make_shared<BufferCache::ReadbackCompletion>(), side});
+  }
+
+  static void ClearPendingPublishes(BufferCache &cache) {
+    std::lock_guard lock(cache.m_pending_mutex);
+    cache.m_pending_publishes.clear();
+  }
 };
 
 // Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
@@ -3526,6 +3538,22 @@ public:
             waited != nullptr && waited_offset == 0,
             "download wrap did not reuse the range after its priority operation");
     parked_ring.Commit();
+
+    // KYTY_TC_LOCK_ORDER: the texture cache waits, before m_lock, up to the tick of the main-queue
+    // fault publications a write binding would wait for. Side publications never count.
+    BufferCacheTestAccess::AddPendingPublish(cache, 0x10000, 0x12000, 7, false);
+    BufferCacheTestAccess::AddPendingPublish(cache, 0x20000, 0x22000, 9, true);
+    const uint64_t disjoint = cache.ImportActive() ? 7 : 0;
+    Require("StreamBufferRing", "write publish tick",
+            cache.WritePublishTick(0x11000, 0x100) == 7 &&
+                cache.WritePublishTick(0x12000, 0x100) == disjoint &&
+                cache.WritePublishTick(0x20000, 0x100) == disjoint &&
+                cache.WritePublishTick(0, UINT64_MAX) == 7,
+            "write publish tick does not match the overlapping main-queue publications");
+    BufferCacheTestAccess::ClearPendingPublishes(cache);
+    Require("StreamBufferRing", "write publish tick cleared",
+            cache.WritePublishTick(0, UINT64_MAX) == 0,
+            "write publish tick without pending publications");
 
     scheduler.Finish();
     download.Invalidate(download_offset, 16);

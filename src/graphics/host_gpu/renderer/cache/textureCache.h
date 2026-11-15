@@ -352,6 +352,7 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 	ImageId FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,
 	                        FindImageMemo* memo);
+	void    WaitAliasPublishes(GuestRange range);
 
 	// `staging`: a mapped download buffer of at least the image size, used instead of the reusable one.
 	// `capture` (GPU capture publish): also stencil associations and compressed video-out images.
