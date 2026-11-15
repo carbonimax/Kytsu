@@ -214,7 +214,8 @@ public:
 	// draw whose pipeline is missing may be skipped while the workers create it (SkipMissing), for
 	// ASYNC_PIPELINE_SKIP_FRAMES guest frames at most; then it waits like any miss.
 	[[nodiscard]] bool AsyncEnabled() const { return m_async; }
-	// KYTY_ASYNC_TESS=1 (default off): tessellation draws skipped until created, no cap, depth-only ones too.
+	// KYTY_ASYNC_TESS (default on with async pipelines, =0 off): tessellation draws skipped until
+	// created, no cap, depth-only ones too.
 	[[nodiscard]] bool AsyncTess() const { return m_async_tess; }
 	// The created pipeline, or nullptr (missing: SkipMissing or GetGraphicsPipeline).
 	Pipeline* FindGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
@@ -310,7 +311,7 @@ private:
 	                              m_pending;
 	std::unique_ptr<ParallelPool> m_pool;
 	bool                          m_async = false;
-	bool                          m_async_tess = false; // KYTY_ASYNC_TESS=1 (default off): no skip cap for tessellation
+	bool                          m_async_tess = false; // KYTY_ASYNC_TESS (default on, =0 off): no skip cap for tessellation
 	std::atomic<uint64_t>         m_frame {0};
 	PrefetchHook                  m_prefetch_hook    = nullptr;
 	void*                         m_prefetch_context = nullptr;
