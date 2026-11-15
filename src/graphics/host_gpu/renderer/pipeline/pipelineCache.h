@@ -308,6 +308,7 @@ private:
 	                              m_pending;
 	std::unique_ptr<ParallelPool> m_pool;
 	bool                          m_async = false;
+	bool                          m_async_tess = false; // KYTY_ASYNC_TESS=1 (default off): no skip cap for tessellation
 	std::atomic<uint64_t>         m_frame {0};
 	PrefetchHook                  m_prefetch_hook    = nullptr;
 	void*                         m_prefetch_context = nullptr;
