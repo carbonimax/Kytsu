@@ -760,22 +760,15 @@ void SetLatch(const char* value) {
 #endif
 }
 
-// A game polling only the current state at a low frame rate misses a short press without the latch.
+// A game polling only the current state at a low frame rate misses a short press without the latch (on by default).
 void TestPressBetweenStateReads() {
 	PadData data {};
 	{
 		Controller controller;
 		SetButton(1, PAD_BUTTON_CROSS, true);
 		SetButton(1, PAD_BUTTON_CROSS, false);
-		Check(PadReadState(1, &data) == OK && data.buttons == 0, "the current state kept a released press");
-	}
-	SetLatch("1");
-	{
-		Controller controller;
-		SetButton(1, PAD_BUTTON_CROSS, true);
-		SetButton(1, PAD_BUTTON_CROSS, false);
 		Check(PadReadState(1, &data) == OK && data.buttons == PAD_BUTTON_CROSS,
-		      "a press released between two reads was lost");
+		      "a press released between two reads was lost by default");
 		Check(PadReadState(1, &data) == OK && data.buttons == 0, "a latched press was reported twice");
 		std::array<PadData, 64> history {};
 		Check(PadRead(1, history.data(), 64) == 2, "the current-state reads consumed the history");
@@ -784,6 +777,13 @@ void TestPressBetweenStateReads() {
 		Check(PadRead(1, history.data(), 64) == 2 && history[0].buttons == PAD_BUTTON_CIRCLE &&
 		          history[1].buttons == 0 && PadReadState(1, &data) == OK && data.buttons == 0,
 		      "a press returned by the history was latched again");
+	}
+	SetLatch("0");
+	{
+		Controller controller;
+		SetButton(1, PAD_BUTTON_CROSS, true);
+		SetButton(1, PAD_BUTTON_CROSS, false);
+		Check(PadReadState(1, &data) == OK && data.buttons == 0, "KYTY_PAD_LATCH=0 kept a released press");
 	}
 	SetLatch("");
 }
