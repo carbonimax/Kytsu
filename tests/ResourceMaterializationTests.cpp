@@ -2035,13 +2035,19 @@ void TestDeadLoadCounted(bool pinned) {
     std::vector<uint32_t> flat;
     Check(WalkSrt(plan, {.user_data = user_data}, flat, nullptr), "walk count plan did not walk");
     flats.push_back(flat);
-    // The dead load still runs: its address slot holds what it read from.
+    // A load's address slot holds what it read from. The dead load runs unless KYTY_SRT_SKIP_DEAD=1
+    // cut it; the live bound n always runs.
+    const bool cut = pinned && SrtSkipDeadMode() == 1u;
+    constexpr uint64_t n_slot = 0x101cu | uint64_t{1} << 63u;
+    bool n_loaded = false;
     for (const auto entry_word : plan.srt_count_loads) {
-      if ((entry_word & 3u) != 2u) continue;
       uint64_t address = 0;
       std::memcpy(&address, reinterpret_cast<const uint8_t *>(plan.srt_scratch.data()) + (entry_word >> 2u), 8u);
-      Check(address == (0x101cu | uint64_t{1} << 63u), "dead load did not run or recorded another address");
+      n_loaded |= address == n_slot;
+      if ((entry_word & 3u) == 2u)
+        Check(address == (cut ? 0u : n_slot), "dead load ran though cut, did not run, or recorded another address");
     }
+    Check(n_loaded == !cut, "the live bound n did not load, or the cut dead n did");
   }
   Check(flats[0] == std::vector<uint32_t>{0x5678u} && flats[2] == flats[0],
         "walk count plan lost its body");
@@ -2053,6 +2059,14 @@ int main(int argc, char **argv) {
   if (argc > 1 && std::string_view(argv[1]) == "--walk-count") {
     // KYTY_SRT_PROF=2 KYTY_PERF_STATS=1: these first, then every case below with counting walkers.
     for (const bool pinned : {true, false}) TestDeadLoadCounted(pinned);
+    if (Libs::Graphics::ShaderRecompiler::IR::SrtSkipDeadMode() == 2u) {
+      // KYTY_SRT_SKIP_DEAD=2: each walk above ran the cut walker too, with the same results.
+      const auto skip = Libs::Graphics::ShaderRecompiler::IR::SrtSkipTotals();
+      Check(skip.checks >= 6u && skip.mismatches == 0u && skip.unstable == 0u, "skip-dead check missing or failed");
+      // The cases below count guest reads exactly, which the second walk doubles.
+      std::puts("ResourceMaterializationTests: skip-dead verification cases passed");
+      return 0;
+    }
     // Their counts alone: every load address is nonzero, so captured equals the sum of loads.
     Libs::Graphics::ShaderRecompiler::IR::ReportWalkCounts(5.0, {});
   }
@@ -2091,6 +2105,7 @@ int main(int argc, char **argv) {
     // Exercises the report on the counts of every case above.
     Libs::Graphics::ShaderRecompiler::IR::ReportWalkCounts(5.0, {});
   }
+  Check(Libs::Graphics::ShaderRecompiler::IR::SrtSkipTotals().mismatches == 0u, "skip-dead walker differs from the full one");
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

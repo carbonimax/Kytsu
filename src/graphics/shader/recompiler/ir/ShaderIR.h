@@ -733,6 +733,10 @@ struct ResourcePlan {
 	// (0 feeds host objects, 1 only flat values, 2 no result); scratch offset of the fill-phase stamps.
 	std::vector<uint32_t>                 srt_count_loads;
 	uint32_t                              srt_count_fill = 0;
+	// KYTY_SRT_SKIP_DEAD=2 (SrtWalker.cpp): the walker without the thunks proven never known, checked
+	// against srt_code; scratch bytes before srt_results_end hold descriptors, activity and outputs.
+	std::unique_ptr<Xbyak::CodeGenerator> srt_skip_code;
+	uint32_t                              srt_results_end = 0;
 	// GPU-thread scratch for walker results and material keys.
 	mutable std::vector<uint64_t>           srt_scratch;
 	// KYTY_SRT_WALK_REUSE (SrtWalker.cpp): inputs and flat result of the last walk, whose results

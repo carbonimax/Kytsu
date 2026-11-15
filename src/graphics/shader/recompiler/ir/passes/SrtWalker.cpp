@@ -219,6 +219,17 @@ std::atomic<uint64_t> g_count_plans {0};
 std::atomic<uint64_t> g_count_dead_plans {0};
 std::atomic<uint64_t> g_count_dead_loads {0};
 
+// KYTY_SRT_SKIP_DEAD (default 0), read once: 1 cuts the thunks proven never known (KnownOf, the
+// KYTY_SRT_PROF=2 proof), so the walk skips the loads only they read (L3-7); 2 keeps the full walker
+// and checks a cut one against it on every real walk ("PERF srtskip", totals since launch).
+const uint32_t g_skip_dead = [] {
+	const char* value = std::getenv("KYTY_SRT_SKIP_DEAD");
+	return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)) : 0u;
+}();
+std::atomic<uint64_t> g_skip_checks {0};
+std::atomic<uint64_t> g_skip_mismatches {0};
+std::atomic<uint64_t> g_skip_unstable {0};
+
 bool ProtectedLoadsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SRT_PROTECTED_LOADS");
@@ -510,7 +521,9 @@ private:
 // rdx scratch, r8 capture cursor.
 class WalkerCompiler {
 public:
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code): m_plan(plan), m_code(code) {}
+	// skip: KYTY_SRT_SKIP_DEAD, cut the thunks proven never known.
+	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool skip = false)
+	    : m_plan(plan), m_code(code), m_skip(skip) {}
 
 	void Compile(std::span<const Value> values);
 
@@ -601,6 +614,7 @@ private:
 	std::vector<Known>    m_known;
 	std::vector<bool>     m_always;
 	uint32_t              m_fill = 0;
+	bool                  m_skip = false;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -956,6 +970,12 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 	auto&       node = m_nodes[index];
 	const auto& args = node.args;
 	c.L(node.label);
+	if (m_skip && m_known[index].can == Can::Never) {
+		// Unknown whatever memory holds: the state stays 0, which callers read as unknown and which
+		// restarts nothing, and no thunk it reads runs from here.
+		c.ret();
+		return;
+	}
 	c.cmp(c.byte[c.rdx + node.state], 0);
 	c.jne(m_ret, Near);
 	c.mov(c.byte[c.rdx + node.state], 1);
@@ -1530,9 +1550,15 @@ void WalkerCompiler::Classify(const std::vector<Operand>& conditions, const std:
 	for (const auto& operand: reads) mark(operand, 2u);
 	m_class.assign(m_nodes.size(), 2u);
 	uint32_t dead = 0;
+	// KYTY_SRT_SKIP_DEAD=2 compiles twice: only its cut walker logs and counts.
+	const bool report = m_skip || g_skip_dead == 0;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		m_class[index] = (live[index] & 1u) != 0u ? 0u : live[index] != 0u ? 1u : 2u;
-		if (m_nodes[index].address == 0 || m_class[index] != 2u) continue;
+		const auto op = m_nodes[index].inst->GetOpcode();
+		const bool load = m_nodes[index].result == Operand {Kind::Node, index} &&
+		                  (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		                   op == ValueOpcode::LoadBufferU32);
+		if (!report || !load || m_class[index] != 2u) continue;
 		++dead;
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
@@ -1549,6 +1575,7 @@ void WalkerCompiler::Classify(const std::vector<Operand>& conditions, const std:
 			std::fflush(stdout);
 		}
 	}
+	if (!g_count || !report) return;
 	g_count_plans.fetch_add(1, std::memory_order_relaxed);
 	g_count_dead_plans.fetch_add(dead != 0u ? 1u : 0u, std::memory_order_relaxed);
 	g_count_dead_loads.fetch_add(dead, std::memory_order_relaxed);
@@ -1578,8 +1605,9 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	Layout();
 	m_plan.srt_count_loads.clear();
 	m_plan.srt_count_fill = m_fill;
+	m_plan.srt_results_end = m_shader_base;
+	if (g_count || m_skip) Classify(conditions, reads, descriptors, outputs);
 	if (g_count) {
-		Classify(conditions, reads, descriptors, outputs);
 		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 			if (m_nodes[index].address != 0) m_plan.srt_count_loads.push_back(m_nodes[index].address << 2u | m_class[index]);
 		}
@@ -1737,9 +1765,15 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+	if (g_skip_dead == 2) {
+		// The cut walker first: the full one, compiled last, leaves its layout and scratch size in the plan.
+		auto check = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+		WalkerCompiler(plan, *check, true).Compile(values);
+		plan.srt_skip_code = std::move(check);
+	}
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	plan.srt_memo_loads = UINT32_MAX;
-	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+	WalkerCompiler(plan, *plan.srt_code, g_skip_dead == 1).Compile(values);
 }
 
 uint32_t WalkReuseMode() noexcept {
@@ -1916,6 +1950,68 @@ void CountWalk(const ResourcePlan& plan, const uint64_t* captures, const uint64_
 	}
 }
 
+// KYTY_SRT_SKIP_DEAD=2: one walk's results, and the first place two of them differ (nullptr when
+// equal): success, flat values, descriptors with their known flags, activity, outputs, reached blocks.
+struct WalkResult {
+	const uint64_t*        end;
+	const uint32_t*        flat;
+	const uint8_t*         scratch;
+};
+
+const char* WalkDifference(const ResourcePlan& plan, const WalkResult& a, const WalkResult& b, size_t& at) {
+	at = 0;
+	if ((a.end == nullptr) != (b.end == nullptr)) return "walk";
+	if (a.end == nullptr) return nullptr;
+	for (at = 0; at < plan.srt_reads.size(); ++at) {
+		if (a.flat[at] != b.flat[at]) return "flat";
+	}
+	for (at = 0; at < plan.srt_results_end; ++at) {
+		if (a.scratch[at] != b.scratch[at]) return "results";
+	}
+	for (at = plan.srt_restart - plan.control_flow.size(); at < plan.srt_restart; ++at) {
+		if (a.scratch[at] != b.scratch[at]) return "reach";
+	}
+	return nullptr;
+}
+
+using WalkerFn = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+
+const uint64_t* RunWalker(const Xbyak::CodeGenerator& code, const SrtRuntime& runtime, uint32_t* flat,
+                          uint64_t* scratch) {
+	t_running_walker = &code;
+	const auto* end  = code.getCode<WalkerFn>()(runtime.user_data.data(), flat, scratch, runtime.shader_base);
+	t_running_walker = nullptr;
+	return end;
+}
+
+// KYTY_SRT_SKIP_DEAD=2: scratch before the walk, and the cut walk run on a copy of it.
+thread_local std::vector<uint64_t> t_skip_before, t_skip_scratch;
+thread_local std::vector<uint32_t> t_skip_flat;
+
+// Compares the full walk that just ran with the cut one. On a difference the full walker runs again
+// from the same scratch: when it disagrees with itself, guest memory moved between the walks.
+void CheckSkipDead(const ResourcePlan& plan, const SrtRuntime& runtime, const uint64_t* skip_end,
+                   const uint64_t* end, const std::vector<uint32_t>& flat) {
+	const auto bytes = [](const std::vector<uint64_t>& scratch) { return reinterpret_cast<const uint8_t*>(scratch.data()); };
+	const WalkResult full {end, flat.data(), bytes(plan.srt_scratch)};
+	size_t           at   = 0;
+	const char*      what = WalkDifference(plan, full, {skip_end, t_skip_flat.data(), bytes(t_skip_scratch)}, at);
+	g_skip_checks.fetch_add(1, std::memory_order_relaxed);
+	if (what == nullptr) return;
+	t_skip_scratch = t_skip_before;
+	t_skip_flat.assign(flat.size(), 0u);
+	size_t     again_at = 0;
+	const auto again    = RunWalker(*plan.srt_code, runtime, t_skip_flat.data(), t_skip_scratch.data());
+	const bool unstable = WalkDifference(plan, full, {again, t_skip_flat.data(), bytes(t_skip_scratch)}, again_at) != nullptr;
+	(unstable ? g_skip_unstable : g_skip_mismatches).fetch_add(1, std::memory_order_relaxed);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+		std::printf("SRT skip-dead %s shader=%016llx stage=%u what=%s at=%zu\n", unstable ? "unstable" : "mismatch",
+		            static_cast<unsigned long long>(plan.shader_hash), static_cast<unsigned>(plan.stage), what, at);
+		std::fflush(stdout);
+	}
+}
+
 } // namespace
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
@@ -1953,6 +2049,14 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	}
 	plan.srt_memo_loads = UINT32_MAX;
 	flat.assign(plan.srt_reads.size(), 0u);
+	// KYTY_SRT_SKIP_DEAD=2: the cut walk first, so the full one still pays any wait the cut loads take.
+	const uint64_t* skip_end = nullptr;
+	if (plan.srt_skip_code != nullptr) {
+		t_skip_before.assign(plan.srt_scratch.begin(), plan.srt_scratch.end());
+		t_skip_scratch = t_skip_before;
+		t_skip_flat.assign(flat.size(), 0u);
+		skip_end = RunWalker(*plan.srt_skip_code, runtime, t_skip_flat.data(), t_skip_scratch.data());
+	}
 	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	// After MemoLoadsHold: its validation loads are not this walk's.
 	if (g_count) t_count_protected.clear();
@@ -1967,6 +2071,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 		                                              .count()),
 		                    std::memory_order_relaxed);
 	}
+	if (plan.srt_skip_code != nullptr) CheckSkipDead(plan, runtime, skip_end, end, flat);
 	if (end == nullptr) return false;
 	const auto* captures = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	if (g_count) CountWalk(plan, captures, end, stride);
@@ -2092,6 +2197,16 @@ WalkStats TakeWalkStats() noexcept {
 
 bool WalkCountEnabled() noexcept {
 	return g_count;
+}
+
+uint32_t SrtSkipDeadMode() noexcept {
+	return g_skip_dead;
+}
+
+SrtSkipChecks SrtSkipTotals() noexcept {
+	return {.checks     = g_skip_checks.load(std::memory_order_relaxed),
+	        .mismatches = g_skip_mismatches.load(std::memory_order_relaxed),
+	        .unstable   = g_skip_unstable.load(std::memory_order_relaxed)};
 }
 
 void NoteWalkFrame() noexcept {

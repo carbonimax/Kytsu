@@ -322,6 +322,11 @@ void MaybeReport() noexcept {
 	}
 	const auto walk = ShaderRecompiler::IR::TakeWalkStats();
 	ShaderRecompiler::IR::ReportWalkCounts(seconds, walk);
+	if (ShaderRecompiler::IR::SrtSkipDeadMode() == 2u) {
+		const auto skip = ShaderRecompiler::IR::SrtSkipTotals();
+		std::printf("PERF srtskip %.1fs: checks=%" PRIu64 " mismatches=%" PRIu64 " unstable=%" PRIu64 " (since launch)\n",
+		            seconds, skip.checks, skip.mismatches, skip.unstable);
+	}
 	if (walk.walks != 0 || walk.reuse_checks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64
 		            " fault_reads=%" PRIu64 " protected_calls=%" PRIu64 "(%.0fms,synced=%" PRIu64 ") evictions=%" PRIu64

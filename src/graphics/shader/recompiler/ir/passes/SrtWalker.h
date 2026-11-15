@@ -121,6 +121,14 @@ WalkStats TakeWalkStats() noexcept;
 [[nodiscard]] bool WalkCountEnabled() noexcept;
 void               NoteWalkFrame() noexcept; // GPU thread, at each guest frame boundary
 void               ReportWalkCounts(double seconds, const WalkStats& walk) noexcept;
+// KYTY_SRT_SKIP_DEAD (default 0): 1 compiles walkers without the thunks proven never known, so a walk
+// skips the loads no result depends on (the KYTY_SRT_PROF=2 dead class); 2 runs such a walker before
+// the full one on every real walk and compares their results. Totals since launch ("PERF srtskip").
+struct SrtSkipChecks {
+	uint64_t checks = 0, mismatches = 0, unstable = 0; // unstable: the full walker disagreed with itself
+};
+[[nodiscard]] uint32_t      SrtSkipDeadMode() noexcept;
+[[nodiscard]] SrtSkipChecks SrtSkipTotals() noexcept;
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);

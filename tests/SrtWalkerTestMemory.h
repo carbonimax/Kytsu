@@ -110,6 +110,9 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   const auto captures = plan.srt_captures;
   auto count_loads = std::move(plan.srt_count_loads);
   const auto count_fill = plan.srt_count_fill;
+  auto skip_code = std::move(plan.srt_skip_code);
+  const auto results_end = plan.srt_results_end;
+  const auto restart = plan.srt_restart;
   CompileSrtWalker(plan, {&value, 1});
   std::vector<uint32_t> flat;
   const bool known = WalkSrt(plan, runtime, flat, nullptr) && WalkedValue(plan, value, result);
@@ -119,6 +122,9 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   plan.srt_captures = captures;
   plan.srt_count_loads = std::move(count_loads);
   plan.srt_count_fill = count_fill;
+  plan.srt_skip_code = std::move(skip_code);
+  plan.srt_results_end = results_end;
+  plan.srt_restart = restart;
   if (inst != nullptr) inst->SetWalkOutput(output);
   return known;
 }

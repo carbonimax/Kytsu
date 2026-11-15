@@ -861,6 +861,21 @@ if(BUILD_TESTING)
 	         $<TARGET_FILE:resource_materialization_tests> --walk-count)
 	add_test(NAME srt_walk_count_reuse COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_PROF=2 KYTY_PERF_STATS=1 KYTY_SRT_WALK_REUSE=1
 	         $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
+	# KYTY_SRT_SKIP_DEAD=1: every walker suite with cut walkers. =2 (a second, cut walk per walk) only on the
+	# dead-load cases: the other suites count guest reads exactly, which the second walk doubles.
+	set(env ${CMAKE_COMMAND} -E env KYTY_SRT_SKIP_DEAD=1)
+	add_test(NAME srt_skip1_shader_cfg COMMAND ${env} KYTY_SRT_WALK_REUSE=0 $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME srt_skip1_scalar_provenance COMMAND ${env} $<TARGET_FILE:scalar_provenance_tests>)
+	add_test(NAME srt_skip1_materialization COMMAND ${env} KYTY_SRT_WALK_REUSE=0 $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME srt_skip1_tracking COMMAND ${env} KYTY_SRT_WALK_REUSE=0 $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME srt_skip1_reuse COMMAND ${env} KYTY_SRT_WALK_REUSE=1 $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
+	add_test(NAME srt_skip1_count COMMAND ${env} KYTY_SRT_PROF=2 KYTY_PERF_STATS=1 KYTY_SRT_WALK_REUSE=0
+	         $<TARGET_FILE:resource_materialization_tests> --walk-count)
+	add_test(NAME srt_skip2_count COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_SKIP_DEAD=2 KYTY_SRT_PROF=2 KYTY_PERF_STATS=1
+	         KYTY_SRT_WALK_REUSE=0 $<TARGET_FILE:resource_materialization_tests> --walk-count)
+	set_tests_properties(srt_skip1_shader_cfg srt_skip1_scalar_provenance srt_skip1_materialization srt_skip1_tracking
+	                     srt_skip1_reuse srt_skip1_count srt_skip2_count PROPERTIES
+	                     FAIL_REGULAR_EXPRESSION "SRT skip-dead (mismatch|unstable)")
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)
