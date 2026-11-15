@@ -6702,7 +6702,7 @@ public:
           return Libs::Graphics::Image::heap_changes.size();
         };
         const auto unpinned = pending();
-        textures.GetImage(resident).MarkCpuDirty();
+        textures.GetImage(resident).HeapChanged();
         Require(name, "unpinned change", pending() == unpinned,
                 "an image no heap pins queued a heap change");
       }
