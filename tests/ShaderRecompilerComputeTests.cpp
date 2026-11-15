@@ -61472,7 +61472,10 @@ int main(int argc, char **argv) {
       vulkan.emplace();
       GpuCapture::Capture capture;
       vulkan->CheckGpuCaptureReplay(&capture);
-      generated = std::filesystem::temp_directory_path() / "kyty_gpu_replay_generated";
+      // One folder per run: ctest runs from other build trees may replay at the same time.
+      generated = std::filesystem::temp_directory_path() /
+                  fmt::format("kyty_gpu_replay_generated_{}",
+                              std::chrono::steady_clock::now().time_since_epoch().count());
       std::filesystem::remove_all(generated, error);
       std::filesystem::create_directories(generated, error);
       const auto write = [&](const char *file, const GpuCapture::Capture &c) {
@@ -61495,8 +61498,12 @@ int main(int argc, char **argv) {
         files.push_back(entry.path().string());
       }
     }
+    if (files.empty() && dir == nullptr) {
+      std::printf("GpuReplayDir generated: no capture found in %s\n", generated.string().c_str());
+      return 1;
+    }
     if (files.empty()) {
-      std::printf("GpuReplayDir skipped: no .kygpucap in KYTY_GPU_REPLAY_DIR (%s)\n", dir != nullptr ? dir : "unset");
+      std::printf("GpuReplayDir skipped: no .kygpucap in KYTY_GPU_REPLAY_DIR (%s)\n", dir);
       return 0;
     }
     std::ranges::sort(files);
