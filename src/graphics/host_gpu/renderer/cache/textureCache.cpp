@@ -1465,6 +1465,8 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		// The record may be an ordinary image a heap pins: as an association it stops being current.
+		record.HeapChanged();
 		m_image_index_epoch++;
 		record.info                 = plane;
 		record.depth_id             = depth_id;
