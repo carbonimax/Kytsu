@@ -22,6 +22,8 @@ constexpr auto MakeRegisterNames() {
 	names[R_PUSH_MARKER]    = "R_PUSH_MARKER";
 	names[R_POP_MARKER]     = "R_POP_MARKER";
 	names[R_CONTEXT_STATE]  = "R_CONTEXT_STATE";
+	names[R_WAIT_FLIP_DONE] = "R_WAIT_FLIP_DONE";
+	names[R_FLIP]           = "R_FLIP";
 	return names;
 }
 

@@ -1234,17 +1234,6 @@ static bool IsPipelinedPacket(uint32_t opcode, uint32_t custom) {
 	}
 }
 
-// A flip or flip-done wait block opens with a SET_UCONFIG_REG of its tag, a pipelined packet, but it
-// drains and is a sync point like any flip: labels, EOP and flips keep their point in the stream.
-static bool IsFlipBlock(uint32_t opcode, const uint32_t* packet, uint32_t remaining_dw) {
-	if (opcode != Pm4::IT_SET_UCONFIG_REG || KYTY_PM4_R(packet[0]) != 1u || remaining_dw < 3 ||
-	    packet[1] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
-		return false;
-	}
-	const auto tag = packet[2] & 0xff000000u;
-	return tag == Pm4::USERDATA_TAG_FLIP || tag == Pm4::USERDATA_TAG_WAIT_FLIP_DONE;
-}
-
 // KYTY_REPROTECT_BATCH: non-pipelined packets that are guest sync points, i.e. after which the guest
 // may observe command-processor progress or the command processor waits for the guest (labels,
 // memory writes, flips and other custom packets, memory waits). Dispatches, indirect draws and cache
@@ -1328,7 +1317,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
-		const bool flip_block = IsFlipBlock(opcode, packet, remaining_dw);
+		// A flip or flip-done wait block opens with a SET_UCONFIG_REG of its tag, a pipelined packet,
+		// but it drains and is a sync point like any flip: labels, EOP and flips keep their point.
+		const bool flip_block = remaining_dw >= 3 && Pm4::IsFlipBlock(packet_header, packet + 1);
 		if (flip_block) {
 			CpSplitProf::Drain(CpSplitProf::Cause::Flip);
 		} else {
