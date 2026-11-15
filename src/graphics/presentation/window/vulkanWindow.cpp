@@ -743,6 +743,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
 	graphics.r8_srgb_views   = graphics.SamplesFiltered(vk::Format::eR8Srgb);
 	graphics.r8g8_srgb_views = graphics.SamplesFiltered(vk::Format::eR8G8Srgb);
+	constexpr auto blended_target = vk::FormatFeatureFlagBits::eColorAttachment |
+	                                vk::FormatFeatureFlagBits::eColorAttachmentBlend;
+	graphics.r4g4b4a4_render_targets =
+	    (graphics.GetFormatProperties(vk::Format::eR4G4B4A4UnormPack16).optimalTilingFeatures &
+	     blended_target) == blended_target;
 	// The device clock ticks at timestampPeriod nanoseconds.
 	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
 		graphics.device_clock_period_ps = static_cast<uint32_t>(
