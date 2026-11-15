@@ -541,6 +541,11 @@ add_executable(dispatch_chain_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(dispatch_chain_policy_tests PRIVATE ${inc_headers})
 
+add_executable(sleep_prof_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SleepProfTests.cpp"
+)
+target_include_directories(sleep_prof_tests PRIVATE ${inc_headers})
+
 add_executable(async_pipeline_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AsyncPipelinePolicyTests.cpp"
 )
@@ -860,6 +865,7 @@ if(BUILD_TESTING)
 	add_test(NAME srt_walk_reuse COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_WALK_REUSE=1 $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
+	add_test(NAME sleep_prof COMMAND $<TARGET_FILE:sleep_prof_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)
 	add_test(NAME staging_memory_policy COMMAND $<TARGET_FILE:staging_memory_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
@@ -1042,6 +1048,7 @@ if(BUILD_TESTING)
 		shader_optimization_tests
 		aliased_color_pass_policy_tests
 		dispatch_chain_policy_tests
+		sleep_prof_tests
 		async_pipeline_policy_tests
 		staging_memory_policy_tests
 		event_queue_lifetime_tests

@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "kernel/sleepProf.h"
 #include "kernel/syncTrace.h"
 
 #include <optional>
@@ -3938,13 +3939,28 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 	// g_thread_dtors = dtors;
 }
 
+// KYTY_SLEEP_PROF: times one guest sleep request. Signal handlers run inside count as oversleep.
+template <class SleepFn>
+static void ProfiledSleep(uint64_t requested_ns, SleepFn sleep) {
+	if (!SleepProf::Enabled()) {
+		sleep();
+		return;
+	}
+	const auto start = std::chrono::steady_clock::now();
+	sleep();
+	const auto actual_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+	SleepProf::Record(requested_ns, static_cast<uint64_t>(actual_ns),
+	                  g_pthread_self != nullptr ? g_pthread_self->name.c_str() : nullptr);
+}
+
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
-	SleepMicroWithSignalPoll(microseconds);
+	ProfiledSleep(static_cast<uint64_t>(microseconds) * 1000ull, [=] { SleepMicroWithSignalPoll(microseconds); });
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
-	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
+	const uint64_t microseconds = static_cast<uint64_t>(seconds) * 1000000ull;
+	ProfiledSleep(microseconds * 1000ull, [=] { SleepMicroWithSignalPoll(microseconds); });
 	return OK;
 }
 
@@ -3965,7 +3981,7 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
-	SleepNanoWithSignalPoll(nanos);
+	ProfiledSleep(nanos, [=] { SleepNanoWithSignalPoll(nanos); });
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;

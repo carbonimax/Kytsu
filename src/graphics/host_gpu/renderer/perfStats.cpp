@@ -7,6 +7,7 @@
 #include "graphics/shader/shaderPretranslate.h"
 #include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "kernel/sleepProf.h"
 
 #include <array>
 #include <atomic>
@@ -358,6 +359,7 @@ void MaybeReport() noexcept {
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	MemTrackProf::Report(seconds, n(Counter::Frames));
 	LateRead::Report(seconds, n(Counter::Frames));
+	::Libs::LibKernel::SleepProf::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
 	std::fflush(stdout);
