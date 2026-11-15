@@ -171,6 +171,14 @@ public:
 		return hit;
 	}
 
+	void Ranges(uint64_t address, uint64_t size, std::vector<std::pair<uint64_t, uint32_t>>& out) {
+		if (!AnyPending()) {
+			return;
+		}
+		std::lock_guard lock(m_mutex);
+		ForEachPending(address, size, [&out](uint64_t base, const Entry& entry) { out.emplace_back(base, entry.size); });
+	}
+
 	// Overlays the pending label bytes on `bytes`, a copy of guest memory [address, address + size).
 	[[nodiscard]] bool Overlay(uint64_t address, uint64_t size, uint8_t* bytes) {
 		if (!AnyPending()) {
@@ -281,6 +289,13 @@ T ReadFrontValue(const volatile T* address, bool* from_pending) {
 } // namespace
 
 namespace EopAtGpu {
+
+void PendingRanges(uint64_t address, uint64_t size, std::vector<std::pair<uint64_t, uint32_t>>& out) noexcept {
+	if (EopAtGpuMode() != 1) {
+		return;
+	}
+	g_pending_labels.Ranges(address, size, out);
+}
 
 bool OverlayPending(uint64_t address, void* bytes, uint64_t size) noexcept {
 	if (EopAtGpuMode() == 0 || !g_pending_labels.AnyPending()) {
@@ -720,25 +735,28 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	const auto address = reinterpret_cast<uint64_t>(dst);
+	const auto bytes =
+	    write_one_address ? uint64_t {sizeof(uint32_t)} : uint64_t {dw_num} * sizeof(uint32_t);
+	// KYTY_LATE_READ_PROF: a command-processor write, not a guest one (logged before and after).
+	LateRead::NoteBackingWrite(address, bytes, true);
 	// Destinations whose bytes the GPU owns: write through the command stream.
-	{
-		const auto address = reinterpret_cast<uint64_t>(dst);
-		const auto bytes   = write_one_address ? uint64_t {sizeof(uint32_t)}
-		                                       : uint64_t {dw_num} * sizeof(uint32_t);
-		GpuCapture::Touch(address, bytes);
-		if (m_renderer.GetBufferCache().WriteGpuOwned(
-		        address, write_one_address ? &src[dw_num - 1] : src, bytes)) {
-			m_renderer.GetTextureCache().InvalidateMemory(address, bytes, RefreshProf::Label);
-			return;
-		}
+	GpuCapture::Touch(address, bytes);
+	if (m_renderer.GetBufferCache().WriteGpuOwned(address, write_one_address ? &src[dw_num - 1] : src,
+	                                              bytes)) {
+		m_renderer.GetTextureCache().InvalidateMemory(address, bytes, RefreshProf::Label);
+		LateRead::NoteBackingWrite(address, bytes, true);
+		return;
 	}
 
+	m_renderer.GetBufferCache().BeforeCpuWrite(address, bytes);
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
 		output += !write_one_address;
 	}
+	LateRead::NoteBackingWrite(address, bytes, true);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -749,7 +767,10 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	GpuCapture::Touch(dst_address, num_bytes);
 	const auto value = Sync::ReadReferenceClock();
+	m_renderer.GetBufferCache().BeforeCpuWrite(dst_address, num_bytes);
+	LateRead::NoteBackingWrite(dst_address, num_bytes, true);
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	LateRead::NoteBackingWrite(dst_address, num_bytes, true);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -1605,12 +1626,14 @@ static bool GpuOwnedEopLabelEnabled() {
 
 void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size) {
 	const auto address = reinterpret_cast<uint64_t>(dst);
+	LateRead::NoteBackingWrite(address, size, true); // KYTY_LATE_READ_PROF: a command-processor write
 	if (GpuOwnedEopLabelEnabled() &&
 	    m_renderer.GetBufferCache().WriteGpuOwned(address, data, size)) {
 		m_renderer.GetTextureCache().InvalidateMemory(address, size, RefreshProf::Label);
-		return;
+	} else {
+		std::memcpy(dst, data, size);
 	}
-	std::memcpy(dst, data, size);
+	LateRead::NoteBackingWrite(address, size, true);
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
@@ -1646,6 +1669,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
+	// KYTY_LATE_READ_PROF: checked before this signal reaches the guest.
+	m_renderer.GetBufferCache().SealLateReads();
 
 	const int eop_mode = EopAtGpuMode();
 	if (eop_mode == 1) {
