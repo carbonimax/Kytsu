@@ -15676,6 +15676,14 @@ public:
     int map = 0;
   };
   ReplayUnmappable m_replay_unmappable;
+  // Owned by no host: between the guest user range (HOST_USER_MAX) and extended memory, on every platform.
+  static constexpr uint64_t kUnmappableAddress = 0x000000fe00000000ull;
+  // The synthetic capture with one more range at kUnmappableAddress.
+  static GpuCapture::Capture WithUnmappableRange(GpuCapture::Capture capture) {
+    capture.records.insert(capture.records.begin(),
+                           GpuCapture::Memory{kUnmappableAddress, std::vector<uint8_t>(0x1000, 0xab)});
+    return capture;
+  }
 
   // Replays a GPU capture without the guest CPU or HLE: maps its memory back at the same
   // addresses, registers its shaders, submits its command lists and hashes the expected ranges.
@@ -16033,7 +16041,8 @@ public:
 
   // A synthetic capture (no game content): graphics and compute command lists with an indirect
   // buffer, CP writes, a DMA copy, an end-of-pipe label and a compute dispatch set up by PM4.
-  void CheckGpuCaptureReplay() {
+  // `synthetic`: receives the synthetic capture instead of running the checks (gpu_capture_replay_local).
+  void CheckGpuCaptureReplay(GpuCapture::Capture *synthetic = nullptr) {
     constexpr const char *name = "GpuCaptureReplay";
     constexpr uint64_t base = 0x0000000206000000ull;
     constexpr uint64_t dcb = base, ib = base + 0x1000, acb = base + 0x2000;
@@ -16130,6 +16139,10 @@ public:
     const std::vector<uint8_t> zeros(0x1000);
     records.emplace_back(GpuCapture::Expect{zero_page, zeros.size(), XXH3_64bits(zeros.data(), zeros.size())});
     records.emplace_back(GpuCapture::Expect{output, sizeof(stored), XXH3_64bits(&stored, sizeof(stored))});
+    if (synthetic != nullptr) {
+      *synthetic = std::move(capture);
+      return;
+    }
 
     // The file format round-trips and rejects damaged or unknown files.
     const auto file = GpuCapture::Serialize(capture);
@@ -16146,6 +16159,11 @@ public:
     Require(name, "version", !GpuCapture::Parse(future, &error), "an unknown version was accepted");
 
     Require(name, "replay", ReplayGpuCapture(name, *parsed) == 0, "replayed output differs");
+    // A range this host cannot map is inconclusive (nothing replayed, the range reported), not a mismatch.
+    Require(name, "unmappable",
+            ReplayGpuCapture(name, WithUnmappableRange(*parsed)) == kReplayUnmappable &&
+                m_replay_unmappable.address == kUnmappableAddress && m_replay_unmappable.map != 0,
+            "an unmappable capture range was not reported as inconclusive");
     // A wrong expectation must be reported, so the comparison above is live.
     auto wrong = *parsed;
     std::get<GpuCapture::Expect>(wrong.records.back()).hash ^= 1u;
@@ -60603,17 +60621,41 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     return vulkan.ReplayGpuCaptureFile(argv[2], std::strcmp(argv[1], "--gpu-replay-record") == 0);
   }
-  // Local game captures (never in the repo): every *.kygpucap of KYTY_GPU_REPLAY_DIR must replay exactly.
+  // Local game captures (never in the repo): every *.kygpucap of KYTY_GPU_REPLAY_DIR must replay exactly;
+  // unset, generated synthetic captures (no game data) take the same path.
   if (argc == 2 && std::strcmp(argv[1], "--gpu-replay-dir-only") == 0) {
     const char *dir = std::getenv("KYTY_GPU_REPLAY_DIR");
     std::vector<std::string> files;
     std::error_code error;
-    if (dir != nullptr) {
-      for (const auto &entry : std::filesystem::directory_iterator(dir, error)) {
-        // Sidecars (<capture>.platform.kygpucap) are read with their capture.
-        if (entry.path().extension() == ".kygpucap" && entry.path().stem().extension() != ".platform") {
-          files.push_back(entry.path().string());
-        }
+    std::optional<VulkanHarness> vulkan;
+    std::filesystem::path generated;
+    if (dir == nullptr) {
+      // No local captures: the synthetic capture of gpu_capture_replay and a copy with a range no host can
+      // map take the file path (parse, sidecars, report); exactly 0 differ and 1 is inconclusive.
+      vulkan.emplace();
+      GpuCapture::Capture capture;
+      vulkan->CheckGpuCaptureReplay(&capture);
+      generated = std::filesystem::temp_directory_path() / "kyty_gpu_replay_generated";
+      std::filesystem::remove_all(generated, error);
+      std::filesystem::create_directories(generated, error);
+      const auto write = [&](const char *file, const GpuCapture::Capture &c) {
+        const auto bytes = GpuCapture::Serialize(c);
+        FILE *f = std::fopen((generated / file).string().c_str(), "wb");
+        const bool ok = f != nullptr && std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+        if (f != nullptr) std::fclose(f);
+        return ok;
+      };
+      if (!write("synthetic.kygpucap", capture) ||
+          !write("unmappable.kygpucap", VulkanHarness::WithUnmappableRange(capture))) {
+        std::printf("GpuReplayDir generated: cannot write %s\n", generated.string().c_str());
+        return 1;
+      }
+    }
+    const auto replay_dir = dir != nullptr ? std::filesystem::path(dir) : generated;
+    for (const auto &entry : std::filesystem::directory_iterator(replay_dir, error)) {
+      // Sidecars (<capture>.platform.kygpucap) are read with their capture.
+      if (entry.path().extension() == ".kygpucap" && entry.path().stem().extension() != ".platform") {
+        files.push_back(entry.path().string());
       }
     }
     if (files.empty()) {
@@ -60621,11 +60663,11 @@ int main(int argc, char **argv) {
       return 0;
     }
     std::ranges::sort(files);
-    VulkanHarness vulkan;
+    if (!vulkan) vulkan.emplace();
     int failed = 0;
     size_t inconclusive = 0;
     for (const auto &file : files) {
-      const int status = vulkan.ReplayGpuCaptureFile(file.c_str());
+      const int status = vulkan->ReplayGpuCaptureFile(file.c_str());
       if (status == VulkanHarness::kReplayFileInconclusive) {
         inconclusive++;
       } else if (status != 0) {
@@ -60635,6 +60677,13 @@ int main(int argc, char **argv) {
     // A capture that cannot be mapped here is inconclusive, not a difference; the others still count.
     std::printf("GpuReplayDir %zu captures, %d differ, %zu inconclusive on this host\n", files.size(), failed,
                 inconclusive);
+    if (dir == nullptr) {
+      // Never "skipped" here: the generated pair must give exactly this result.
+      const bool expected = files.size() == 2 && failed == 0 && inconclusive == 1;
+      std::filesystem::remove_all(generated, error);
+      std::printf("GpuReplayDir generated captures: %s\n", expected ? "ok" : "unexpected result");
+      return expected ? 0 : 1;
+    }
     if (failed == 0 && inconclusive == files.size()) {
       std::printf("GpuReplayDir skipped: no capture could be mapped on this host\n");
     }
