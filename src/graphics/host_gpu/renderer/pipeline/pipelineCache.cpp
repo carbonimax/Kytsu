@@ -1091,7 +1091,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		if (m_async) PipelineCacheLog("Pipeline async: draws skipped while their pipeline is created (KYTY_ASYNC_PIPELINE)");
 		const char* async_tess = std::getenv("KYTY_ASYNC_TESS");
 		m_async_tess           = m_async && async_tess != nullptr && std::strcmp(async_tess, "1") == 0;
-		if (m_async_tess) PipelineCacheLog("Pipeline async: tessellation draws skipped until created, no cap (KYTY_ASYNC_TESS)");
+		if (m_async_tess) PipelineCacheLog("Pipeline async: tessellation draws skipped until created, no cap, depth-only too (KYTY_ASYNC_TESS)");
 	}
 	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
 		// The verify shaders embed this launch's counter address.

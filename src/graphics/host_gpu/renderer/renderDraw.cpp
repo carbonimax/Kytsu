@@ -1935,10 +1935,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		if (pipelines[0] == nullptr) {
 			// KYTY_ASYNC_PIPELINE: only a draw whose effects are this frame's colors may be skipped while
 			// its pipeline is created; any other miss waits (below), counted by reason.
+			// KYTY_ASYNC_TESS: a depth-only tessellation draw is skipped too (its creation froze the draw
+			// thread); later passes then miss its depth for the frames it waits.
 			using PerfStats::Counter;
+			const bool tess_skip = pipeline_cache.AsyncTess() && state.VertexStages().size() == 3;
 			const auto block = passes                                       ? Counter::AsyncBlockPasses
 			                   : DrawWritesAnything(state)                  ? Counter::AsyncBlockWrites
-			                   : state.color_count == 0                     ? Counter::AsyncBlockDepthOnly
+			                   : state.color_count == 0 && !tess_skip       ? Counter::AsyncBlockDepthOnly
 			                   : m_context.GetOcclusionQueries().Counting() ? Counter::AsyncBlockQuery
 			                                                                : Counter::Count;
 			if (block != Counter::Count) {
