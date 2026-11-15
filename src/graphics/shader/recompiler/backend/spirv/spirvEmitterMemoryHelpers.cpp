@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
@@ -502,6 +504,17 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 	}
 }
 
+// KYTY_F16_STORE_RTZ=1 encodes 16-bit float store components like the hardware format
+// conversion (round toward zero, NaN payload kept); unset or 0 keeps the host PackHalf2x16,
+// whose rounding the driver picks (truncating on AMD, nearest on others).
+static bool F16StoreRoundTowardZero() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_F16_STORE_RTZ");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                        uint32_t component, uint32_t data, uint32_t data_bits,
                                        UnormRounding rounding) {
@@ -564,6 +577,25 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
 	}
 	if (bits == 16u && info.type == Format::ComponentType::Float) {
+		if (F16StoreRoundTowardZero()) {
+			// Upstream KytyPS5 #1588: native 16-bit float stores (RDNA2, RDNA4) round toward zero as
+			// EmitF32BitsToF16RtzBits does, but keep a NaN's top mantissa bits (1 if those are 0)
+			// without quieting it.
+			const auto magnitude = EmitAndConstant(state, data, 0x7fffffffu);
+			const auto sign      = EmitAndConstant(
+			    state, EmitBinaryU32(state, spv::OpShiftRightLogical, data, ConstantU32(state, 16u)),
+			    0x8000u);
+			const auto payload = EmitUMax32(state,
+			                                EmitBinaryU32(state, spv::OpShiftRightLogical,
+			                                              EmitAndConstant(state, data, 0x7fffffu),
+			                                              ConstantU32(state, 13u)),
+			                                ConstantU32(state, 1u));
+			return Select(
+			    state, TypeU32(state),
+			    EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x7f800000u),
+			    EmitOrU32(state, sign, EmitOrU32(state, payload, ConstantU32(state, 0x7c00u))),
+			    EmitF32BitsToF16RtzBits(state, data));
+		}
 		const auto pair = EmitCompositeConstructF32x2(
 		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
 		return EmitGlslPackHalf2x16(state, pair);
