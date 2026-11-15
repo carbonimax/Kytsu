@@ -377,6 +377,7 @@ static KYTY_SYSV_ABI const char** getargv() {
 	return LibC::GetArgv();
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 static void dump_stack_chk_fail_context(uint64_t caller, uint64_t rsp) {
 	LOGF("stack_chk_fail caller = 0x%016" PRIx64 "\n", caller);
 	LOGF("stack_chk_fail guard  = 0x%016" PRIx64 " @ 0x%016" PRIx64 "\n", g_stack_chk_guard,
@@ -457,13 +458,19 @@ static void dump_stack_chk_fail_context(uint64_t caller, uint64_t rsp) {
 		LOGF("\n");
 	}
 }
+#endif
 
 static KYTY_SYSV_ABI void stack_chk_fail() {
 	PRINT_NAME();
 
+#if defined(__x86_64__) || defined(_M_X64)
 	uint64_t rsp = 0;
 	asm volatile("movq %%rsp, %0" : "=r"(rsp));
 	dump_stack_chk_fail_context(reinterpret_cast<uint64_t>(__builtin_return_address(0)), rsp);
+#else
+	// The host stack and return address here are not the guest x86 frame, so the dump would read bogus data.
+	LOGF("stack_chk_fail: guest x86 stack/caller context unavailable on this host architecture, dump skipped\n");
+#endif
 
 	EXIT("stack fail!!!");
 }
@@ -702,6 +709,8 @@ static SignalUcontext CreateSignalUcontext(
 	return ctx;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+// Callers are the Windows and x86-64 KernelRaiseException paths only.
 static SignalUcontext CreateCurrentGuestCallSignalUcontext(uint64_t rip) {
 	auto ctx = CreateSignalUcontext();
 
@@ -743,6 +752,7 @@ static SignalUcontext CreateCurrentGuestCallSignalUcontext(uint64_t rip) {
 
 	return ctx;
 }
+#endif
 
 static bool IsGuestCodeAddress(uint64_t addr) {
 	return addr >= 0x0000000900000000ull && addr < 0x0000000980000000ull;
