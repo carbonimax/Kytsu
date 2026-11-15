@@ -79,6 +79,9 @@ public:
 	static constexpr int MIN_SCREEN_SIZE = 320;
 	static constexpr int MAX_SCREEN_SIZE = 16384;
 
+	// Written with every configuration; 1 = tessellation on by default.
+	static constexpr int SETTINGS_VERSION = 1;
+
 	static QString NormalizeResolution(const QString& text);
 
 	enum class PresentMode { Fifo, Mailbox, Immediate };
