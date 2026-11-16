@@ -1184,8 +1184,7 @@ static bool SameDesc(const TextureCache::ImageDesc& a, const TextureCache::Image
 	       x.guest_format == y.guest_format && x.type == y.type && x.extent == y.extent &&
 	       x.resources == y.resources && x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
 	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.bgra16 == y.bgra16 &&
-	       x.tiled_slice_stride == y.tiled_slice_stride && x.linear_slice_stride == y.linear_slice_stride &&
-	       x.first_tail_level == y.first_tail_level;
+	       x.tiled_slice_stride == y.tiled_slice_stride && x.first_tail_level == y.first_tail_level;
 }
 
 static bool SameColor(const RenderColorInfo& a, const RenderColorInfo& b) {
