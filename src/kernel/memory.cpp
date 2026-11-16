@@ -176,6 +176,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static callback_func_t       g_test_before_backing_map   = nullptr;
 static callback_func_t       g_test_backing_read         = nullptr;
+static int                   g_test_sparse_copy_cache_mode = -1; // -1 = KYTY_SPARSE_COPY_CACHE
 static uint64_t              g_test_backing_bytes_zeroed = 0;
 static std::atomic<uint64_t> g_test_free_range_visits {0};
 #endif
@@ -2724,6 +2725,14 @@ void TestBeforeNextBackingMap(callback_func_t callback) {
 
 void TestSetBackingReadCallback(callback_func_t callback) {
 	g_test_backing_read = callback;
+}
+
+void TestSetSparseCopyCacheMode(int mode) {
+	g_test_sparse_copy_cache_mode = mode;
+}
+
+void TestSparseCopyCounts(uint64_t* checked, uint64_t* locked) {
+	g_guest_address_space->SparseCopyCounts(checked, locked);
 }
 
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {

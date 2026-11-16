@@ -330,9 +330,14 @@ public:
 
 	// KYTY_SPARSE_COPY_CACHE: 0 (default) always takes the locks, 1 copies a range that lies inside
 	// one recently used backing mapping without any lock (TryCopyCached), 2 also re-checks every
-	// lock-free copy's translation under the locks and exits on a difference. Read at the first
-	// copy, after KYTY_SPARSE_COPY_CACHE_TITLES has been applied (emulator.cpp).
+	// lock-free copy's translation under the locks and exits on a difference. Read once, at the
+	// first copy. With 1 or 2, a copy that misses the cache takes one address-space lock, not two.
 	static int SparseCopyCacheMode() {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_sparse_copy_cache_mode >= 0) {
+			return g_test_sparse_copy_cache_mode;
+		}
+#endif
 		static const int mode = [] {
 			const char* value = std::getenv("KYTY_SPARSE_COPY_CACHE");
 			const int   m     = value == nullptr ? 0 : static_cast<int>(std::strtol(value, nullptr, 10));
@@ -789,14 +794,26 @@ public:
 	}
 
 	[[nodiscard]] bool Owns(uint64_t vaddr, uint64_t size) {
+		std::shared_lock lock(m_mutex);
+		return OwnsUnlocked(vaddr, size);
+	}
+
+	// m_owned is only written by ReserveGuestRegions, from the constructor: it needs no lock.
+	[[nodiscard]] bool OwnsUnlocked(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return vaddr >= range.first && vaddr + size <= range.first + range.second;
 		});
 	}
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	void SparseCopyCounts(uint64_t* checked, uint64_t* locked) const {
+		*checked = m_sparse_checked.load(std::memory_order_relaxed);
+		*locked  = m_sparse_locked.load(std::memory_order_relaxed);
+	}
+#endif
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	[[nodiscard]] bool OverlapsOwned(uint64_t vaddr, uint64_t size) {
@@ -871,6 +888,19 @@ public:
 		// - the order against tracker protections (protect, then copy) is program order on this
 		//   thread, as before; guest mprotect never applied to alias reads.
 		// Each thread (CP thread, #69 back thread) has its own entries; only the generation is shared.
+		// What can unmap or remap a range during a lock-free copy, and why it stays correct:
+		// - UnmapBacking/MapBacking (guest munmap, mmap, MAP_FIXED over a view): the store's Unmap,
+		//   UnmapOne and MapFixed bump the generation under the store's exclusive lock before
+		//   m_maps changes, so a cached entry never matches again (64-bit counter, no wrap) and a
+		//   copy that overlapped the change fails its second generation read and runs locked;
+		// - the Windows partial-unmap window (UnmapOne remaps the survivors): bumps on extract and
+		//   on each MapFixed; the locked path then waits on the address-space lock UnmapBacking
+		//   holds exclusively throughout, as without the cache;
+		// - private Commit/ReleaseCommitted and Protect only touch m_mapped, never a range inside
+		//   a backing view;
+		// - the alias itself is unmapped only by ~GuestBackingStore, after all guest threads.
+		// The copied bytes are those the locked path would have read at the copy's linearization
+		// point (both read the alias); a racing guest store is unordered in both cases.
 		if (data != nullptr && size != 0 && UINT64_MAX - vaddr >= size &&
 		    GuestBackingStore::SparseCopyCacheMode() != 0) {
 			uint64_t generation     = 0;
@@ -897,7 +927,10 @@ public:
 				m_sparse_locked.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
-		if (data == nullptr || !Owns(vaddr, size)) {
+		// With the cache on, a miss also skips the lock Owns takes (m_owned is constant).
+		if (data == nullptr || !(GuestBackingStore::SparseCopyCacheMode() != 0
+		                             ? OwnsUnlocked(vaddr, size)
+		                             : Owns(vaddr, size))) {
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
