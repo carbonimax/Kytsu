@@ -952,10 +952,10 @@ static void RefreshShaders(CommandBuffer& buffer, DrawRenderState& state, bool s
 		}
 	}
 	AliasedColorTargets aliased;
-	const auto          reason = PlanAliasedColorTargets(ctx, active, aliased);
+	const auto          reason = PlanAliasedColorTargets(buffer.GetGraphics(), ctx, active, aliased);
 	if (!reason.empty()) {
 		// No exact shared attachment: each target keeps its own output and blend in its own pass.
-		const auto passes = PlanAliasedColorPasses(ctx, active, state.aliased_passes);
+		const auto passes = PlanAliasedColorPasses(buffer.GetGraphics(), ctx, active, state.aliased_passes);
 		if (!passes.empty()) {
 			EXIT("aliased color targets: %s\nper-target passes: %s\n", reason.c_str(),
 			     passes.c_str());

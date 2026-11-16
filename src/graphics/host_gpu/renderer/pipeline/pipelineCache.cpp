@@ -2000,7 +2000,7 @@ bool PipelineCache::MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig
 	if (aliased_targets != 0) {
 		// A prediction skips aliased targets (merged when the pixel shader was selected).
 		if (predict) return false;
-		const auto reason = PlanAliasedColorTargets(ctx, aliased_targets, aliased);
+		const auto reason = PlanAliasedColorTargets(m_graphics, ctx, aliased_targets, aliased);
 		if (!reason.empty() ||
 		    !std::equal(std::begin(aliased.component_mask), std::end(aliased.component_mask),
 		                component_mask.begin()) ||

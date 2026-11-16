@@ -14927,7 +14927,7 @@ public:
       const auto layout = fill_case.layout;
       const auto type = fill_case.type;
       const auto bytes_per_pixel = TextureGetRenderTargetFormat(
-          layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
+          m_runtime_context, layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
       const uint32_t probe_width = bytes_per_pixel == 2 ? 2 : 1;
       const uint32_t selected_layer =
           fill_case.cmask || fill_case.eliminate_fast_clear || fill_case.dcc_mips ? 1 : 0;
@@ -16791,14 +16791,14 @@ public:
                 vk::ComponentSwizzle::eZero},
             "cyclic host mapping reordered output slots or descriptor constants");
     const auto target = TextureGetRenderTargetFormat(
-        Prospero::ChannelLayout::k1_5_5_5, Prospero::ChannelType::kUNorm,
+        m_runtime_context, Prospero::ChannelLayout::k1_5_5_5, Prospero::ChannelType::kUNorm,
         Prospero::ChannelOrder::kStandard);
     Require(name, "1555 render target",
             target.format == vk::Format::eR5G5B5A1UnormPack16 &&
                 target.export_mapping == Prospero::ColorMappingAbgr,
             "shared format resolution changed the existing 1555 render target");
     for (const auto native : {target, TextureGetRenderTargetFormat(
-                                          Prospero::ChannelLayout::k8,
+                                          m_runtime_context, Prospero::ChannelLayout::k8,
                                           Prospero::ChannelType::kSNorm,
                                           Prospero::ChannelOrder::kStandard)}) {
       const auto upload =
@@ -16933,7 +16933,7 @@ public:
     for (const auto &format : transfers) {
       for (const auto tile : {Prospero::TileMode::kLinear, Prospero::TileMode::kRenderTarget}) {
         const auto target = TextureGetRenderTargetFormat(
-            format.layout, format.type, Prospero::ChannelOrder::kReversed);
+            m_runtime_context, format.layout, format.type, Prospero::ChannelOrder::kReversed);
         Require(name, "reversed packed render target",
                 target.format == format.native_format && target.guest_format == format.format &&
                     target.export_mapping == Prospero::ColorMappingRgba,
@@ -54612,7 +54612,7 @@ void CheckEmbeddedFetchVertexOffset() {
 }
 
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
-  (void)TextureGetRenderTargetFormat(Prospero::ChannelLayout::k16_16_16_16,
+  (void)TextureGetRenderTargetFormat(GraphicContext{}, Prospero::ChannelLayout::k16_16_16_16,
                                      Prospero::ChannelType::kSrgb,
                                      Prospero::ChannelOrder::kStandard);
   std::_Exit(0x7f);
@@ -54621,7 +54621,7 @@ void CheckEmbeddedFetchVertexOffset() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckRenderTargetFormatContract() {
   const auto r8_uint = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k8, Prospero::ChannelType::kUInt,
+      GraphicContext{}, Prospero::ChannelLayout::k8, Prospero::ChannelType::kUInt,
       Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "R8 uint",
           r8_uint.format == vk::Format::eR8Uint &&
@@ -54630,7 +54630,7 @@ void CheckRenderTargetFormatContract() {
           "R8 uint render-target tuple was rejected");
 
   const auto rgb565 = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k5_6_5, Prospero::ChannelType::kUNorm,
+      GraphicContext{}, Prospero::ChannelLayout::k5_6_5, Prospero::ChannelType::kUNorm,
       Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "RGB565 UNorm",
           rgb565.format == vk::Format::eB5G6R5UnormPack16 &&
@@ -54639,7 +54639,7 @@ void CheckRenderTargetFormatContract() {
           "RGB565 UNorm render-target tuple was rejected");
 
   const auto uint_format = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUInt,
+      GraphicContext{}, Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUInt,
       Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "RGBA16 uint",
           uint_format.format == vk::Format::eR16G16B16A16Uint &&
@@ -54648,7 +54648,7 @@ void CheckRenderTargetFormatContract() {
           "RGBA16 uint render-target tuple was rejected");
 
   const auto format = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+      GraphicContext{}, Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kReversed);
   Require("ReverseRenderTarget", "exact format",
           format.format == vk::Format::eR16G16B16A16Sfloat &&
@@ -54664,7 +54664,7 @@ void CheckRenderTargetFormatContract() {
           "reverse RGBA16F component mask was not mapped exactly once");
 
   const auto rg32 = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
+      GraphicContext{}, Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kReversed);
   Require(
       "ReverseRenderTarget", "GR32 float",
@@ -54678,7 +54678,7 @@ void CheckRenderTargetFormatContract() {
       "reverse GR32F render-target export or write-mask mapping is incorrect");
 
   const auto argb = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+      GraphicContext{}, Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kAltReversed);
   Require(
       "ReverseRenderTarget", "ARGB float",
