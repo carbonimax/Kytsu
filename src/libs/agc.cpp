@@ -1862,8 +1862,17 @@ static uint32_t* set_registers_direct(CommandBuffer* buf, const volatile ShaderR
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
 
-	auto* values = static_cast<uint32_t*>(__builtin_alloca(num_regs * sizeof(uint32_t)));
-	values[0]    = regs[0].value;
+	// num_regs comes from the guest: an unbounded alloca could overflow a guest thread's stack
+	// (and num_regs * 4 wraps past 2^30), so stage up to 256 values on the stack, more on the heap.
+	constexpr uint32_t    StackValues = 256;
+	uint32_t              stack_values[StackValues];
+	std::vector<uint32_t> heap_values;
+	auto*                 values = stack_values;
+	if (num_regs > StackValues) {
+		heap_values.resize(num_regs);
+		values = heap_values.data();
+	}
+	values[0] = regs[0].value;
 
 	uint32_t* first_cmd        = nullptr;
 	uint32_t  run_start_index  = 0;
