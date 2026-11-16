@@ -1539,6 +1539,8 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  // An OpAtomicLoad through a PhysicalStorageBuffer pointer, Device scope, relaxed.
+  bool requires_device_bda_atomic_load = false;
   const ShaderProfile *profile = &Maintenance8Profile;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
@@ -2189,18 +2191,36 @@ size_t SpirvCodeWords(const std::vector<u32> &spirv) {
 
 void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   std::vector<u32> result_types(spirv[3]);
+  std::unordered_map<u32, u32> constants, pointer_classes;
+  const auto constant_is = [&](u32 id, u32 value) {
+    const auto found = constants.find(id);
+    return found != constants.end() && found->second == value;
+  };
+  bool device_bda_atomic_load = false;
   for (size_t offset = 5; offset < spirv.size();) {
     const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
     const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
     bool has_result = false, has_type = false;
     spv::HasResultAndType(opcode, &has_result, &has_type);
     if (has_result && has_type) result_types[words[2]] = words[1];
+    if (opcode == spv::OpConstant && words.size() == 4) constants[words[2]] = words[3];
+    if (opcode == spv::OpTypePointer) pointer_classes[words[1]] = words[2];
+    if (opcode == spv::OpAtomicLoad &&
+        pointer_classes[result_types[words[3]]] == spv::StorageClassPhysicalStorageBuffer &&
+        constant_is(words[4], spv::ScopeDevice) &&
+        constant_is(words[5], spv::MemorySemanticsMaskNone)) {
+      device_bda_atomic_load = true;
+    }
     if (opcode == spv::OpBitcast) {
       Require(test.name, "bitcast changes representation",
               words[1] != result_types[words[3]],
               "emitted a redundant bitcast between identical SPIR-V types");
     }
     offset += words.size();
+  }
+  if (test.requires_device_bda_atomic_load && !device_bda_atomic_load) {
+    Fail(test.name, "SPIR-V emission",
+         "no Device-scope relaxed OpAtomicLoad through a PhysicalStorageBuffer pointer");
   }
   if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
     return;
@@ -44974,11 +44994,13 @@ TestCase Wave64AppendIndexFromExecRank() {
 }
 
 TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
-                                  bool store_completion = false) {
+                                  bool store_completion = false, bool flat = false) {
   using O = ShaderOpcode;
   constexpr u32 groups = 31;
   TestCase test;
-  test.name = store_completion ? (wave_size == 64 ? "Wave64StoreCompletionPublication"
+  test.name = flat ? (wave_size == 64 ? "FlatWorkgroupPublicationWave64"
+                                      : "FlatWorkgroupPublicationWave32")
+             : store_completion ? (wave_size == 64 ? "Wave64StoreCompletionPublication"
                                                  : "Wave32StoreCompletionPublication")
              : dlc_only ? "BufferWorkgroupPublicationDlc"
              : wave_size == 64 ? "BufferWorkgroupPublicationWave64"
@@ -44993,6 +45015,7 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
   code.push_back(EncodeVop1(0x02, 20, Vgpr(1)));
   code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 1));
   AppendVMovU32(&code, 2, 0);
+  if (flat) AppendVMovU32(&code, 21, 31); // v[20:21] = 0x1f00000000 + ticket * 4.
   code.push_back(EncodeSMovB32(21, InlineU32(0)));
   AppendSMovLiteral(&code, 22, 1000000);
   if (store_completion) AppendSMovLiteral(&code, 26, groups * 4);
@@ -45006,9 +45029,18 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
     AppendVMovU32(&code, 3, 0);
     AppendBufferStoreOpcode(&code, 0x32, 3, 4, true);
   }
-  code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
-  code.push_back(EncodeMubuf1(2, 12, 20));
-  code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
+  const auto append_poll_load = [&] {
+    if (flat) {
+      // FLAT_LOAD_DWORD v2, v[20:21] DLC, the loop form of FlatLoadDlcCaptured. DLC is the
+      // only coherent FLAT modifier the decoder takes (FLAT GLC is unsupported).
+      code.insert(code.end(), {EncodeFlat0(0x0c, 0) | (1u << 12u), EncodeFlat1(2, 0x7d, 0, 20)});
+    } else {
+      code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
+      code.push_back(EncodeMubuf1(2, 12, 20));
+    }
+    code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
+  };
+  append_poll_load();
   code.push_back(EncodeVop1(0x02, 23, Vgpr(store_completion ? 3 : 2)));
   code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
   const auto ready = code.size();
@@ -45018,9 +45050,18 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
   code.push_back(EncodeSopp(0x05, static_cast<u32>(poll - code.size() - 1)));
   // A broken poll reports an incorrect result instead of hanging the test GPU.
   AppendVMovLiteral(&code, 2, 0x80000000u);
+  auto reload = code.size();
+  if (!store_completion) {
+    // The same coherent load once more after the loop: off any guest cycle, it stays Volatile.
+    const auto skip = code.size();
+    code.push_back(0);
+    reload = code.size();
+    append_poll_load();
+    code[skip] = EncodeSopp(0x02, code.size() - skip - 1);
+  }
   const auto publish = code.size();
   code[first_ticket] = EncodeSopp(0x05, publish - first_ticket - 1);
-  code[ready] = EncodeSopp(0x05, publish - ready - 1);
+  code[ready] = EncodeSopp(0x05, reload - ready - 1);
   code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));
   code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));
   code.push_back(EncodeVop2(0x25, 20, InlineU32(4), 20));
@@ -45063,6 +45104,16 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
     test.opcodes.push_back(O::S_WAITCNT_VSCNT);
     test.opcodes.push_back(O::S_LSHL_B64);
     test.required_spirv.push_back("OpControlBarrier %uint_3 %uint_1 %uint_2116");
+  }
+  if (!store_completion) {
+    test.opcodes.push_back(O::S_BRANCH);
+    test.required_spirv.push_back(flat ? "Volatile|Aligned 4" : "Volatile");
+  }
+  if (flat) {
+    test.opcodes.push_back(O::FLAT_LOAD_DWORD);
+    test.decoded_counts = {{"dlc=1", 2}};
+    test.requires_device_bda_atomic_load = true;
+    test.bda_mappings = {{0x1f00000000ull, 0}};
   }
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
@@ -53460,6 +53511,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferWorkgroupPublication(32, true));
   cases.push_back(BufferWorkgroupPublication(32, false, true));
   cases.push_back(BufferWorkgroupPublication(64, false, true));
+  cases.push_back(BufferWorkgroupPublication(32, false, false, true));
+  cases.push_back(BufferWorkgroupPublication(64, false, false, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
@@ -62123,6 +62176,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferWorkgroupPublication(32, true));
     RunCase(&vulkan, BufferWorkgroupPublication(32, false, true));
     RunCase(&vulkan, BufferWorkgroupPublication(64, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, false, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(64, false, false, true));
     RunCase(&vulkan, BufferAtomicVariants());
     return 0;
   }
