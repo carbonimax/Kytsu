@@ -1641,8 +1641,14 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (end == nullptr) return false;
 	const auto* captures = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
-		for (const auto* read = captures; read != end; read += stride)
-			reads->emplace_back(*read, sizeof(uint32_t));
+		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
+		// Reuse modes record (address, value) pairs, so captures advance by `stride`.
+		const auto count = static_cast<size_t>(end - captures) / stride;
+		const auto first = reads->size();
+		reads->resize(first + count);
+		auto* out = reads->data() + first;
+		for (size_t i = 0; i < count; ++i)
+			out[i] = {captures[i * stride], uint64_t {sizeof(uint32_t)}};
 	}
 	if (reuse != 0) {
 		const auto loads = static_cast<uint32_t>((end - captures) / 2);
