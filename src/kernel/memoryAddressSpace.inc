@@ -877,30 +877,34 @@ public:
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
-		// Lock-free path (KYTY_SPARSE_COPY_CACHE). The locks only guard the translation, never the
-		// bytes: guest CPU stores and tracker protections take no lock, and the copy reads the
-		// backing alias, which stays mapped and unprotected for the store's lifetime. So:
-		// - a range inside one backing mapping is owned (MapBacking consumes owned free ranges
-		//   only) and holds no private mapping (Backing and Private regions are disjoint);
-		// - every change of a backing mapping, and every ZeroRange/WriteBacking, bumps the
-		//   store generation under its exclusive lock before acting; the copy is validated by the
-		//   generation read before and after it, and redone under the locks otherwise;
-		// - the order against tracker protections (protect, then copy) is program order on this
-		//   thread, as before; guest mprotect never applied to alias reads.
-		// Each thread (CP thread, #69 back thread) has its own entries; only the generation is shared.
-		// What can unmap or remap a range during a lock-free copy, and why it stays correct:
-		// - UnmapBacking/MapBacking (guest munmap, mmap, MAP_FIXED over a view): the store's Unmap,
-		//   UnmapOne and MapFixed bump the generation under the store's exclusive lock before
-		//   m_maps changes, so a cached entry never matches again (64-bit counter, no wrap) and a
-		//   copy that overlapped the change fails its second generation read and runs locked;
-		// - the Windows partial-unmap window (UnmapOne remaps the survivors): bumps on extract and
-		//   on each MapFixed; the locked path then waits on the address-space lock UnmapBacking
-		//   holds exclusively throughout, as without the cache;
-		// - private Commit/ReleaseCommitted and Protect only touch m_mapped, never a range inside
-		//   a backing view;
-		// - the alias itself is unmapped only by ~GuestBackingStore, after all guest threads.
-		// The copied bytes are those the locked path would have read at the copy's linearization
-		// point (both read the alias); a racing guest store is unordered in both cases.
+		// Lock-free path (KYTY_SPARSE_COPY_CACHE, off by default). Invariants it relies on:
+		// - Memory safety: the copy only dereferences the store's writable alias
+		//   [m_backing_base, +m_size), never a guest view. The alias is mapped once by the store's
+		//   constructor, never protected, resized or unmapped before ~GuestBackingStore, and the
+		//   locked path reads the same bytes. A cached offset was a live mapping's offset, so
+		//   offset + size <= m_size; a stale entry can only read other alias bytes, never freed or
+		//   unmapped memory, whatever guest munmap or mmap does to the views meanwhile.
+		// - Slots are keyed by `this`: one store per process (Memory::Initialize), destroyed by
+		//   Memory::Shutdown after the guest threads, so no slot outlives its store.
+		// - Translation: every m_maps change and every locked byte write (store MapFixed, Unmap,
+		//   UnmapOne, ZeroRange, WriteBacking) bumps the 64-bit generation first, inside the same
+		//   exclusive section of the store lock. Slot generations are only captured under the shared
+		//   lock, when no writer is inside, so one bump per writer is enough (no odd/even): a copy
+		//   that read the slot's generation before and after it ran entirely before the next writer
+		//   acted, at a valid translation. Otherwise it is discarded and redone under the locks.
+		// - What can unmap or remap a range meanwhile: UnmapBacking and MapBacking (guest munmap,
+		//   mmap, MAP_FIXED over a view) go through those store calls. The Windows partial unmap
+		//   bumps at extract and at each survivor's MapFixed; the survivors' new entries refill the
+		//   cache on their next locked copy. Commit, ReleaseCommitted and Protect touch only
+		//   m_mapped (free or Private ranges), never a range inside a backing view.
+		// - A range inside one backing view is owned (MapBacking consumes owned free ranges only)
+		//   and holds no Private mapping (the two types are disjoint), so skipping Owns and
+		//   OverlapsPrivateUnlocked returns what the locked path returns. Mode 2 checks this.
+		// - Bytes: the locks never guarded them. Guest CPU stores and tracker protections take no
+		//   lock, and the alias ignores view protections, so a racing guest store is unordered with
+		//   the copy in both paths. Tracker protect-then-copy stays program order on this thread.
+		// Each thread (CP thread, #69 back thread) has its own slots; only the generation is shared,
+		// so any map change or WriteBacking anywhere invalidates every thread's slots.
 		if (data != nullptr && size != 0 && UINT64_MAX - vaddr >= size &&
 		    GuestBackingStore::SparseCopyCacheMode() != 0) {
 			uint64_t generation     = 0;

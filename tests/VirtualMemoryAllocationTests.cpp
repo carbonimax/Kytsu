@@ -1759,13 +1759,17 @@ void TestSparseCopyCacheMatchesLockedCopy() {
 			std::memset(reinterpret_cast<void*>(base + i * page), first + i, page);
 		}
 	};
-	const std::array<std::pair<uint64_t, uint64_t>, 6> ranges {{
+	// The last two lie inside the survivors of the partial unmap below: only they can hit the
+	// cache there, which shows the cache refills from the remapped survivors.
+	const std::array<std::pair<uint64_t, uint64_t>, 8> ranges {{
 	    {base + page + 7, 100},         // inside one page of the view
 	    {base + page * 2 - 9, page},    // across two pages of the view
 	    {base, page * 4},               // the whole view
 	    {base + page * 3 + 50, page},   // view end, then the reservation
 	    {base + page * 5, 64},          // reserved, never backed
 	    {0x10000, 64},                  // not owned
+	    {base + 9, 100},                // first page (left survivor)
+	    {base + page * 2 + 5, page},    // pages 2 and 3 (right survivor)
 	}};
 	const auto copy_all = [&](int mode) {
 		TestSetSparseCopyCacheMode(mode);
