@@ -2467,6 +2467,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_system_input_base = 2;
   pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
+  // As the renderer sets it from the AA config: single-sample centroid reuses center barycentrics.
+  pixel_info.ps_single_sample = test.samples == vk::SampleCountFlagBits::e1;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   pixel_info.object_primitive_id = !test.object_ids.empty();
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
