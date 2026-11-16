@@ -881,11 +881,11 @@ public:
 		// - Memory safety: the copy only dereferences the store's writable alias
 		//   [m_backing_base, +m_size), never a guest view. The alias is mapped once by the store's
 		//   constructor, never protected, resized or unmapped before ~GuestBackingStore, and the
-		//   locked path reads the same bytes. A cached offset was a live mapping's offset, so
-		//   offset + size <= m_size; a stale entry can only read other alias bytes, never freed or
-		//   unmapped memory, whatever guest munmap or mmap does to the views meanwhile.
-		// - Slots are keyed by `this`: one store per process (Memory::Initialize), destroyed by
-		//   Memory::Shutdown after the guest threads, so no slot outlives its store.
+		//   locked path reads the same bytes. A slot only covers alias bytes the locked path
+		//   dereferenced for that same entry, so a stale slot can only read other alias bytes,
+		//   never freed or unmapped memory, whatever guest munmap or mmap does to the views.
+		// - Slots are keyed by `this`. Requirement: one store per process (Memory::Initialize),
+		//   and Memory::Shutdown destroys it only after every thread that copies has stopped.
 		// - Translation: every m_maps change and every locked byte write (store MapFixed, Unmap,
 		//   UnmapOne, ZeroRange, WriteBacking) bumps the 64-bit generation first, inside the same
 		//   exclusive section of the store lock. Slot generations are only captured under the shared
@@ -895,8 +895,10 @@ public:
 		// - What can unmap or remap a range meanwhile: UnmapBacking and MapBacking (guest munmap,
 		//   mmap, MAP_FIXED over a view) go through those store calls. The Windows partial unmap
 		//   bumps at extract and at each survivor's MapFixed; the survivors' new entries refill the
-		//   cache on their next locked copy. Commit, ReleaseCommitted and Protect touch only
-		//   m_mapped (free or Private ranges), never a range inside a backing view.
+		//   cache on their next locked copy. Commit and ReleaseCommitted touch only free or
+		//   Private ranges. Protect and ProtectTransient may change a backing view's host
+		//   protection, but never m_maps or the alias, so they need no bump: the copy does not
+		//   go through the view.
 		// - A range inside one backing view is owned (MapBacking consumes owned free ranges only)
 		//   and holds no Private mapping (the two types are disjoint), so skipping Owns and
 		//   OverlapsPrivateUnlocked returns what the locked path returns. Mode 2 checks this.
