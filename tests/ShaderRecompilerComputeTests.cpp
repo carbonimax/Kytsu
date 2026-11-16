@@ -47470,6 +47470,9 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto materialize = [&] {
+    // Count one walk: KYTY_SRT_WALK_REUSE would first re-read the count to validate the last walk
+    // (srt_walk_reuse covers that path).
+    plan.srt_memo_loads = UINT32_MAX;
     FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<u32> words) {
       auto &memory = *static_cast<CountMemory *>(data);
       ++memory.reads;
