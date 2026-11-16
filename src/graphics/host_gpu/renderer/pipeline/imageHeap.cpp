@@ -440,15 +440,11 @@ void ImageHeap::TakeChanges() {
 ImageId ImageHeap::CurrentImage(const Image::HeapChange& change) {
 	auto&            textures = m_context.GetTextureCache();
 	std::scoped_lock lock {textures.m_lock};
-	// The fork's page table lists image ids, without upstream's address-tagged buckets.
-	for (const auto id: textures.FindImagesInRegion(change.data.address, 1u)) {
-		const auto& image = textures.m_slot_images[id];
-		if (image.info.data.address == change.data.address && image.serial == change.serial &&
-		    !image.depth_id) {
-			return id;
-		}
-	}
-	return {};
+	ImageId          current;
+	textures.ForEachImageWithAddress(change.data.address, [&](ImageId id, const Image& image) {
+		if (image.serial == change.serial && !image.depth_id) current = id;
+	});
+	return current;
 }
 
 uint32_t ImageHeap::Allocate() {
@@ -517,13 +513,10 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		const auto id = CurrentImage(change);
 		if (id) {
 			textures.UpdateImage(id);
-			// The depth image's own stencil plane record, as FindTexture refreshes it.
 			const auto& image = textures.m_slot_images[id];
-			ImageId     stencil;
-			for (const auto plane: image.stencil_ids) {
-				if (textures.m_slot_images[plane].info.data == image.info.stencil) stencil = plane;
+			if (const auto stencil = textures.FindStencilPlane(image, image.info.stencil)) {
+				textures.UpdateImage(stencil);
 			}
-			if (stencil) textures.UpdateImage(stencil);
 			m_away.emplace_back(change.serial, id);
 		}
 		return static_cast<bool>(id);
