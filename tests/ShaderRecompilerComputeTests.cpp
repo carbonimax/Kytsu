@@ -40741,8 +40741,9 @@ bool F16StoreRoundTowardZero() {
   return value != nullptr && value[0] == '1';
 }
 
-// 0x3f807e63 is 3.95 f16 ulps above 1.0: 0x3c03 toward zero, 0x3c04 to nearest.
-u32 Float16StoreOneWord() { return F16StoreRoundTowardZero() ? 0xc0003c03u : 0xc0003c04u; }
+// 0x3f807e63 is 3.95 f16 ulps above 1.0. The hardware stores it toward zero as 0x3c03 (#1588); a host
+// pack that rounds to nearest (0x3c04) fails here unless KYTY_F16_STORE_RTZ=1.
+u32 Float16StoreOneWord() { return 0xc0003c03u; }
 
 TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   using O = ShaderOpcode;
