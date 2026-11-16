@@ -81,6 +81,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
                bool prefer_device)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
+	AllocateDevice(graphics, usage, cpu_address, flags, size, prefer_device);
+}
+
+void Buffer::AllocateDevice(GraphicContext& graphics, MemoryUsage usage, uint64_t cpu_address,
+                            vk::BufferUsageFlags flags, uint64_t size, bool prefer_device) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -179,11 +184,24 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
       m_cpu_address(cpu_address), m_size(size) {
 	EXIT_IF(size == 0 || imported.memory == nullptr);
 	const ImportedBufferInfo create(graphics, flags, size);
-	EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&create.info, nullptr, &m_buffer) !=
-	                     vk::Result::eSuccess);
-	const auto bound = graphics.device.bindBufferMemory(m_buffer, imported.memory, imported.offset);
+	const auto created = graphics.device.createBuffer(&create.info, nullptr, &m_buffer);
+	vk::BindBufferMemoryInfo bind {};
+	bind.buffer       = m_buffer;
+	bind.memory       = imported.memory;
+	bind.memoryOffset = imported.offset;
+	// The pointer form returns the result unchecked; the enhanced bindBufferMemory asserts on failure.
+	const auto bound = created == vk::Result::eSuccess ? graphics.device.bindBufferMemory2(1, &bind) : created;
 	if (bound != vk::Result::eSuccess) {
-		EXIT("Buffer: binding imported host memory failed (%d)\n", static_cast<int>(bound));
+		// Refused by the driver: device memory, as for a refused import (IsImported() stays false).
+		if (created == vk::Result::eSuccess) {
+			graphics.device.destroyBuffer(m_buffer);
+		}
+		m_buffer = nullptr;
+		if (imported.owned) {
+			graphics.device.freeMemory(imported.memory);
+		}
+		AllocateDevice(graphics, MemoryUsage::DeviceLocal, cpu_address, flags, size, false);
+		return;
 	}
 	m_import_memory = imported.memory;
 	m_owns_import   = imported.owned;

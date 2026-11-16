@@ -122,6 +122,13 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+void MemoryTracker::MarkRegionAsCpuModifiedExceptGpu(uint64_t vaddr, uint64_t size) {
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->MarkCpuModifiedExceptGpu(offset, bytes);
+	});
+}
+
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);

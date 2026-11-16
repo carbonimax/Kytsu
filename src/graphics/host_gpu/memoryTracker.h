@@ -33,6 +33,8 @@ public:
 	// without the region lock. False means no byte of the range can be GPU-dirty.
 	[[nodiscard]] bool MaybeGpuModifiedOnGpuThread(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
+	// The same for the pages of the range that are not GPU-modified (their newer bytes stay on the GPU).
+	void               MarkRegionAsCpuModifiedExceptGpu(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	// Only for ranges whose complete tracker pages have no cache-buffer owner.
 	void               ReleaseUnownedRegion(uint64_t vaddr, uint64_t size);

@@ -79,21 +79,25 @@ static const char* MemImportModeForTitle(const char* list, const std::string& ti
 	return nullptr;
 }
 
-static void SetEnvIfUnset(const char* name, const char* value) {
+// True when it set the variable.
+static bool SetEnvIfUnset(const char* name, const char* value) {
 	if (std::getenv(name) != nullptr) {
-		return;
+		return false;
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	_putenv_s(name, value);
 #else
 	setenv(name, value, 0);
 #endif
+	return true;
 }
 
-// Per-title guest memory import: an explicit KYTY_MEM_IMPORT wins; a listed title gets its mode, the
-// labels/EOP mode it needs (KYTY_EOP_AT_GPU=1), GPU-written buffers kept imported
-// (KYTY_MEM_IMPORT_GPU_WRITES=1) and the write-watch safety net (KYTY_MEM_IMPORT_WATCH=1),
-// before the GPU device is created. Each stays overridable by its own variable.
+// Per-title guest memory import: an explicit KYTY_MEM_IMPORT wins; a listed title gets its mode and,
+// for a nonzero mode, the labels/EOP mode it needs (KYTY_EOP_AT_GPU=1), GPU-written buffers kept
+// imported (KYTY_MEM_IMPORT_GPU_WRITES=1), the write-watch safety net (KYTY_MEM_IMPORT_WATCH=1) and the
+// texture-cache lock order EOP at GPU needs (KYTY_TC_LOCK_ORDER=1),
+// before the GPU device is created. Each stays overridable by its own variable. The EOP mode set here
+// is withdrawn if the import turns out unavailable (EopAtGpu::WithdrawTitleDefault).
 static void ApplyPerTitleMemImport(const std::string& title_id) {
 	EXIT_IF(MemImportModeForTitle("A1,B2=2", "B2") == nullptr || std::string(MemImportModeForTitle("A1,B2=2", "B2")) != "2" ||
 	        std::string(MemImportModeForTitle("A1,B2=2", "A1")) != "1" || MemImportModeForTitle("A1", "A") != nullptr ||
@@ -103,7 +107,16 @@ static void ApplyPerTitleMemImport(const std::string& title_id) {
 		return;
 	}
 	SetEnvIfUnset("KYTY_MEM_IMPORT", mode);
-	SetEnvIfUnset("KYTY_EOP_AT_GPU", "1");
+	if (std::strtol(mode, nullptr, 10) == 0) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Title {}: KYTY_MEM_IMPORT={} from KYTY_MEM_IMPORT_TITLES: import off\n", title_id, mode));
+		return;
+	}
+	if (SetEnvIfUnset("KYTY_EOP_AT_GPU", "1")) {
+		SetEnvIfUnset("KYTY_EOP_AT_GPU_FROM_TITLE", "1");
+	}
+	// EOP at GPU deadlocks the texture GC against label delivery without this lock order.
+	SetEnvIfUnset("KYTY_TC_LOCK_ORDER", "1");
 	SetEnvIfUnset("KYTY_MEM_IMPORT_GPU_WRITES", "1");
 	SetEnvIfUnset("KYTY_MEM_IMPORT_WATCH", "1");
 	Log::WriteToConsoleAndLog(fmt::format("Title {}: KYTY_MEM_IMPORT={} from KYTY_MEM_IMPORT_TITLES\n", title_id, mode));

@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -128,6 +129,19 @@ public:
 			UpdateProtection<!enable, false>(changed);
 		} else {
 			UpdateProtection<enable, true>(changed);
+		}
+	}
+
+	// ChangeState<Cpu, true> on the pages of [offset, offset + size) that are not GPU-modified.
+	void MarkCpuModifiedExceptGpu(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
+		for (size_t page = start; page < end;) {
+			const auto [gpu_first, gpu_last] = m_gpu_dirty.FirstRangeFrom(page);
+			const auto stop                  = std::min(gpu_first, end);
+			if (stop > page) {
+				ChangeState<DirtySource::Cpu, true>(page * TRACKER_PAGE_SIZE, (stop - page) * TRACKER_PAGE_SIZE);
+			}
+			page = std::max(stop, gpu_last);
 		}
 	}
 

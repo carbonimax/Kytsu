@@ -573,6 +573,8 @@ void BufferCache::DropImported(uint64_t vaddr, uint64_t size) {
 		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
 			(void)PublishImported(buffer.CpuAddress(), buffer.Size(), true, nullptr);
 		}
+		// As the garbage collector: no buffer holds these bytes any more, the next one uploads them.
+		m_memory_tracker.MarkRegionAsCpuModifiedExceptGpu(buffer.CpuAddress(), buffer.Size());
 		DeleteBuffer(id);
 		g_import_stats.dropped.fetch_add(1, std::memory_order_relaxed);
 	}
@@ -1135,6 +1137,13 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_import = std::make_unique<HostImport>(graphics);
 		if (!m_import->Valid()) {
 			m_import.reset();
+			graphics.host_memory_import_enabled = false; // no host barrier at each submission
+			Log::WriteToConsoleAndLog(
+			    EopAtGpu::WithdrawTitleDefault()
+			        ? "GPU: KYTY_MEM_IMPORT unavailable: no guest memory backing; buffers stay in device memory, "
+			          "KYTY_EOP_AT_GPU of the title list off.\n"
+			        : "GPU: KYTY_MEM_IMPORT unavailable: no guest memory backing; buffers stay in device memory, "
+			          "explicit KYTY_EOP_AT_GPU kept.\n");
 		}
 	}
 	if (m_import && LateRead::WatchMode() != 0) {
@@ -1299,7 +1308,7 @@ uint64_t NowNs() {
 }
 
 // Stream: small CPU-modified read copied into the stream buffer. Ring: cache buffer created or grown
-// by a stream leap (the CPU-written rings of 13.90). Fixed: any other cache buffer.
+// by a stream leap (rings the CPU keeps writing). Fixed: any other cache buffer.
 enum Path : uint8_t { PathStream, PathRing, PathFixed, PathCount };
 constexpr std::array<const char*, PathCount> PathNames {"stream", "ring", "fixed"};
 constexpr std::array<const char*, static_cast<size_t>(Site::Count)> SiteNames {"-", "vtx", "idx", "desc",
@@ -1489,6 +1498,13 @@ bool Track(State& st, uint64_t vaddr, uint64_t size, Make&& make) {
 
 // GPU thread or CP back thread, inside ObtainBuffer of a read. True: a new watched range (protect it).
 bool Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, uint64_t buffer_size = 0) {
+	// shortcut: only the four Scope sites are watched (vertex, index, indirect arguments, storage
+	// descriptors). Imported reads never watched: texture sources (TextureCache upload), color
+	// metadata checks bound for reading, DMA copy sources, ObtainBufferForImage, device-address reads
+	// (SynchronizeBda), and any range with a GPU-modified page (ObtainBuffer). A guest rewrite there
+	// under the GPU is neither seen nor demoted. Upgrade (a default site for reads outside a Scope)
+	// once such a rewrite is measured, or before listing a title that streams textures from imported
+	// memory.
 	if (t_site == Site::None) {
 		return false;
 	}
@@ -1711,8 +1727,9 @@ void DelayWriteFault() {
 
 } // namespace
 
+// As the import safety net only (KYTY_LATE_READ_PROF unset): while the import is really on.
 bool Enabled() noexcept {
-	return SamplePeriod() != 0;
+	return SamplePeriod() != 0 && (!NetOnly() || g_import_cache.load(std::memory_order_relaxed) != nullptr);
 }
 
 int WatchMode() noexcept {
@@ -2157,8 +2174,8 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 
 // KYTY_MEM_IMPORT_OWNED_READS=0|1|2 (default 2): CPU reads of imported bytes that a command-processor
 // WRITE_DATA put in the command stream (WriteGpuOwned) still running on the GPU. 0: read the old bytes
-// (device lost in game A: the walker binds the previous frame's descriptors); 1: the bytes count as
-// GPU-dirty, readers wait for the GPU; 2: readers see the written bytes (OverlayOwnedWrites).
+// (device lost seen on one title: the walker binds the previous frame's descriptors); 1: the bytes
+// count as GPU-dirty, readers wait for the GPU; 2: readers see the written bytes (OverlayOwnedWrites).
 static uint32_t ImportOwnedReads() {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_MEM_IMPORT_OWNED_READS");
@@ -2438,11 +2455,12 @@ static bool ImportExcluded(uint64_t vaddr, uint64_t size) {
 void BufferCache::DemoteImported(uint64_t vaddr, uint64_t size) {
 	m_import_demoted.emplace_back(vaddr, vaddr + size);
 	DropImported(vaddr, size);
-	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	// The key may be stale: a device buffer now holds the range, some pages GPU-written since.
+	m_memory_tracker.MarkRegionAsCpuModifiedExceptGpu(vaddr, size);
 }
 
-// KYTY_MEM_IMPORT_GPU_WRITES=1 keeps GPU-written buffers on imported memory (device lost in game A:
-// a compute shader then never completes); by default they go back to device memory at their first
+// KYTY_MEM_IMPORT_GPU_WRITES=1 keeps GPU-written buffers on imported memory (device lost seen on one
+// title: a compute shader then never completes); by default they go back to device memory at their first
 // write binding, and only buffers the GPU reads use guest memory.
 static bool ImportGpuWrites() {
 	static const bool keep = [] {
@@ -2491,13 +2509,23 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 	// KYTY_MEM_IMPORT: a range mapped from one run of direct memory gets the guest's own bytes.
 	std::optional<ImportedMemory> imported;
+	uint64_t                      host = 0;
 	if (m_import) {
-		const auto host = ImportExcludedRange(overlap.begin, bytes)
-		                      ? 0
-		                      : LibKernel::Memory::BackingHostAddress(overlap.begin, bytes);
+		host = ImportExcludedRange(overlap.begin, bytes) ? 0
+		                                                 : LibKernel::Memory::BackingHostAddress(overlap.begin, bytes);
 		if (host != 0) {
 			imported = m_import->Acquire(host, bytes, flags);
 		}
+	}
+	const auto id =
+	    imported ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags, bytes, *imported)
+	             : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+	                                     overlap.begin, flags, bytes);
+	auto& buffer = m_slot_buffers[id];
+	if (!buffer.IsImported()) {
+		imported.reset(); // the buffer refused the imported memory: device memory (Buffer)
+	}
+	if (m_import) {
 		(imported ? g_import_stats.imported : host != 0 ? g_import_stats.failed : g_import_stats.device)
 		    .fetch_add(1, std::memory_order_relaxed);
 		static std::atomic<uint32_t> logged {0};
@@ -2513,11 +2541,6 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 			     overlap.begin, bytes, static_cast<int>(overlap.has_stream_leap));
 		}
 	}
-	const auto id =
-	    imported ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags, bytes, *imported)
-	             : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
-	                                     overlap.begin, flags, bytes);
-	auto& buffer  = m_slot_buffers[id];
 	buffer.leaped = overlap.has_stream_leap;
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer{}[guest=0x{:016x} size=0x{:x}]",
