@@ -211,6 +211,15 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 		}
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
+		// A coherent poll in a guest loop: atomic, as in LoadWordInBounds. shortcut: the shared
+		// load_indirect_buffer_* functions are emitted outside any block and keep Volatile; key
+		// them on the loop if a guest loop polls through a GPU-selected descriptor.
+		if (coherent && EmittingInGuestLoop(state)) {
+			state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer,
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+			return value;
+		}
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
 		                          spv::MemoryAccessAlignedMask |
 		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
@@ -382,10 +391,12 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
 }
 
-// A GLC 32-bit load in a multi-wave workgroup is an OpAtomicLoad (LoadWordInBounds).
+// A GLC 32-bit load in a multi-wave workgroup or in a guest loop is an OpAtomicLoad
+// (LoadWordInBounds).
 bool IsAtomicWordLoad(const EmitterState& state, const MemoryResourceAccess& resource) {
 	return (resource.memory_access & spv::MemoryAccessVolatileMask) != 0 &&
-	       resource.element_bits == 32u && !WorkgroupIsSingleWave(state);
+	       resource.element_bits == 32u &&
+	       (!WorkgroupIsSingleWave(state) || EmittingInGuestLoop(state));
 }
 
 // min(index, max(length, 1) - 1): an element inside the descriptor range, also of a null binding
@@ -487,10 +498,10 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	if ((resource.memory_access & spv::MemoryAccessVolatileMask) != 0 &&
-	    resource.element_bits == 32u && !WorkgroupIsSingleWave(ctx.state)) {
+	if (IsAtomicWordLoad(ctx.state, resource)) {
 		// A GLC load reads memory each time it runs; a guest spin loop polls with one. Without a
 		// barrier in the loop, amdvlk hoists a Volatile buffer load out of it, so use an atomic.
+		// Single-wave workgroups too: they poll words that other workgroups publish.
 		ctx.state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(ctx.state), value, pointer,
 		                              ConstantU32(ctx.state, spv::ScopeDevice),
 		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone));

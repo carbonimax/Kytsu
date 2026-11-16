@@ -710,6 +710,27 @@ bool WorkgroupIsSingleWave(const EmitterState& state) {
 	return threads <= state.program.wave_size;
 }
 
+bool EmittingInGuestLoop(const EmitterState& state) {
+	const auto* block = state.current_block;
+	if (block == nullptr) {
+		return false;
+	}
+	std::vector<const IR::Block*>        pending(block->ImmSuccessors().begin(),
+	                                             block->ImmSuccessors().end());
+	std::unordered_set<const IR::Block*> seen(pending.begin(), pending.end());
+	for (size_t index = 0; index < pending.size(); index++) {
+		if (pending[index] == block) {
+			return true;
+		}
+		for (const auto* next: pending[index]->ImmSuccessors()) {
+			if (seen.insert(next).second) {
+				pending.push_back(next);
+			}
+		}
+	}
+	return false;
+}
+
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
 	// RDNA atomics carry no fence of their own: a returned value is ordered by its use (S_WAITCNT
 	// VMCNT), and other waves observe memory through GLC accesses.

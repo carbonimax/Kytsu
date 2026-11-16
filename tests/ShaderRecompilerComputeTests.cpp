@@ -45057,7 +45057,8 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                   O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
                   O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  // The poll is in a guest loop, so its GLC load is atomic: AMD hoists a Volatile one.
+  test.required_spirv = {"Coherent", "OpAtomicLoad", "OpAtomicIAdd", "OpLoopMerge"};
   if (store_completion) {
     test.opcodes.push_back(O::S_WAITCNT_VSCNT);
     test.opcodes.push_back(O::S_LSHL_B64);
