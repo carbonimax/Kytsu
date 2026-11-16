@@ -32734,13 +32734,16 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
+  // Runtime inputs: constant ones fold the V_MIN_U32 away before SPIR-V emission.
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 7);
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 12, 30);
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 0);
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 64);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 12, 30);
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 1);
@@ -32749,9 +32752,10 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   TestCase test;
   test.name = "Vop2SdwaMinU32PreservesWordDestination";
   test.code = code;
+  test.initial = {7u, 64u};
   test.expected = {0xa1b20007u, 0xa1b2001fu};
-  test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {" UMin ", "OpSelect"};
   return test;
 }
@@ -33321,7 +33325,8 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
                   O::S_ENDPGM};
   test.decoded_counts = {
       {"V_ADDC_U32 v2, vcc_lo, 0, v26.sdwa(sel=4,sext=1), vcc_lo", 1}};
-  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 3}};
+  // Carry-out of (0 + sext) + carry-in: 0 + x folds to x, leaving two unsigned compares.
+  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 2}};
   test.required_spirv = {"OpBitFieldSExtract"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -39103,7 +39108,9 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
                   upper_nonzero ? O::S_CBRANCH_EXECNZ : O::S_CBRANCH_EXECZ,
                   O::V_READLANE_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpGroupNonUniformAny"};
+  // A whole subgroup votes (OpGroupNonUniformAny %bool) unless wave32 is packed into a 64-lane
+  // host subgroup, where each half votes on its own ballot (OpAny %bool).
+  test.required_spirv = {"Any %bool"};
   test.compute_info.wave_size = wave_size;
   test.compute_info.threads_num[0] = threads;
   test.compute_info.thread_ids_num = 1;
@@ -61128,6 +61135,16 @@ int main(int argc, char **argv) {
 #else
   if (setenv("KYTY_ASYNC_PIPELINE", "0", 1) != 0) return 1;
 #endif
+  // BufferCacheDirtyGarbageCollection checks page-granular fault publication; the default
+  // readback window (read once) publishes whole 256 KiB windows. Same setting as the
+  // buffer_cache_dirty_gc ctest, for the full suite only; an explicit value is kept.
+  if (argc == 1 && std::getenv("KYTY_READBACK_WINDOW_KIB") == nullptr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    if (_putenv_s("KYTY_READBACK_WINDOW_KIB", "0") != 0) return 1;
+#else
+    if (setenv("KYTY_READBACK_WINDOW_KIB", "0", 1) != 0) return 1;
+#endif
+  }
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
