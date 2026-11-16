@@ -67,6 +67,15 @@ int main() {
 	    R"({"version": 1, "global": {"args": ["value-first"]}})",
 	    R"({"version": 1, "titles": []})",
 	    R"({"version": 1, "global": {"env": {"KYTY_A": "1"}}, "titles": {"TITLE_B": {"env": []}}})",
+	    // cmd.exe injection and loader paths (the Windows launcher goes through cmd.exe).
+	    R"({"version": 1, "global": {"env": {"KYTY_A": "\" & calc & \""}}})",
+	    R"({"version": 1, "global": {"env": {"KYTY_A": "%PATH%"}}})",
+	    R"({"version": 1, "global": {"args": ["--x", "%KYTY_A%"]}})",
+	    R"({"version": 1, "global": {"args": ["--x", "a^b"]}})",
+	    R"({"version": 1, "global": {"args": ["--x", "!V!"]}})",
+	    R"({"version": 1, "global": {"args": ["--x", "a\nb"]}})",
+	    R"({"version": 1, "global": {"env": {"VK_LAYER_PATH": "C:/evil"}}})",
+	    R"({"version": 1, "global": {"env": {"PATH": "C:/evil"}}})",
 	};
 	for (const auto* text: bad) {
 		const bool ok = Presets::Parse(text, "TITLE_A", preset, error);

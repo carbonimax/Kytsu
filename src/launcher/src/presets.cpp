@@ -32,6 +32,18 @@ static QStringList AppendMissing(QStringList& dst, const QStringList& src) {
 	return added;
 }
 
+// The Windows launcher runs the emulator through cmd.exe, which expands %VAR% before it reads quotes:
+// a preset value or argument holding these characters could break out of CmdCommand's quoting.
+static bool IsSafeText(const QString& text) {
+	for (const QChar c: text) {
+		const char16_t u = c.unicode();
+		if (u < 0x20 || u == u'%' || u == u'"' || u == u'^' || u == u'!') {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool ReadEntry(const QJsonValue& value, const QString& where, Preset& out, QString& error) {
 	if (value.isUndefined()) {
 		return true;
@@ -46,11 +58,14 @@ static bool ReadEntry(const QJsonValue& value, const QString& where, Preset& out
 		error = where + QStringLiteral(".env must be an object");
 		return false;
 	}
-	static const QRegularExpression key_pattern(QStringLiteral("^[A-Za-z_][A-Za-z0-9_]*$"));
+	// Only emulator and MoltenVK variables: a preset must not reach loader paths such as VK_LAYER_PATH.
+	static const QRegularExpression key_pattern(QStringLiteral("^(KYTY|MVK)_[A-Za-z0-9_]*$"));
 	const auto                      vars = env.toObject();
 	for (auto it = vars.constBegin(); it != vars.constEnd(); ++it) {
-		if (!key_pattern.match(it.key()).hasMatch() || !it.value().isString()) {
-			error = QStringLiteral("%1.env.%2 must be a string with a valid name").arg(where, it.key());
+		if (!key_pattern.match(it.key()).hasMatch() || !it.value().isString() ||
+		    !IsSafeText(it.value().toString())) {
+			error = QStringLiteral("%1.env.%2 must be a KYTY_ or MVK_ variable with a plain string value")
+			            .arg(where, it.key());
 			return false;
 		}
 		out.env.insert(it.key(), it.value().toString());
@@ -61,8 +76,8 @@ static bool ReadEntry(const QJsonValue& value, const QString& where, Preset& out
 		return false;
 	}
 	for (const auto& arg: args.toArray()) {
-		if (!arg.isString() || (out.args.isEmpty() && !IsOption(arg.toString()))) {
-			error = where + QStringLiteral(".args must be strings starting with an --option");
+		if (!arg.isString() || (out.args.isEmpty() && !IsOption(arg.toString())) || !IsSafeText(arg.toString())) {
+			error = where + QStringLiteral(".args must be plain strings starting with an --option");
 			return false;
 		}
 		out.args << arg.toString();
