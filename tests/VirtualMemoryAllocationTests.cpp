@@ -1732,6 +1732,103 @@ void TestCopySparseMemoryMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// KYTY_SPARSE_COPY_CACHE 1 and 2 copy what 0 copies over mapped, unmapped, partly mapped and
+// unowned ranges, also after a remap to another backing offset and a partial unmap.
+void TestSparseCopyCacheMatchesLockedCopy() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "SparseCopyCacheMatchesLockedCopy";
+	constexpr uint64_t page = SceKernelPageSize;
+	int64_t            phys[2] {};
+	for (auto& offset : phys) {
+		CheckOk(test,
+		        KernelAllocateDirectMemory(SceKernelDirectMemoryStart, KernelGetDirectMemorySize(),
+		                                   page * 4, page, SceKernelMtypeC, &offset),
+		        "KernelAllocateDirectMemory");
+	}
+	void* addr = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&addr, page * 8, 0, page), "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	// Views 0 and 1 hold different bytes, so a stale translation reads the wrong view.
+	const auto map_view = [&](int view, uint8_t first) {
+		void* fixed = addr;
+		CheckOk(test,
+		        KernelMapNamedDirectMemory(&fixed, page * 4, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                   phys[view], page, "sparse_copy_cache"),
+		        "map direct view");
+		for (uint64_t i = 0; i < 4; ++i) {
+			std::memset(reinterpret_cast<void*>(base + i * page), first + i, page);
+		}
+	};
+	const std::array<std::pair<uint64_t, uint64_t>, 6> ranges {{
+	    {base + page + 7, 100},         // inside one page of the view
+	    {base + page * 2 - 9, page},    // across two pages of the view
+	    {base, page * 4},               // the whole view
+	    {base + page * 3 + 50, page},   // view end, then the reservation
+	    {base + page * 5, 64},          // reserved, never backed
+	    {0x10000, 64},                  // not owned
+	}};
+	const auto copy_all = [&](int mode) {
+		TestSetSparseCopyCacheMode(mode);
+		std::vector<std::vector<uint8_t>> out;
+		for (const auto& [address, size]: ranges) {
+			for (int repeat = 0; repeat < 2; ++repeat) { // the repeat can hit the cache
+				std::vector<uint8_t> bytes(size + 2, 0x55);
+				bytes.push_back(CopySparseMemory(address, bytes.data() + 1, size) ? 1 : 0);
+				out.push_back(std::move(bytes));
+			}
+		}
+		return out;
+	};
+	const auto compare_modes = [&](const std::string& phase) {
+		const auto locked = copy_all(0);
+		uint64_t   checked_before = 0, missed = 0, checked_after = 0;
+		TestSparseCopyCounts(&checked_before, &missed);
+		Check(test, copy_all(1) == locked, phase + ": mode 1 copied other bytes than mode 0");
+		Check(test, copy_all(2) == locked, phase + ": mode 2 copied other bytes than mode 0");
+		TestSparseCopyCounts(&checked_after, &missed);
+		Check(test, checked_after > checked_before, phase + ": no copy took the lock-free path");
+		return locked;
+	};
+	const auto copy_byte = [&](uint64_t address, uint8_t expected) {
+		uint8_t value = 0x55;
+		return CopySparseMemory(address, &value, 1) && value == expected;
+	};
+
+	map_view(0, 0x10);
+	const auto view0 = compare_modes("view 0");
+	Check(test,
+	      view0[0].back() == 1 && std::all_of(view0[0].begin() + 1, view0[0].end() - 2,
+	                                          [](uint8_t value) { return value == 0x11; }),
+	      "locked copy inside the view read wrong bytes");
+	Check(test,
+	      view0[6].back() == 1 && view0[6][1 + page - 50] == 0 && view0[6][page - 50] == 0x13,
+	      "locked copy over the view end did not zero the reservation");
+	Check(test, view0[8].back() == 1 && view0[10].back() == 0 && view0[10][1] == 0x55,
+	      "locked copy of an unbacked or unowned range changed its result");
+
+	CheckOk(test, KernelMunmap(base, page * 4), "unmap view 0");
+	map_view(1, 0x20);
+	TestSetSparseCopyCacheMode(1);
+	Check(test, copy_byte(base + page + 7, 0x21), "lock-free copy kept the unmapped view's offset");
+	compare_modes("view 1 at the same address");
+
+	CheckOk(test, KernelMunmap(base + page, page), "unmap the second page of view 1");
+	TestSetSparseCopyCacheMode(1);
+	Check(test, copy_byte(base + page * 2 + 5, 0x22) && copy_byte(base + page * 2 + 5, 0x22) &&
+	                copy_byte(base + page + 7, 0),
+	      "lock-free copy after a partial unmap read wrong bytes");
+	compare_modes("after a partial unmap");
+
+	TestSetSparseCopyCacheMode(-1);
+	CheckOk(test, KernelMunmap(base, page), "unmap the first page of view 1");
+	CheckOk(test, KernelMunmap(base + page * 2, page * 2), "unmap the end of view 1");
+	CheckOk(test, KernelMunmap(base + page * 4, page * 4), "release the reservation");
+	for (const auto offset: phys) {
+		CheckOk(test, KernelCheckedReleaseDirectMemory(offset, page * 4), "release direct memory");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFlexibleMapQueryAndWholeMunmap() {
 	const char* test     = "FlexibleMapQueryAndWholeMunmap";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -5843,6 +5940,7 @@ int main(int argc, char** argv) {
 		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
+		RunTest(TestSparseCopyCacheMatchesLockedCopy);
 		RunTest(TestSparseReadDuringDirectCommit);
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestFlexibleMemoryUsesSharedBacking);
@@ -5900,6 +5998,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestCopySparseMemoryMappings);
+	RunTest(TestSparseCopyCacheMatchesLockedCopy);
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
