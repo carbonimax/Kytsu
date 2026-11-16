@@ -70,6 +70,13 @@ public:
 	// (KYTY_READBACK_WINDOW_KIB, clamped to the faulting buffer) are published in one sync.
 	void                   ReadFaultMemory(uint64_t vaddr);
 	void                   InvalidateFaultMemory(uint64_t vaddr);
+	// KYTY_LATE_READ_PROF (see LateRead): queues the check of the ranges bound since the last seal,
+	// to run once the GPU completed the work recorded so far, before any label released later.
+	void                   SealLateReads();
+	// Unhandled guest fault (KYTY_MEM_IMPORT_LOG, diagnostic): what the import knows about the bytes around
+	// each value (imported buffer, GPU-dirty, pending label or WRITE_DATA, logged CP writes). Best effort,
+	// no blocking lock.
+	void                   DescribeFault(const uint64_t* values, size_t count);
 	// GPU thread: like ReadMemory, but publishes the GPU-written bytes of the whole readback window
 	// around the range, as guest faults do, so neighbouring reads no longer need the GPU.
 	// KYTY_BACKING_READ_WINDOW=0 reads only the range.
@@ -134,6 +141,9 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_MEM_IMPORT: copies over a CPU read of the backing the WRITE_DATA bytes that WriteGpuOwned put
+	// in the command stream of imported memory and whose command buffer has not completed (GPU thread).
+	void OverlayOwnedWrites(uint64_t vaddr, void* data, uint64_t size);
 	// GPU thread: the tracker page of vaddr may hold GPU-written bytes (page bits only).
 	[[nodiscard]] bool MaybeGpuModifiedPage(uint64_t vaddr) {
 		return m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, sizeof(uint32_t));
@@ -167,9 +177,36 @@ public:
 	void                   FlushBatchedUploads();
 	[[nodiscard]] static bool ReprotectBatchEnabled() noexcept;
 	void               RunGarbageCollector();
+	// KYTY_MEM_IMPORT (GPU thread, RenderContext::UnmapMemory after the range was published): the
+	// imported buffers touching the range are deleted, their physical pages may be mapped elsewhere.
+	void               DropImported(uint64_t vaddr, uint64_t size);
+	// KYTY_MEM_IMPORT: KYTY_MEM_IMPORT_EXCLUDE ranges and buffers the safety net sent back to copies.
+	[[nodiscard]] bool ImportExcludedRange(uint64_t vaddr, uint64_t size) const;
+	// KYTY_MEM_IMPORT: drops the imported buffers of the range for good; it uploads to device memory.
+	void               DemoteImported(uint64_t vaddr, uint64_t size);
+	// KYTY_MEM_IMPORT_SHADERS: set around a compute dispatch's bindings (0 ends the scope).
+	void               BeginImportShader(uint64_t cs_address);
+	void               EndImportShader() noexcept { m_import_shader = 0; }
+	[[nodiscard]] uint64_t ImportShader() const noexcept { return m_import_shader; }
+	[[nodiscard]] bool ImportActive() const noexcept { return m_import != nullptr; }
+	// KYTY_MEM_IMPORT (GPU thread): the command processor is about to write [vaddr, vaddr + size)
+	// with the CPU (WRITE_DATA, DMA fill/copy), ahead of the GPU work recorded before it. On imported
+	// memory that work reads the guest's bytes when it runs, so the write first waits for every
+	// earlier GPU access to those bytes (64 KiB granularity). No-op without imported memory.
+	void BeforeCpuWrite(uint64_t vaddr, uint64_t size);
+	static void        ReportImport(double seconds);
 
 private:
 	friend struct BufferCacheTestAccess;
+	class HostImport;
+
+	// KYTY_MEM_IMPORT (GPU thread): the bytes of an imported buffer are guest memory, so publishing
+	// GPU writes is only waiting for them. Drops the GPU ownership of [vaddr, vaddr + size) once every
+	// GPU write to it completed; when one is still running, waits for it if `may_wait`, else stores
+	// its tick in `wait_tick` (submitted) and returns false.
+	[[nodiscard]] bool PublishImported(uint64_t vaddr, uint64_t size, bool may_wait,
+	                                   uint64_t* wait_tick);
+	[[nodiscard]] bool IsImportedRange(uint64_t vaddr, uint64_t size);
 
 	void PublishFaultWindow(uint64_t vaddr, bool is_write);
 
@@ -290,6 +327,8 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	// Declared first among the owners: imported chunks outlive every buffer bound to them.
+	std::unique_ptr<HostImport>                       m_import;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
@@ -300,6 +339,14 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	// KYTY_CP_PIPELINE: the GPU thread's program lookups test the ranges while the back thread runs.
 	std::mutex                                        m_gpu_ranges_mutex;
+	struct OwnedWrite {
+		uint64_t             vaddr = 0, tick = 0;
+		std::vector<uint8_t> bytes;
+	};
+	// OverlayOwnedWrites, oldest first: the CP pipeline's front and back threads both read backings.
+	std::vector<OwnedWrite> m_owned_writes;
+	std::mutex              m_owned_mutex;
+	std::atomic<size_t>     m_owned_count {0};
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::atomic<uint64_t>                             m_color_metadata_epoch {0};
@@ -307,6 +354,10 @@ private:
 	std::vector<PendingPublish>                       m_pending_publishes;
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
 	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_write_ticks;
+	std::vector<std::pair<uint64_t, uint64_t>> m_import_demoted; // GPU thread (SealLateReads)
+	uint64_t m_import_shader = 0; // listed compute shader binding now (KYTY_MEM_IMPORT_SHADERS)
+	// KYTY_MEM_IMPORT: latest tick that may read each 64 KiB of imported memory (BeforeCpuWrite).
+	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_read_ticks;
 	struct SideCopy {
 		uint64_t begin = 0, end = 0, tick = 0;
 	};
@@ -343,6 +394,45 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 };
+
+// KYTY_LATE_READ_PROF=N (measurement, default 0): late-read detector for a static guest-memory
+// mapping. Guest ranges that a draw or dispatch reads (vertex, index, descriptor buffers, indirect
+// arguments) are hashed when the command processor binds them, then again in a priority operation once
+// the host GPU completed that work, ahead of any label released after them. A range whose bytes
+// changed with no emulator-side backing write overlapping it in between (label delivery, readback
+// publication, CP write) was rewritten by the guest while the GPU could still read it. One batch in N
+// is checked. "PERF lateread" lines (KYTY_PERF_STATS=1).
+// KYTY_WFAULT_DELAY_US=N (measurement, default 0): every guest-thread write fault spins N us before it
+// is resolved (slope test, "PERF wfault" lines).
+// Unhandled guest fault with KYTY_MEM_IMPORT_LOG: BufferCache::DescribeFault of the import cache, if any.
+void DescribeImportFault(const uint64_t* values, size_t count);
+
+namespace LateRead {
+enum class Site : uint8_t { None, Vertex, Index, Descriptor, Indirect, Count };
+[[nodiscard]] bool Enabled() noexcept;
+// The ObtainBuffer reads inside the scope come from `site`.
+class Scope {
+public:
+	explicit Scope(Site site) noexcept;
+	~Scope();
+	KYTY_CLASS_NO_COPY(Scope);
+
+private:
+	Site m_previous;
+};
+// Any thread, before and after the write: the emulator writes guest bytes through the backing
+// (kernel/memory.cpp TryWriteBacking) or the command processor writes them directly (WRITE_DATA,
+// end-of-pipe labels written at release).
+void NoteBackingWrite(uint64_t vaddr, uint64_t size, bool cp = false) noexcept;
+void Report(double seconds, uint64_t frames);
+// KYTY_MEM_IMPORT_WATCH=1 (with KYTY_MEM_IMPORT; 0 = off): the safety net checks every batch, but a
+// bound imported range is copied only when the guest is about to write one of its pages, which are
+// write-protected at bind.
+// With KYTY_LATE_READ_PROF also set, the copy at bind runs too and both verdicts are compared.
+[[nodiscard]] int WatchMode() noexcept;
+// g_cpu_dirty_hook (region lock held): the guest is about to write [vaddr, vaddr + size).
+void BeforeCpuDirty(uint64_t vaddr, uint64_t size);
+} // namespace LateRead
 
 } // namespace Libs::Graphics
 

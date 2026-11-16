@@ -28,6 +28,8 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <string>
+#include <string_view>
 #include <thread>
 
 namespace Emulator {
@@ -53,6 +55,85 @@ static void PrintSystemInfo() {
 	     "  threads: %u\n\n",
 	     KYTY_BUILD_LABEL, platform_name, info.ProcessorName.c_str(),
 	     std::thread::hardware_concurrency());
+}
+
+// KYTY_MEM_IMPORT_TITLES=ID[=MODE][,ID[=MODE]...] (local configuration, default empty): the import
+// mode (default 1) of the running title, or nullptr when it is not listed.
+static const char* MemImportModeForTitle(const char* list, const std::string& title_id) {
+	static thread_local std::string mode;
+	if (list == nullptr || title_id.empty()) {
+		return nullptr;
+	}
+	const std::string_view all(list);
+	for (size_t at = 0; at <= all.size();) {
+		auto end = all.find(',', at);
+		end      = end == std::string_view::npos ? all.size() : end;
+		auto item = all.substr(at, end - at);
+		const auto equal = item.find('=');
+		if (item.substr(0, equal) == title_id) {
+			mode = equal == std::string_view::npos ? "1" : std::string(item.substr(equal + 1));
+			return mode.c_str();
+		}
+		at = end + 1;
+	}
+	return nullptr;
+}
+
+// True when it set the variable.
+static bool SetEnvIfUnset(const char* name, const char* value) {
+	if (std::getenv(name) != nullptr) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	_putenv_s(name, value);
+#else
+	setenv(name, value, 0);
+#endif
+	return true;
+}
+
+// Per-title guest memory import: an explicit KYTY_MEM_IMPORT wins; a listed title gets its mode and,
+// for a nonzero mode, the labels/EOP mode it needs (KYTY_EOP_AT_GPU=1), GPU-written buffers kept
+// imported (KYTY_MEM_IMPORT_GPU_WRITES=1), the write-watch safety net (KYTY_MEM_IMPORT_WATCH=1) and the
+// texture-cache lock order EOP at GPU needs (KYTY_TC_LOCK_ORDER=1),
+// before the GPU device is created. Each stays overridable by its own variable. The EOP mode set here
+// is withdrawn if the import turns out unavailable (EopAtGpu::WithdrawTitleDefault).
+static void ApplyPerTitleMemImport(const std::string& title_id) {
+	EXIT_IF(MemImportModeForTitle("A1,B2=2", "B2") == nullptr || std::string(MemImportModeForTitle("A1,B2=2", "B2")) != "2" ||
+	        std::string(MemImportModeForTitle("A1,B2=2", "A1")) != "1" || MemImportModeForTitle("A1", "A") != nullptr ||
+	        MemImportModeForTitle("", "A1") != nullptr);
+	const char* mode = MemImportModeForTitle(std::getenv("KYTY_MEM_IMPORT_TITLES"), title_id);
+	if (mode == nullptr || std::getenv("KYTY_MEM_IMPORT") != nullptr) {
+		return;
+	}
+	SetEnvIfUnset("KYTY_MEM_IMPORT", mode);
+	if (std::strtol(mode, nullptr, 10) == 0) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Title {}: KYTY_MEM_IMPORT={} from KYTY_MEM_IMPORT_TITLES: import off\n", title_id, mode));
+		return;
+	}
+	if (SetEnvIfUnset("KYTY_EOP_AT_GPU", "1")) {
+		SetEnvIfUnset("KYTY_EOP_AT_GPU_FROM_TITLE", "1");
+	}
+	// EOP at GPU deadlocks the texture GC against label delivery without this lock order.
+	SetEnvIfUnset("KYTY_TC_LOCK_ORDER", "1");
+	SetEnvIfUnset("KYTY_MEM_IMPORT_GPU_WRITES", "1");
+	SetEnvIfUnset("KYTY_MEM_IMPORT_WATCH", "1");
+	Log::WriteToConsoleAndLog(fmt::format("Title {}: KYTY_MEM_IMPORT={} from KYTY_MEM_IMPORT_TITLES\n", title_id, mode));
+}
+
+// TITLE_ID of param.json, else the one inside CONTENT_ID; empty when neither is there.
+static std::string TitleId() {
+	std::string title_id;
+	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
+	if (title_id.empty()) {
+		std::string content_id;
+		if (Loader::SystemContentParamSfoGetString("CONTENT_ID", &content_id) &&
+		    content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
+			title_id = content_id.substr(7, 9);
+		}
+	}
+	return title_id;
 }
 
 static void KytyClose() {
@@ -99,6 +180,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
 	}
+	// Before the splash screen and the graphics subsystem create the GPU device, which reads it.
+	ApplyPerTitleMemImport(TitleId());
 	if (cfg.splash_enabled) {
 		Libs::Graphics::InitializeSplashScreen(param_json.parent_path());
 	}
@@ -153,15 +236,7 @@ void Run(const RunOptions& options) {
 	Init(options.config, param_json, subsystems);
 
 	PrintSystemInfo();
-	std::string title_id;
-	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
-	if (title_id.empty()) {
-		std::string content_id;
-		if (Loader::SystemContentParamSfoGetString("CONTENT_ID", &content_id) &&
-		    content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
-			title_id = content_id.substr(7, 9);
-		}
-	}
+	const auto title_id = TitleId();
 	if (!title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
 	}

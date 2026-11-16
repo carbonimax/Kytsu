@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/guestStacks.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
@@ -859,7 +860,20 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+static bool TryWriteBackingTracked(uint64_t vaddr, const void* data, uint64_t size);
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	if (Graphics::LateRead::Enabled()) [[unlikely]] {
+		// Logged before and after: a late-read bind hash racing with the write sees one of them.
+		Graphics::LateRead::NoteBackingWrite(vaddr, size);
+		const bool written = TryWriteBackingTracked(vaddr, data, size);
+		Graphics::LateRead::NoteBackingWrite(vaddr, size);
+		return written;
+	}
+	return TryWriteBackingTracked(vaddr, data, size);
+}
+
+static bool TryWriteBackingTracked(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!Graphics::GpuCapture::Recording()) [[likely]] {
 		return g_guest_address_space->TryWriteBacking(vaddr, data, size);
 	}
@@ -872,6 +886,22 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
+}
+
+uint64_t BackingHostAddress(uint64_t vaddr, uint64_t size) {
+	uint64_t offset = 0;
+	if (g_guest_address_space == nullptr || !g_guest_address_space->BackingOffsetOf(vaddr, size, &offset)) {
+		return 0;
+	}
+	return g_guest_address_space->GetBackingBase() + offset;
+}
+
+uint64_t BackingAliasBase() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingBase() : 0;
+}
+
+uint64_t BackingAliasSize() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingSize() : 0;
 }
 
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -907,6 +937,11 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			Graphics::CpPipeline::Drain();
 			buffers.ReadMemoryWindow(vaddr, size);
 		}
+		if (!TryReadBacking(vaddr, data, size)) {
+			return false;
+		}
+		buffers.OverlayOwnedWrites(vaddr, data, size);
+		return true;
 	}
 	return TryReadBacking(vaddr, data, size);
 }
@@ -1095,9 +1130,26 @@ void Initialize() {
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
+	if (Graphics::MemTrackProf::Enabled()) {
+		using Graphics::MemTrackProf::Mapping;
+		Graphics::MemTrackProf::SetClassifier([](uint64_t vaddr) {
+			const int kind = g_guest_address_space != nullptr ? g_guest_address_space->MappingKindOf(vaddr) : 2;
+			return kind == 0 ? Mapping::Backing : kind == 1 ? Mapping::Private : Mapping::Unknown;
+		});
+		Graphics::MemTrackProf::SetMapStats([] {
+			Graphics::MemTrackProf::MapStats stats;
+			if (g_guest_address_space != nullptr) {
+				g_guest_address_space->MapStats(&stats.backing_bytes, &stats.backing_views, &stats.aliased_bytes,
+				                                &stats.private_bytes);
+			}
+			return stats;
+		});
+	}
 }
 
 void Shutdown() {
+	Graphics::MemTrackProf::SetClassifier(nullptr);
+	Graphics::MemTrackProf::SetMapStats(nullptr);
 	g_pooled_memory.reset();
 	g_flexible_memory.reset();
 	g_physical_memory.reset();

@@ -1,9 +1,11 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/shaderPretranslate.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
@@ -24,6 +26,10 @@ void Report(double seconds); // cmdRecord.h (KYTY_CP_RECORD_THREAD)
 namespace Libs::Graphics::EopAtGpu {
 void Report(double seconds); // graphicsRun.cpp (KYTY_EOP_AT_GPU)
 } // namespace Libs::Graphics::EopAtGpu
+
+namespace Libs::Graphics::LateRead {
+void Report(double seconds, uint64_t frames); // bufferCache.h (KYTY_LATE_READ_PROF, KYTY_WFAULT_DELAY_US)
+} // namespace Libs::Graphics::LateRead
 
 namespace Libs::Graphics::PerfStats {
 
@@ -98,6 +104,7 @@ void Add(Counter counter, uint64_t value) noexcept {
 
 void MarkGpuThread() noexcept {
 	g_gpu_thread = true;
+	MemTrackProf::SetThreadKind(MemTrackProf::ThreadKind::Gpu, "gpu");
 	if (Enabled()) {
 		ShaderRecompiler::IR::EnableWalkStats();
 	}
@@ -345,9 +352,12 @@ void MaybeReport() noexcept {
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);
+	BufferCache::ReportImport(seconds);
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));
+	MemTrackProf::Report(seconds, n(Counter::Frames));
+	LateRead::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
 	std::fflush(stdout);

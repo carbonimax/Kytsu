@@ -651,6 +651,31 @@ void TestGpuDirtyBits() {
   Release(memory);
 }
 
+void TestCpuMarkSkipsGpuDirtyPages() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  tracker.ForEachUploadRange(
+      address, 3 * page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  MarkGpuModified(tracker, address + page_size, page_size);
+  // A plain CPU mark of this range exits on the GPU-modified middle page.
+  tracker.MarkRegionAsCpuModifiedExceptGpu(address + 16, 3 * page_size - 32);
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            !tracker.IsRegionCpuModified(address + page_size, page_size) &&
+            tracker.IsRegionCpuModified(address + 2 * page_size, page_size) &&
+            tracker.IsRegionGpuModified(address + page_size, page_size) &&
+            !tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.IsRegionGpuModified(address + 2 * page_size, page_size),
+        "CPU mark did not skip exactly the GPU-modified page");
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
+  tracker.MarkRegionAsCpuModified(address, 3 * page_size);
+  Release(memory);
+}
+
 void TestExactDirtyIntervalsSharingTrackerPage() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1332,6 +1357,7 @@ int main(int argc, char **argv) {
   TestGpuReacquisitionAfterInvalidation();
   TestHostReadIntoUnownedGpuPage();
   TestGpuDirtyBits();
+  TestCpuMarkSkipsGpuDirtyPages();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();

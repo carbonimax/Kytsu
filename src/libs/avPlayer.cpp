@@ -692,11 +692,12 @@ static int HeldVideoBuffers(int buffers) {
 	return std::clamp(value != nullptr && value[0] != '\0' ? std::atoi(value) : 2, 0, buffers - 2);
 }
 
-// KYTY_AVPLAYER_SKIP_LATE=1: in clock-synced playback, Video() drops ready frames that are already past due so a
-// game polling slower than the video frame rate stays on time instead of playing it in slow motion.
+// In clock-synced playback, Video() drops ready frames that are already past due so a game polling slower than the
+// video frame rate stays on time instead of playing it in slow motion. On by default; KYTY_AVPLAYER_SKIP_LATE=0 turns
+// it off.
 static bool SkipLateVideo() {
 	const char* value = std::getenv("KYTY_AVPLAYER_SKIP_LATE");
-	return value != nullptr && value[0] == '1';
+	return value == nullptr || value[0] != '0';
 }
 
 class Source {

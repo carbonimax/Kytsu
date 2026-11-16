@@ -81,6 +81,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
                bool prefer_device)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
+	AllocateDevice(graphics, usage, cpu_address, flags, size, prefer_device);
+}
+
+void Buffer::AllocateDevice(GraphicContext& graphics, MemoryUsage usage, uint64_t cpu_address,
+                            vk::BufferUsageFlags flags, uint64_t size, bool prefer_device) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -147,9 +152,93 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+namespace {
+
+// One create info for imported buffers and their requirement queries.
+struct ImportedBufferInfo {
+	vk::ExternalMemoryBufferCreateInfo external {};
+	std::array<uint32_t, 2>            families {};
+	vk::BufferCreateInfo               info {};
+
+	ImportedBufferInfo(const GraphicContext& graphics, vk::BufferUsageFlags flags, uint64_t size) {
+		external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+		info.pNext           = &external;
+		info.size            = size;
+		info.usage           = flags;
+		families             = {graphics.queue_family, graphics.readback_family};
+		if (graphics.readback_queue != nullptr && graphics.readback_family != graphics.queue_family) {
+			info.sharingMode           = vk::SharingMode::eConcurrent;
+			info.queueFamilyIndexCount = 2;
+			info.pQueueFamilyIndices   = families.data();
+		}
+	}
+	ImportedBufferInfo(const ImportedBufferInfo&)            = delete;
+	ImportedBufferInfo& operator=(const ImportedBufferInfo&) = delete;
+};
+
+} // namespace
+
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               vk::BufferUsageFlags flags, uint64_t size, const ImportedMemory& imported)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size) {
+	EXIT_IF(size == 0 || imported.memory == nullptr);
+	const ImportedBufferInfo create(graphics, flags, size);
+	const auto created = graphics.device.createBuffer(&create.info, nullptr, &m_buffer);
+	vk::BindBufferMemoryInfo bind {};
+	bind.buffer       = m_buffer;
+	bind.memory       = imported.memory;
+	bind.memoryOffset = imported.offset;
+	// The pointer form returns the result unchecked; the enhanced bindBufferMemory asserts on failure.
+	const auto bound = created == vk::Result::eSuccess ? graphics.device.bindBufferMemory2(1, &bind) : created;
+	if (bound != vk::Result::eSuccess) {
+		// Refused by the driver: device memory, as for a refused import (IsImported() stays false).
+		if (created == vk::Result::eSuccess) {
+			graphics.device.destroyBuffer(m_buffer);
+		}
+		m_buffer = nullptr;
+		if (imported.owned) {
+			graphics.device.freeMemory(imported.memory);
+		}
+		AllocateDevice(graphics, MemoryUsage::DeviceLocal, cpu_address, flags, size, false);
+		return;
+	}
+	m_import_memory = imported.memory;
+	m_owns_import   = imported.owned;
+	m_coherent      = true;
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+		if (graphics.device_fault_enabled) {
+			DeviceFault::Registry().Add({m_device_address, size, cpu_address, "imported guest buffer"});
+		}
+	}
+}
+
+vk::MemoryRequirements Buffer::ImportedRequirements(GraphicContext& graphics,
+                                                    vk::BufferUsageFlags flags, uint64_t size) {
+	const ImportedBufferInfo        create(graphics, flags, size);
+	vk::DeviceBufferMemoryRequirements query {};
+	query.pCreateInfo = &create.info;
+	vk::MemoryRequirements2 requirements {};
+	graphics.device.getBufferMemoryRequirements(&query, &requirements);
+	return requirements.memoryRequirements;
+}
+
 Buffer::~Buffer() {
 	if (m_device_address != 0 && m_graphics->device_fault_enabled) {
 		DeviceFault::Registry().Remove(m_device_address);
+	}
+	if (m_import_memory != nullptr) {
+		if (m_buffer != nullptr) {
+			m_graphics->device.destroyBuffer(m_buffer);
+		}
+		if (m_owns_import) {
+			m_graphics->device.freeMemory(m_import_memory);
+		}
+		return;
 	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
@@ -265,7 +354,7 @@ bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& 
 }
 
 std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignment,
-                                                bool allow_wait) {
+                                                bool allow_wait, bool wait_priority) {
 	if (Mapped().empty()) {
 		return {nullptr, 0};
 	}
@@ -294,7 +383,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	    wrap ? std::optional<size_t> {m_current_watch_cursor} : m_invalidation_mark;
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
 	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
-	                           allow_wait, wait_cursor, wait_bound)) {
+	                           allow_wait, wait_priority, wait_cursor, wait_bound)) {
 		return {nullptr, 0};
 	}
 
@@ -329,8 +418,9 @@ void StreamBuffer::Commit() {
 	watch.tick        = tick;
 }
 
-StreamBuffer::Download StreamBuffer::MapDownload(uint64_t size, uint64_t alignment) {
-	if (const auto [mapped, offset] = Map(size, alignment); mapped != nullptr) {
+StreamBuffer::Download StreamBuffer::MapDownload(uint64_t size, uint64_t alignment,
+                                                 bool wait_priority) {
+	if (const auto [mapped, offset] = Map(size, alignment, true, wait_priority); mapped != nullptr) {
 		Commit();
 		return {this, mapped, offset, nullptr};
 	}
@@ -350,7 +440,8 @@ uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignmen
 bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
                                          std::optional<size_t>     invalidation_mark,
                                          uint64_t requested_upper_bound, bool allow_wait,
-                                         size_t& wait_cursor, uint64_t& wait_bound) {
+                                         bool wait_priority, size_t& wait_cursor,
+                                         uint64_t& wait_bound) {
 	if (!invalidation_mark.has_value()) {
 		return true;
 	}
@@ -361,6 +452,10 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		}
 		Scheduler().Wait(watch.tick);
 		if (Usage() == MemoryUsage::Download) {
+			// After Wait(), no new priority operation can take a tick at or before watch.tick.
+			if (!wait_priority && Scheduler().PriorityOperationsPending(watch.tick)) {
+				return false;
+			}
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}
 		wait_bound = watch.upper_bound;

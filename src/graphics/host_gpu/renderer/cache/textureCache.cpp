@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -50,6 +51,17 @@ bool MsaaZeroInit() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_MSAA_ZERO_INIT");
 		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_TC_LOCK_ORDER=1 (default 0): image downloads under m_lock never wait for priority
+// operations. Those operations deliver guest labels (KYTY_EOP_AT_GPU) through InvalidateMemory,
+// which takes m_lock, so the wait could deadlock; the download takes a buffer of its own instead.
+bool TcLockOrder() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TC_LOCK_ORDER");
+		return value != nullptr && std::strtol(value, nullptr, 10) != 0;
 	}();
 	return enabled;
 }
@@ -2421,7 +2433,8 @@ bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging, bool capture
 	auto download = staging != nullptr
 	                    ? StreamBuffer::Download {staging, staging->Mapped().data(), 0, nullptr}
 	                    : m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download)
-	                          .MapDownload(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	                          .MapDownload(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4),
+	                                       !TcLockOrder());
 	if (!LibKernel::Memory::TryReadBacking(range.address, download.mapped, range.size)) {
 		return false;
 	}
@@ -2574,6 +2587,9 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size, uint8_t rea
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(page_begin, page_end - page_begin)) {
 		auto& owner = m_slot_images[id];
+		if (MemTrackProf::Enabled()) {
+			MemTrackProf::NoteTextureHit();
+		}
 		if (owner.Overlaps(address, size)) {
 			if (RefreshProf::Enabled()) [[unlikely]] {
 				RefreshProf::NoteDirty(owner, reason, address, size);

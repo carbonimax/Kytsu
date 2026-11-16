@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -75,6 +76,10 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// KYTY_MEM_IMPORT_WATCH (BufferCache LateRead): called under the region lock with each run of pages
+// about to become CPU-modified, before their write protection is lifted.
+inline void (*g_cpu_dirty_hook)(uint64_t vaddr, uint64_t size) = nullptr;
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -108,6 +113,13 @@ public:
 		}
 		auto&      bits = GetBits<source>();
 		RegionBits changed(enable ? ~bits : bits, start, end);
+		if constexpr (source == DirtySource::Cpu && enable) {
+			if (g_cpu_dirty_hook != nullptr && !changed.None()) [[unlikely]] {
+				for (const auto [first, last]: changed) {
+					g_cpu_dirty_hook(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+				}
+			}
+		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
@@ -117,6 +129,19 @@ public:
 			UpdateProtection<!enable, false>(changed);
 		} else {
 			UpdateProtection<enable, true>(changed);
+		}
+	}
+
+	// ChangeState<Cpu, true> on the pages of [offset, offset + size) that are not GPU-modified.
+	void MarkCpuModifiedExceptGpu(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
+		for (size_t page = start; page < end;) {
+			const auto [gpu_first, gpu_last] = m_gpu_dirty.FirstRangeFrom(page);
+			const auto stop                  = std::min(gpu_first, end);
+			if (stop > page) {
+				ChangeState<DirtySource::Cpu, true>(page * TRACKER_PAGE_SIZE, (stop - page) * TRACKER_PAGE_SIZE);
+			}
+			page = std::max(stop, gpu_last);
 		}
 	}
 

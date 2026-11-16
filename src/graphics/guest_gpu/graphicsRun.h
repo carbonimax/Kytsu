@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <utility>
+#include <vector>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -128,10 +130,16 @@ private:
 namespace EopAtGpu {
 // KYTY_EOP_AT_GPU is 1 or 2.
 [[nodiscard]] bool Enabled() noexcept;
+// The import turned out unavailable (device creation or BufferCache, before any label is released):
+// the KYTY_EOP_AT_GPU=1 that KYTY_MEM_IMPORT_TITLES set for it goes back to 0. True if it was set so;
+// an explicit KYTY_EOP_AT_GPU stays.
+bool WithdrawTitleDefault() noexcept;
 // GPU thread: `bytes` holds a copy of guest memory [address, address + size) about to be used by
 // GPU work recorded now; overlays the pending label bytes (as if written at release). Returns true
 // when it changed something.
 bool OverlayPending(uint64_t address, void* bytes, uint64_t size) noexcept;
+// The pending labels overlapping [address, address + size) as (start, size); mode 1 only.
+void PendingRanges(uint64_t address, uint64_t size, std::vector<std::pair<uint64_t, uint32_t>>& out) noexcept;
 // Command-processor reads of a value that may be a pending label.
 [[nodiscard]] uint32_t ReadFront32(const volatile uint32_t* address) noexcept;
 [[nodiscard]] uint64_t ReadFront64(const volatile uint64_t* address) noexcept;

@@ -240,6 +240,45 @@ public:
 		return true;
 	}
 
+	// KYTY_MEM_IMPORT: backing offset of [vaddr, vaddr + size) when the whole range is mapped from one
+	// contiguous run of the backing (one view, or adjacent views of adjacent backing ranges).
+	bool ContiguousOffset(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		if (m_backing_base == nullptr || offset == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		auto it = m_maps.upper_bound(vaddr);
+		if (it == m_maps.begin()) {
+			return false;
+		}
+		--it;
+		if (vaddr >= it->second.vaddr + it->second.size) {
+			return false;
+		}
+		const auto base    = it->second.backing_offset + (vaddr - it->second.vaddr);
+		const auto end     = vaddr + size;
+		auto       current = vaddr;
+		for (;;) {
+			const auto& entry = it->second;
+			if (current < entry.vaddr || current >= entry.vaddr + entry.size ||
+			    entry.backing_offset + (current - entry.vaddr) != base + (current - vaddr)) {
+				return false;
+			}
+			current = std::min(end, entry.vaddr + entry.size);
+			if (current >= end) {
+				break;
+			}
+			if (++it == m_maps.end()) {
+				return false;
+			}
+		}
+		if (base >= m_size || size > m_size - base) {
+			return false;
+		}
+		*offset = base;
+		return true;
+	}
+
 	template <typename Gap>
 	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
 		std::shared_lock lock(m_mutex);
@@ -551,6 +590,34 @@ private:
 		return m_map_generation.load(std::memory_order_relaxed) == generation;
 	}
 
+public:
+	// KYTY_MEMTRACK_PROF: bytes and count of the guest views, and backing bytes mapped by more
+	// than one view (the whole-backing writable alias is not counted).
+	void ViewStats(uint64_t* bytes, uint64_t* views, uint64_t* aliased) {
+		std::vector<std::pair<uint64_t, int>> events;
+		{
+			std::shared_lock lock(m_mutex);
+			for (const auto& [vaddr, entry]: m_maps) {
+				(void)vaddr;
+				*bytes += entry.size;
+				++*views;
+				events.emplace_back(entry.backing_offset, 1);
+				events.emplace_back(entry.backing_offset + entry.size, -1);
+			}
+		}
+		std::sort(events.begin(), events.end());
+		int      depth = 0;
+		uint64_t at    = 0;
+		for (const auto& [position, delta]: events) {
+			if (depth >= 2) {
+				*aliased += position - at;
+			}
+			depth += delta;
+			at = position;
+		}
+	}
+
+private:
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
@@ -645,6 +712,40 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	// KYTY_MEM_IMPORT: see GuestBackingStore::ContiguousOffset; never for ranges with private mappings.
+	bool BackingOffsetOf(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->ContiguousOffset(vaddr, size, offset);
+	}
+
+	// KYTY_MEMTRACK_PROF: 0 = view of the backing, 1 = private mapping, 2 = unknown (or the
+	// address-space lock is held exclusively: called from fault handlers, never waits).
+	int MappingKindOf(uint64_t vaddr) {
+		std::shared_lock lock(m_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			return 2;
+		}
+		const auto it = FindMappedContainingUnlocked(vaddr);
+		if (it == m_mapped.end()) {
+			return 2;
+		}
+		return it->second.type == MappingType::Backing ? 0 : 1;
+	}
+
+	void MapStats(uint64_t* backing, uint64_t* views, uint64_t* aliased, uint64_t* private_bytes) {
+		m_backing->ViewStats(backing, views, aliased);
+		std::shared_lock lock(m_mutex);
+		for (const auto& [vaddr, region]: m_mapped) {
+			(void)vaddr;
+			if (region.type == MappingType::Private) {
+				*private_bytes += region.size;
+			}
+		}
 	}
 
 	template <bool copy_private>
