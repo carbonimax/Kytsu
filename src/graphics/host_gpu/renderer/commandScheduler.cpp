@@ -608,6 +608,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 	PerfStats::Add(PerfStats::Counter::Submits, 1);
+	if (PerfStats::t_patch_draw) PerfStats::Add(PerfStats::Counter::PatchSubmits, 1);
 
 	if (result != vk::Result::eSuccess) {
 		graphics.ReportDeviceLost(result, "vkQueueSubmit");

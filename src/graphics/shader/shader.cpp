@@ -838,9 +838,45 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
+// KYTY_PERF_STATS: whether a PrepareTessellationPrograms call reads the same inputs as the previous
+// call on this thread ("PERF tesscost"). prog = what selects the programs and their layout; regs adds
+// every other register input. The vertex tables the LS SGPRs point to are not compared.
+static void NoteTessPrepareRepeat(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                                  uint32_t stages, uint64_t local_hash, uint64_t control_hash,
+                                  uint64_t evaluation_hash) {
+	struct Inputs {
+		std::array<uint64_t, 9> prog {};
+		std::array<uint64_t, 2> extra {};
+		HW::UserSgprInfo        hs {};
+		HW::UserSgprInfo        gs {};
+	};
+	thread_local Inputs prev {};
+	thread_local bool   has_prev = false;
+	const uint32_t      hs_count = regs.hs_regs.rsrc2.user_sgpr;
+	const uint32_t      gs_count = regs.gs_regs.rsrc2.user_sgpr;
+	Inputs              cur {};
+	cur.prog  = {regs.ls_regs.data_addr, regs.hs_regs.data_addr, regs.es_regs.data_addr,
+	             local_hash,             control_hash,           evaluation_hash,
+	             stages,                 sh.m_vgtLsHsConfig,     sh.m_vgtTfParam};
+	cur.extra = {regs.hs_regs.user_data_addr,
+	             uint64_t {sh.m_paClVsOutCntl} << 32u | uint64_t {hs_count} << 8u | gs_count};
+	std::copy_n(regs.hs_user_sgpr.value, hs_count, cur.hs.value);
+	std::copy_n(regs.gs_user_sgpr.value, gs_count, cur.gs.value);
+	if (has_prev && cur.prog == prev.prog) {
+		PerfStats::Add(PerfStats::Counter::TessPrepareSameProg, 1);
+		if (cur.extra == prev.extra && std::memcmp(&cur.hs, &prev.hs, sizeof(cur.hs)) == 0 &&
+		    std::memcmp(&cur.gs, &prev.gs, sizeof(cur.gs)) == 0) {
+			PerfStats::Add(PerfStats::Counter::TessPrepareSameRegs, 1);
+		}
+	}
+	prev     = cur;
+	has_prev = true;
+}
+
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info) {
+	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::TessPrepareNs, PerfStats::Counter::TessPrepareCount);
 	const auto& sh        = context.GetShaderRegisters();
 	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
 	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
@@ -904,6 +940,9 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
+	}
+	if (PerfStats::Enabled()) {
+		NoteTessPrepareRepeat(regs, sh, stages, local_hash, control_hash, evaluation_hash);
 	}
 	return params;
 }

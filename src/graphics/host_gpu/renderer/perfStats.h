@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 
 // Measurement counters of the command processor (GPU thread), shader translation, pipeline creation
@@ -162,6 +163,13 @@ enum class Counter : uint32_t {
 	TessPipelines,       // tessellation pipelines created, of which
 	TessPipelineMisses,  //   missed the pipeline cache
 	TessPipelineMissNs,
+	// "PERF tesscost" line: PrepareTessellationPrograms (any thread) and patch draw bodies.
+	TessPrepareNs,
+	TessPrepareCount,
+	TessPrepareSameProg, // addresses, code hashes, stages and VGT fields equal to the previous call's
+	TessPrepareSameRegs, //   and the user SGPRs, HS user data address and PA_CL_VS_OUT_CNTL too
+	PatchSubmits,        // vkQueueSubmit calls made while a patch draw's body runs
+	PatchCalls,          // KYTY_CP_RECORD_THREAD calls captured while a patch draw's body runs
 	Count
 };
 
@@ -185,6 +193,10 @@ void SetStorageBoundsCounters(const volatile uint32_t* counters) noexcept;
 // A pipeline creation reported by VK_EXT_pipeline_creation_feedback (core in Vulkan 1.3).
 void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) noexcept;
 void NoteTessPipeline(bool cache_miss, uint64_t duration_ns) noexcept;
+// Pipeline worker jobs (PipelineCache::CreatePending on a KYTY_PIPELINE_PARALLEL worker), split at
+// the report boundaries ("PERF workers" line). Call only when Enabled(); pass the slot back to End.
+[[nodiscard]] size_t WorkerJobBegin(bool tess) noexcept;
+void                 WorkerJobEnd(size_t slot) noexcept;
 
 // KYTY_FRAME_TIMES=<file> (measurement, default off): one line per presented frame with its
 // steady-clock time in microseconds and the flip argument of the latest guest flip completed before
@@ -209,6 +221,9 @@ inline std::atomic<uint64_t> t_work_recorded {0};
 inline void                  NoteWork() noexcept {
     t_work_recorded.fetch_add(1, std::memory_order_relaxed);
 }
+
+// KYTY_PERF_STATS: set while a patch draw's body runs on this thread (PatchSubmits, PatchCalls).
+inline thread_local bool t_patch_draw = false;
 
 // KYTY_BIND_PROF: set on the CP back thread while PrepareDrawRenderState resolves its targets.
 inline thread_local bool t_target_prof = false;

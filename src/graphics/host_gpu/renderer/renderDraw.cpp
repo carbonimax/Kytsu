@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
@@ -880,6 +881,33 @@ static void NotePatchDraw(const HW::UserConfig& ucfg) {
 		PerfStats::Add(PerfStats::Counter::PatchDraws, 1);
 	}
 }
+
+// KYTY_PERF_STATS: submits and captured calls made while a patch draw's body runs ("PERF tesscost").
+// Submits a later flush makes for the commands of patch draws are not attributed.
+class PatchDrawScope {
+public:
+	explicit PatchDrawScope(const HW::UserConfig& ucfg)
+	    : m_on(PerfStats::Enabled() && ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		if (m_on) {
+			PerfStats::t_patch_draw = true;
+			m_calls                 = CmdRecord::CapturedCalls();
+		}
+	}
+	~PatchDrawScope() {
+		if (!m_on) return;
+		PerfStats::t_patch_draw = false;
+		// The report resets the captured calls (GPU thread); a body on the CP back thread may span it.
+		if (const auto calls = CmdRecord::CapturedCalls(); calls >= m_calls) {
+			PerfStats::Add(PerfStats::Counter::PatchCalls, calls - m_calls);
+		}
+	}
+	PatchDrawScope(const PatchDrawScope&)            = delete;
+	PatchDrawScope& operator=(const PatchDrawScope&) = delete;
+
+private:
+	bool     m_on;
+	uint64_t m_calls = 0;
+};
 
 static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
                                     const DrawIndexBufferSource& source) {
@@ -2163,6 +2191,7 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
+	const PatchDrawScope patch_scope(ucfg);
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
@@ -2277,6 +2306,7 @@ bool RenderExecutor::DrawAutoBody(CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
+	const PatchDrawScope patch_scope(ucfg);
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {

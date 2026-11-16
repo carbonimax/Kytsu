@@ -129,6 +129,48 @@ void NoteTessPipeline(bool cache_miss, uint64_t duration_ns) noexcept {
 	}
 }
 
+namespace {
+
+// Worker jobs in flight and the busy time of the current report interval (split at its start).
+struct WorkerJobs {
+	struct Job {
+		uint64_t begin_us = 0;
+		bool     tess     = false;
+		bool     active   = false;
+	};
+	std::mutex       mutex;
+	std::vector<Job> jobs;
+	uint64_t         interval_us = 0;
+	uint64_t         busy_us[2] {}; // other, tess
+	uint64_t         done[2] {};
+};
+
+WorkerJobs& GetWorkerJobs() noexcept {
+	static auto* jobs = new WorkerJobs;
+	return *jobs;
+}
+
+} // namespace
+
+size_t WorkerJobBegin(bool tess) noexcept {
+	auto&            w = GetWorkerJobs();
+	std::scoped_lock lock(w.mutex);
+	size_t           slot = 0;
+	while (slot < w.jobs.size() && w.jobs[slot].active) slot++;
+	if (slot == w.jobs.size()) w.jobs.emplace_back();
+	w.jobs[slot] = {NowUs(), tess, true};
+	return slot;
+}
+
+void WorkerJobEnd(size_t slot) noexcept {
+	auto&            w = GetWorkerJobs();
+	std::scoped_lock lock(w.mutex);
+	auto&            job = w.jobs[slot];
+	w.busy_us[job.tess ? 1 : 0] += NowUs() - std::max(job.begin_us, w.interval_us);
+	w.done[job.tess ? 1 : 0]++;
+	job.active = false;
+}
+
 uint64_t SteadyUs() noexcept {
 	return NowUs();
 }
@@ -288,6 +330,33 @@ void MaybeReport() noexcept {
 		            Config::TessellationEnabled() ? "drawn" : "skipped", n(Counter::TessPipelines),
 		            n(Counter::TessPipelineMisses), ms(Counter::TessPipelineMissNs));
 	}
+	{
+		// Worker-seconds of pipeline creation in this interval (jobs in flight count up to now).
+		auto&    w = GetWorkerJobs();
+		uint64_t busy[2] {}, done[2] {}, inflight = 0;
+		{
+			std::scoped_lock lock(w.mutex);
+			const auto       now_us = NowUs();
+			for (const auto& job: w.jobs) {
+				if (job.active) {
+					w.busy_us[job.tess ? 1 : 0] += now_us - std::max(job.begin_us, w.interval_us);
+					inflight++;
+				}
+			}
+			w.interval_us = now_us;
+			std::swap(busy, w.busy_us);
+			std::swap(done, w.done);
+		}
+		std::printf("PERF workers %.1fs: busy=%.2fs tess=%.2fs other=%.2fs jobs=%" PRIu64 "/%" PRIu64
+		            " inflight=%" PRIu64 "\n",
+		            seconds, static_cast<double>(busy[0] + busy[1]) / 1e6, static_cast<double>(busy[1]) / 1e6,
+		            static_cast<double>(busy[0]) / 1e6, done[1], done[0], inflight);
+	}
+	std::printf("PERF tesscost %.1fs: prepare=%.2fms(%" PRIu64 ") same_prog=%" PRIu64 " same_regs=%" PRIu64
+	            " patch_draws=%" PRIu64 " patch_submits=%" PRIu64 " patch_calls=%" PRIu64 " frames=%" PRIu64 "\n",
+	            seconds, ms(Counter::TessPrepareNs), n(Counter::TessPrepareCount), n(Counter::TessPrepareSameProg),
+	            n(Counter::TessPrepareSameRegs), n(Counter::PatchDraws), n(Counter::PatchSubmits),
+	            n(Counter::PatchCalls), n(Counter::Frames));
 	if (BindProfMode() != 0) {
 		std::printf("PERF bindback %.1fs: resolve=%.0fms targets=%.0fms pipeline=%.0fms vertex=%.0fms"
 		            " dynamic=%.0fms record=%.0fms flush=%.0fms(%" PRIu64 ")\n",

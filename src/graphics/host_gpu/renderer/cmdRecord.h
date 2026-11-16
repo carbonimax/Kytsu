@@ -38,6 +38,8 @@ void Drain() noexcept;
 void DrainAll() noexcept;
 // GPU thread, with the PERF report.
 void Report(double seconds);
+// KYTY_PERF_STATS: calls captured since the last report (0 when the mode is 0).
+[[nodiscard]] uint64_t CapturedCalls() noexcept;
 
 // Modes 1 and 2 with KYTY_CP_RECORD_SUBMIT (default 1): vkBeginCommandBuffer, vkEndCommandBuffer
 // and the main queue submission (Call below) are captured too, so the GPU thread never waits for

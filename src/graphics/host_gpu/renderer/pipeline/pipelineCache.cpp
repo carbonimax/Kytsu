@@ -2436,9 +2436,13 @@ void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {
 	}
 	LoadStoredModule(job.pixel);
 	const auto begin = PerfStats::CompileLogEnabled() ? PerfStats::SteadyUs() : 0;
+	// KYTY_PERF_STATS: the same window as the J line ("PERF workers"); quiet creation hides it otherwise.
+	const bool timed = worker && PerfStats::Enabled();
+	const auto slot  = timed ? PerfStats::WorkerJobBegin(job.stage_count == 3) : 0;
 	CreatePipelineInternal(m_graphics, job.pipeline, job.key.rendering, job.key.vertex_input,
 	                       job.key.static_params, std::span(job.stages).first(job.stage_count),
 	                       job.pixel, m_driver_cache);
+	if (timed) PerfStats::WorkerJobEnd(slot);
 	job.feedback = LastPipelineCacheFeedback();
 	EXIT_NOT_IMPLEMENTED(job.pipeline.pipeline == nullptr || job.pipeline.pipeline_layout == nullptr);
 	if (PerfStats::CompileLogEnabled()) {

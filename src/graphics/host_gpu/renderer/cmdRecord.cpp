@@ -1401,6 +1401,12 @@ void Call(void (*fn)(void* data), const void* data, size_t bytes) {
 	Publish(&c->h, F_Device);
 }
 
+uint64_t CapturedCalls() noexcept {
+	uint64_t calls = 0;
+	for (const auto count: g_ps.deferred) calls += count;
+	return calls;
+}
+
 void Report(double seconds) {
 	if (g_mode <= 0) {
 		return;
