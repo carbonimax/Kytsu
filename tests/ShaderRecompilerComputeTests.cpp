@@ -11,6 +11,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
+#include "gpu_test_shaders/gpu_test_ray_query_spv.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -38,6 +39,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStore.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1447,6 +1449,8 @@ void CheckLeastRecentlyUsedCacheOrdering() {
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
+  // Loads from an unaccessed mapping must record its first page.
+  bool accessed = true;
 };
 
 using ShaderProfile = ShaderRecompiler::Spirv::Profile;
@@ -7013,11 +7017,14 @@ public:
     context.MapMemory(base + 2 * page, page);
     const auto id = cache.FindBuffer(base, 3 * page);
     auto &buffer = cache.GetBuffer(id);
-    auto readback = CreateHostBuffer(name, 6 * sizeof(u32),
+    auto readback = CreateHostBuffer(name, 9 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
-    const auto snapshot = [&](uint64_t offset, uint32_t index) {
+    const auto snapshot_of = [&](const auto &source, uint64_t offset, uint32_t index) {
       const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
-      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+      scheduler.Current().Handle().copyBuffer(source.Handle(), readback.buffer, 1, &copy);
+    };
+    const auto snapshot = [&](uint64_t offset, uint32_t index) {
+      snapshot_of(buffer, offset, index);
     };
     context.PrepareBda();
     Require(name, "mapped intersection",
@@ -7027,6 +7034,21 @@ public:
             "BDA upload missed a mapped range or uploaded an unmapped hole");
     snapshot(0, 0);
     snapshot(2 * page, 1);
+
+    // A write queues a page only once a DMA access reported it; the report queues it too.
+    cache.InvalidateMemory(base + 17, 1);
+    context.PrepareBda();
+    Require(name, "unaccessed write", cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "a write queued a page no DMA shader accessed");
+    cache.GetFaultBuffer()->Fill(BufferCache::PageIndex(base) / 32 * 4, 4,
+                                 1u << (BufferCache::PageIndex(base) % 32));
+    cache.ProcessFaultBuffer();
+    scheduler.Finish();
+    context.PrepareBda();
+    Require(name, "accessed page", !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "a DMA access report did not queue its page");
+    const auto tagged_entry = static_cast<u32>(buffer.BufferDeviceAddress() | BufferCache::BDA_ACCESSED);
+    snapshot_of(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(uint64_t), 6);
 
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
@@ -7076,10 +7098,14 @@ public:
             !cache.IsRegionRegistered(base, 3 * page) &&
                 cache.IsRegionCpuModified(base + 2 * page, page),
             "garbage collection kept the clean buffer or its protection");
-    (void)cache.FindBuffer(base, 3 * page);
+    const auto replacement = cache.FindBuffer(base, 3 * page);
     context.PrepareBda();
     Require(name, "replacement upload", !cache.IsRegionCpuModified(base, 3 * page),
             "a buffer replacing an evicted one did not upload its untracked pages");
+    // Registration re-tags only the accessed page.
+    snapshot_of(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(uint64_t), 7);
+    snapshot_of(*cache.GetBdaPageTableBuffer(),
+                BufferCache::PageIndex(base + page) * sizeof(uint64_t), 8);
 
     vk::BufferMemoryBarrier barrier{};
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -7090,10 +7116,13 @@ public:
     scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
     scheduler.Finish();
-    Require(name, "GPU contents", ReadBuffer(name, readback, 6) ==
+    Require(name, "GPU contents", ReadBuffer(name, readback, 9) ==
         std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u, 0xabcdef01u,
-                        0x12345678u, 0xfedcba98u},
-        "initial, re-dirtied, newly mapped or remapped bytes were stale on the GPU");
+                        0x12345678u, 0xfedcba98u, tagged_entry,
+                        static_cast<u32>(cache.GetBuffer(replacement).BufferDeviceAddress() |
+                                         BufferCache::BDA_ACCESSED),
+                        static_cast<u32>(cache.GetBuffer(replacement).BufferDeviceAddress() + page)},
+        "stale bytes on the GPU, or page-table entries with wrong accessed tags");
     context.UnmapMemory(base, 3 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);
@@ -8814,6 +8843,17 @@ public:
                       ms_depth_image,
               "CPU invalidation left a reused stencil image write-protected");
       memory[second_stencil_offset] = 0x5a;
+
+      // Another image at the plane's range is not adopted while the depth
+      // keeps its own plane record.
+      const auto other_image = TextureCacheTestAccess::InsertImage(
+          texture_cache, stencil_storage_desc.info);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, switched_ms_depth_id, switched_ms_depth.info.stencil);
+      Require(name, "stencil re-association keeps its plane record",
+              !texture_cache.GetImage(other_image).depth_id,
+              "re-association adopted another image at the stencil range");
+      TextureCacheTestAccess::DeleteImage(texture_cache, other_image);
 
       constexpr uint64_t added_stencil_depth_offset = 0x60000;
       constexpr uint64_t added_stencil_offset = 0x70000;
@@ -18767,6 +18807,32 @@ public:
         });
 #endif
       }
+      {
+        // A game samples a 512x32 R32 Standard256B chain, which ends at 1x1
+        // in mip 9, with LAST_LEVEL 10; the extra level has no storage.
+        constexpr uint64_t address = base + 0x200000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc1400000u,
+                             0x0007c07fu,
+                             0x90190facu,
+                             0,
+                             0x00700090u,
+                             0,
+                             0};
+        descriptor.dword_count = 8;
+        const auto chain = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        descriptor.dwords[3] += 1u << 16u;
+        const auto past = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        Require(name, "LAST_LEVEL past a complete chain",
+                past.image_id == chain.image_id &&
+                    past.desc.info.data.size == chain.desc.info.data.size &&
+                    past.desc.view_info.level_count == 10,
+                "a view past MAX_MIP of a complete chain changed its stored "
+                "layout");
+      }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
                                                    mipped_storage_descriptor);
@@ -22006,7 +22072,7 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
-      for (const auto &[guest_base, backing] : test.bda_mappings) {
+      for (const auto &[guest_base, backing, accessed] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
         Require(test.name, "dispatch",
@@ -22016,7 +22082,8 @@ public:
         const auto pages =
             (bytes + BufferCache::CACHING_PAGESIZE - 1) /
             BufferCache::CACHING_PAGESIZE;
-        auto address = buffer.device_address + backing - page_offset;
+        auto address = buffer.device_address + backing - page_offset +
+                       (accessed ? BufferCache::BDA_ACCESSED : 0);
         auto page = BufferCache::PageIndex(guest_base);
         for (uint64_t mapped = 0; mapped < pages; mapped++) {
           cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
@@ -22074,7 +22141,15 @@ public:
                           &barrier, 0, nullptr);
     }
     Buffer fault_result;
-    if (test.fault_free_address) {
+    auto fault_address = test.fault_free_address;
+    u32 expected_fault = 0;
+    for (const auto &mapping : test.bda_mappings) {
+      if (!mapping.accessed) {
+        fault_address = mapping.guest_base;
+        expected_fault = 1u << (BufferCache::PageIndex(mapping.guest_base) & 31u);
+      }
+    }
+    if (fault_address) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
       fault_result = CreateHostBuffer(test.name, sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
@@ -22083,7 +22158,7 @@ public:
           .dstAccessMask = vk::AccessFlagBits::eTransferRead};
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
-      const vk::BufferCopy region{(BufferCache::PageIndex(*test.fault_free_address) >> 5u) * sizeof(u32),
+      const vk::BufferCopy region{(BufferCache::PageIndex(*fault_address) >> 5u) * sizeof(u32),
                                    0, sizeof(u32)};
       cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
       const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
@@ -22092,9 +22167,9 @@ public:
                           {}, 1, &readable, 0, nullptr, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
-    if (test.fault_free_address) {
-      Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == 0u,
-              "suppressed formatted access touched an unmapped page");
+    if (fault_address) {
+      Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == expected_fault,
+              "an access recorded a suppressed or accessed page, or missed an unaccessed one");
       DestroyBuffer(&fault_result);
     }
     for (const auto view : sampled_mip_views) {
@@ -26070,6 +26145,7 @@ public:
 
 
 #include "PssrGpuTests.inc"
+#include "BvhMirrorGpuTests.inc"
 
 private:
   Mode m_mode = Mode::Full;
@@ -26094,6 +26170,7 @@ private:
   bool m_conditional_rendering_enabled = false; // Full mode, when the device supports it.
   // Full rasterization mode with VK_EXT_mesh_shader mesh and task shaders.
   bool m_mesh_task_enabled = false;
+  bool m_ray_query_enabled = false;
   u32 m_robust_storage_alignment = 0;           // Full mode with robustBufferAccess2 (as the emulator).
   u32   m_skipped_cases          = 0;
 
@@ -26348,6 +26425,9 @@ private:
     available_clock.pNext = &available_maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
     available_robustness2.pNext = &available_clock;
+    vk::PhysicalDeviceAccelerationStructureFeaturesKHR available_acceleration_structure{};
+    vk::PhysicalDeviceRayQueryFeaturesKHR available_ray_query{};
+    available_ray_query.pNext = &available_acceleration_structure;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR available_barycentric{};
@@ -26356,7 +26436,8 @@ private:
     available_barycentric.pNext = &available_conditional_rendering;
     vk::PhysicalDeviceMeshShaderFeaturesEXT available_mesh{};
     available_mesh.pNext = &available_barycentric;
-    available_features2.pNext = &available_mesh;
+    available_acceleration_structure.pNext = &available_mesh;
+    available_features2.pNext = &available_ray_query;
     m_physical_device.getFeatures2(&available_features2);
     uint32_t extension_count = 0;
     RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr), "vkEnumerateDeviceExtensionProperties");
@@ -26379,6 +26460,17 @@ private:
     m_mesh_task_enabled = full && available_mesh.meshShader && available_mesh.taskShader && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
       return std::strcmp(extension.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0;
     });
+    // Optional like mesh shaders: MoltenVK has no ray queries, so the BVH mirror case skips there.
+    m_ray_query_enabled = full && available_acceleration_structure.accelerationStructure &&
+                          available_ray_query.rayQuery &&
+                          std::ranges::all_of(std::array{VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+                                                         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+                                                         VK_KHR_RAY_QUERY_EXTENSION_NAME},
+                                              [&](const char *name) {
+                                                return std::ranges::any_of(extensions, [name](const vk::ExtensionProperties &extension) {
+                                                  return std::strcmp(extension.extensionName, name) == 0;
+                                                });
+                                              });
     Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
             "shaderInt64 is not supported");
     Require("VulkanHarness", "dispatch",
@@ -26614,6 +26706,15 @@ private:
       mesh.pNext = const_cast<void *>(device_info.pNext);
       device_info.pNext = &mesh;
     }
+    vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure{};
+    vk::PhysicalDeviceRayQueryFeaturesKHR ray_query{};
+    if (m_ray_query_enabled) {
+      acceleration_structure.accelerationStructure = true;
+      acceleration_structure.pNext = const_cast<void *>(device_info.pNext);
+      ray_query.rayQuery = true;
+      ray_query.pNext = &acceleration_structure;
+      device_info.pNext = &ray_query;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = full;
     device_features.shaderStorageImageMultisample = full && available_features.shaderStorageImageMultisample;
@@ -26649,6 +26750,11 @@ private:
     }
     if (m_mesh_task_enabled) {
       device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    }
+    if (m_ray_query_enabled) {
+      device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+      device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+      device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
     if (relaxed) {
       const auto has_extension = [&](const char *name) {
@@ -42445,6 +42551,14 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   return test;
 }
 
+// A load from a page without the accessed tag reads it and records a fault.
+TestCase GlobalLoadRecordsUnaccessedPage() {
+  auto test = GlobalSignedImmediateRebasesBeforeSaddr();
+  test.name = "GlobalLoadRecordsUnaccessedPage";
+  test.bda_mappings.front().accessed = false;
+  return test;
+}
+
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   using O = ShaderOpcode;
 
@@ -53203,6 +53317,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(64));
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
+  AddCase(GlobalLoadRecordsUnaccessedPage);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
@@ -59562,6 +59677,79 @@ void CheckPm4Flip() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// A flip rate is the shortest flip interval, counted from the last flip.
+void CheckFlipRate() {
+  namespace EventQueue = LibKernel::EventQueue;
+  using Common::DebugCounters::Counter;
+  constexpr const char *name = "FlipRate";
+  constexpr std::chrono::duration<double> period{1.0 / 30};
+  Config::Load({.vblank_frequency = 30,
+                .printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO),
+          "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window =
+      SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr,
+          "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &video_out = VideoOut::VideoOutInit(64, 64, *window.presenter);
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(&video_out);
+
+  const int handle = VideoOut::VideoOutOpen(255, 0, 0, nullptr);
+  EventQueue::KernelEqueue flips = EventQueue::KERNEL_EQUEUE_INVALID;
+  Require(name, "setup",
+          handle > 0 && EventQueue::KernelCreateEqueue(&flips, "flips") == 0 &&
+              VideoOut::VideoOutAddFlipEvent(flips, handle, nullptr) == 0 &&
+              VideoOut::VideoOutSetFlipRate(handle, 1) == 0,
+          "video-out setup failed");
+  const auto flip = [&] {
+    EventQueue::KernelEvent event{};
+    int count = 0;
+    LibKernel::KernelUseconds timeout = 2'000'000;
+    Require(name, "flip",
+            VideoOut::VideoOutSubmitFlip(handle, -1, 1, 0) == 0 &&
+                EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
+                                             &timeout) == 0 &&
+                count == 1,
+            "the flip did not complete");
+    return std::chrono::steady_clock::now();
+  };
+
+  // At rate 1 a frame submitted after its slot flips at the next vblank, 3
+  // vblanks after the last flip, and the frame after it waits 2 vblanks again.
+  // The first present of the port is slow, so the timed flips follow a warm-up
+  // and one idle vblank that settles its lateness count.
+  Common::DebugCounters::SetEnabled(true);
+  flip();
+  std::this_thread::sleep_for(period);
+  const auto late_vblanks = Common::DebugCounters::Get(Counter::LateVblanks);
+  const auto first = flip();
+  std::this_thread::sleep_until(first + period * 2.4);
+  const auto late = flip();
+  const auto next = flip();
+  Require(name, "pacing",
+          Common::DebugCounters::Get(Counter::LateVblanks) == late_vblanks,
+          "the present thread fell behind the vblank rate");
+  Common::DebugCounters::SetEnabled(false);
+  const double next_gap = (next - late) / period;
+  Require(name, "late flip", (late - first) / period < 3.5,
+          "a late frame did not flip at the next vblank");
+  Require(name, "interval", next_gap > 1.5 && next_gap < 2.5,
+          "the frame after a late flip did not wait 2 vblanks");
+
+  renderer.GetGpu().WaitForIdle();
+  Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
+          "video-out close failed");
+  EventQueue::KernelDeleteEqueue(flips);
+  renderer.ShutdownGpu();
+  VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
 
@@ -60687,6 +60875,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
+    RunCase(&vulkan, GlobalLoadRecordsUnaccessedPage());
     RunCase(&vulkan, FlatSegmentIgnoresSaddrAndMasksOffsetMsb());
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     return 0;
@@ -61050,6 +61239,10 @@ int main(int argc, char **argv) {
     CheckPm4Flip();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
+    CheckFlipRate();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--video-out-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckVideoOutHdr10ToSdr();
@@ -61251,6 +61444,11 @@ int main(int argc, char **argv) {
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
     CheckPm4DepthShaderControl(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-mirror-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBvhMirror();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pssr-only") == 0) {
@@ -61667,6 +61865,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckBvhMirror();
   vulkan.CheckFaultBufferScan();
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();
