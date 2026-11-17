@@ -370,6 +370,9 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 		ApplyGridMinimum();
 		auto* view = grid ? static_cast<QAbstractItemView*>(m_ui->cfgs_grid) : m_ui->cfgs_list;
 		m_ui->game_views->setCurrentWidget(view);
+		m_ui->game_views->SetBackgroundImage(!grid && m_selected_item != nullptr
+		                                         ? m_selected_item->GetInfo().basedir
+		                                         : QString());
 		if (grid) {
 			if (m_selected_item == nullptr) {
 				SelectFirstVisibleItem();
@@ -1455,7 +1458,9 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	m_ui->edit_button->setEnabled(!item->IsRunning());
 
 	m_selected_item = item;
-	m_ui->game_views->SetBackgroundImage(item->GetInfo().basedir);
+	// The carousel paints its own pic0 over the whole view, so the stack only needs it for the list.
+	const bool grid = m_ui->game_views->currentWidget() == m_ui->cfgs_grid;
+	m_ui->game_views->SetBackgroundImage(grid ? QString() : item->GetInfo().basedir);
 	UpdateGridDetails();
 	ApplyGridLimit();
 
