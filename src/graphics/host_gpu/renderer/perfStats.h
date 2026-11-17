@@ -162,6 +162,23 @@ enum class Counter : uint32_t {
 	TessPipelines,       // tessellation pipelines created, of which
 	TessPipelineMisses,  //   missed the pipeline cache
 	TessPipelineMissNs,
+	// LS, HS and DS program misses on the draw thread ("PERF tessmiss"), and those it translated
+	// itself; the others (KYTY_TESS_PRETRANSLATE) were translated by a worker and only emitted there.
+	TessMissLs,
+	TessMissHs,
+	TessMissDs,
+	TessInlineLs,
+	TessInlineHs,
+	TessInlineDs,
+	TessInlineNs,      // draw-thread preparation + translation of those
+	TessMissNs,        // whole misses (translation, emission, module)
+	TessDeferredDraws, // KYTY_TESS_PRETRANSLATE: draws skipped while a worker translates their stages
+	// Presented frames by interval, in 60 Hz vsync buckets: < 41.7 ms (33), < 58.3 ms (50),
+	// < 75 ms (67), longer ("PERF frames").
+	Frames33,
+	Frames50,
+	Frames67,
+	FramesLong,
 	Count
 };
 

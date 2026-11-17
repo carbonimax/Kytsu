@@ -159,6 +159,8 @@ struct DrawRenderState {
 	// (vertex_info[0].indirect_draw).
 	ShaderIndirectOffsets                indirect_offsets;
 	uint32_t                             indirect_count = 0;
+	// Output (KYTY_TESS_PRETRANSLATE): skipped while workers translate its tessellation stages.
+	bool                                 tess_deferred  = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -196,8 +198,11 @@ public:
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	// `single_sample` selects the pixel permutation; `aliased` merges aliased color targets.
+	// `may_defer_tess`: a first lookup whose caller skips a draw left without a vertex program
+	// (KYTY_TESS_PRETRANSLATE, state.tess_deferred).
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state,
-	                         bool single_sample = false, const AliasedColorTargets* aliased = nullptr);
+	                         bool single_sample = false, const AliasedColorTargets* aliased = nullptr,
+	                         bool may_defer_tess = false);
 	// An empty program skips the dispatch.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                ShaderComputeInputInfo&      input_info);
