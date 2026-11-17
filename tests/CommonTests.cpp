@@ -48,7 +48,11 @@ volatile uint64_t g_fault_rsp = 0;
 
 // Resolves the write fault on BASE by making the page writable.
 bool MakeBaseWritable(const Common::HostException::ExceptionInfo& info) {
+#if defined(__APPLE__) && defined(__aarch64__)
+	g_fault_rsp = info.sp;
+#else
 	g_fault_rsp = info.rsp;
+#endif
 	return info.type == Common::HostException::ExceptionType::AccessViolation &&
 	       info.access_violation_type == Common::HostException::AccessViolationType::Write &&
 	       info.access_violation_vaddr == BASE &&

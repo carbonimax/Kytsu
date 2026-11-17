@@ -33,6 +33,13 @@ struct ExceptionInfo {
 	uint32_t            native_code            = 0;
 	// Platform-specific mutable context, valid only for the duration of the handler call.
 	void* native_context = nullptr;
+#if defined(__APPLE__) && defined(__aarch64__)
+	// Host state only (the x86 fields above stay zero); guest x86 registers belong to the translator.
+	uint64_t x[31] {};
+	uint64_t sp  = 0;
+	uint64_t far = 0;
+	uint32_t esr = 0;
+#endif
 };
 
 using Handler = bool (*)(const ExceptionInfo&);

@@ -6,6 +6,13 @@
 
 #include <xbyak/xbyak.h>
 
+// The walker is emitted as x86-64 code; other hosts compile without it.
+#if defined(__x86_64__) || defined(_M_X64)
+#define KYTY_SRT_X86_WALKER 1
+#else
+#define KYTY_SRT_X86_WALKER 0
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -195,6 +202,7 @@ std::atomic<uint64_t> g_reuse_hits {0};
 std::atomic<uint64_t> g_reuse_ns {0};
 std::atomic<uint64_t> g_reuse_diffs {0};
 
+#if KYTY_SRT_X86_WALKER
 bool ProtectedLoadsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SRT_PROTECTED_LOADS");
@@ -282,6 +290,7 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	}
 	code.mov(code.eax, code.dword[code.r10]);
 }
+#endif
 
 class RuntimeValidator {
 public:
@@ -474,6 +483,7 @@ private:
 };
 
 
+#if KYTY_SRT_X86_WALKER
 // Emits one x86 function per plan. Each value, per EXEC-mask context, is a memoized thunk with a
 // state byte (0 unevaluated, 1 unknown or in progress, 2 known, 3 a control Phi holding its first
 // value) and a qword slot; a reference is `call thunk; cmp state, 2`. Operands that are unknown,
@@ -1481,13 +1491,25 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
 }
+#endif
 
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+#if KYTY_SRT_X86_WALKER
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	plan.srt_memo_loads = UINT32_MAX;
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+#else
+	plan.srt_memo_loads = UINT32_MAX;
+	// shortcut: no walker backend on this host, so WalkSrt fails and the plan is not specialized;
+	// add a portable interpreter (or an ARM64 emitter) to render on non-x86 hosts.
+	(void)values;
+	static std::atomic<bool> logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		std::printf("SRT walker: no backend for this host CPU (x86-64 only); resource plans are not walked\n");
+	}
+#endif
 }
 
 uint32_t WalkReuseMode() noexcept {
@@ -1505,6 +1527,7 @@ namespace {
 // loads as walker loads while t_running_walker points here. Returns 1 when every value matches.
 using LoadValidator = uint32_t KYTY_SYSV_ABI (*)(const uint64_t* begin, const uint64_t* end);
 
+#if KYTY_SRT_X86_WALKER
 const Xbyak::CodeGenerator& LoadValidatorCode() {
 	static const auto* code = [] {
 		auto* c = new Xbyak::CodeGenerator(4096);
@@ -1530,6 +1553,7 @@ const Xbyak::CodeGenerator& LoadValidatorCode() {
 	}();
 	return *code;
 }
+#endif
 
 uint64_t ElapsedNs(std::chrono::steady_clock::time_point start) {
 	return static_cast<uint64_t>(
@@ -1538,12 +1562,17 @@ uint64_t ElapsedNs(std::chrono::steady_clock::time_point start) {
 
 // The memo's recorded loads still read the same values (the plan's inputs already match).
 bool MemoLoadsHold(const ResourcePlan& plan) {
+#if KYTY_SRT_X86_WALKER
 	const auto* begin = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	const auto& code  = LoadValidatorCode();
 	t_running_walker  = &code;
 	const auto same   = code.getCode<LoadValidator>()(begin, begin + 2u * plan.srt_memo_loads);
 	t_running_walker  = nullptr;
 	return same != 0u;
+#else
+	(void)plan;
+	return false;
+#endif
 }
 
 bool MemoInputsMatch(const ResourcePlan& plan, const SrtRuntime& runtime) {

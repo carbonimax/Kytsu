@@ -13,6 +13,9 @@
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <sys/ucontext.h>
+#if defined(__aarch64__)
+#include <mach/arm/thread_status.h>
+#endif
 #else
 #include <ucontext.h> // IWYU pragma: keep
 #endif
@@ -139,6 +142,28 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 #else
 
+#if defined(__APPLE__) && defined(__aarch64__)
+// ARM64 ESR: EC (bits 31:26) 0x20/0x21 = instruction abort, 0x24/0x25 = data abort, where WnR
+// (bit 6) tells a write from a read; other classes carry no access direction.
+constexpr AccessViolationType DecodeEsr(uint32_t esr) {
+	const auto exception_class = esr >> 26u;
+	if (exception_class == 0x20u || exception_class == 0x21u) {
+		return AccessViolationType::Execute;
+	}
+	if (exception_class == 0x24u || exception_class == 0x25u) {
+		return (esr & (1u << 6u)) != 0 ? AccessViolationType::Write : AccessViolationType::Read;
+	}
+	return AccessViolationType::Unknown;
+}
+static_assert(DecodeEsr(0x9200004fu) == AccessViolationType::Write); // data abort, WnR, permission fault
+static_assert(DecodeEsr(0x9200000fu) == AccessViolationType::Read);
+static_assert(DecodeEsr(0x8200000fu) == AccessViolationType::Execute); // instruction abort
+static_assert(DecodeEsr(0x00000040u) == AccessViolationType::Unknown); // WnR outside a data abort
+
+static AccessViolationType DecodeAccess(const ucontext_t* context) {
+	return DecodeEsr(context->uc_mcontext->__es.__esr);
+}
+#else
 // x86-64 page-fault error code: bit 4 = instruction fetch, bit 1 = write, otherwise a read.
 static AccessViolationType DecodeAccess(const ucontext_t* context) {
 #if defined(__APPLE__)
@@ -154,6 +179,7 @@ static AccessViolationType DecodeAccess(const ucontext_t* context) {
 	}
 	return AccessViolationType::Read;
 }
+#endif
 
 // A resolved fault returns and retries the instruction; an unresolved one restores the default
 // action so the retry terminates the process.
@@ -161,7 +187,18 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	auto* context = static_cast<ucontext_t*>(native_context);
 
 	ExceptionInfo info {};
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(__aarch64__)
+	const auto& registers  = context->uc_mcontext->__ss;
+	info.exception_address = arm_thread_state64_get_pc(registers);
+	info.sp                = arm_thread_state64_get_sp(registers);
+	info.far               = context->uc_mcontext->__es.__far;
+	info.esr               = context->uc_mcontext->__es.__esr;
+	for (size_t index = 0; index < 29; ++index) {
+		info.x[index] = registers.__x[index];
+	}
+	info.x[29] = arm_thread_state64_get_fp(registers);
+	info.x[30] = arm_thread_state64_get_lr(registers);
+#elif defined(__APPLE__)
 	const auto& registers  = context->uc_mcontext->__ss;
 	info.exception_address = registers.__rip;
 	info.rax               = registers.__rax;

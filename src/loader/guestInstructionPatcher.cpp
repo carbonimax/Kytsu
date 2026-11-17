@@ -39,6 +39,8 @@ using s64 = int64_t;
 
 #define ASSERT(condition) EXIT_IF(!(condition))
 
+// Native x86-64 patching only; ARM64 runs guest code through FEX.
+#if !defined(__aarch64__) && !defined(_M_ARM64)
 constexpr size_t NearJumpSize = 5;
 
 struct PatchModule {
@@ -1611,6 +1613,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	}
 	return result;
 }
+#endif
 
 namespace {
 
@@ -1787,6 +1790,7 @@ bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_fram
 	return true;
 }
 
+#if !defined(__aarch64__) && !defined(_M_ARM64)
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size) {
 	EXIT_IF(module_ptr == nullptr || module_size == 0 || trampoline_area_ptr == nullptr ||
@@ -1802,6 +1806,27 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
 void UnregisterGuestInstructionPatchModule(void* module_ptr) {
 	g_patch_modules.erase(reinterpret_cast<u64>(module_ptr));
 }
+#else
+// FEX receives the raw guest bytes on ARM64; there is no host x86 CPUID or native trampoline here.
+// Refuse instead of reporting a module as patched or a host feature set nobody measured.
+GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
+	EXIT("%s: native x86 guest instruction patching is unavailable on ARM64 hosts\n", __func__);
+	return {}; // EXIT terminates; never reached.
+}
+
+GuestInstructionPatchResult PatchGuestInstructions(uint64_t /*segment_addr*/, uint64_t /*segment_size*/, std::span<const uintptr_t> /*function_starts*/, bool /*protect_memory*/, bool /*emulate_amd*/, GuestInstructionHostFeatures /*host_features*/) {
+	EXIT("%s: native x86 guest instruction patching is unavailable on ARM64 hosts\n", __func__);
+	return {}; // EXIT terminates; never reached.
+}
+
+void RegisterGuestInstructionPatchModule(void* /*module_ptr*/, uint64_t /*module_size*/, void* /*trampoline_area_ptr*/, uint64_t /*trampoline_area_size*/) {
+	EXIT("%s: native x86 guest instruction patching is unavailable on ARM64 hosts\n", __func__);
+}
+
+void UnregisterGuestInstructionPatchModule(void* /*module_ptr*/) {
+	EXIT("%s: native x86 guest instruction patching is unavailable on ARM64 hosts\n", __func__);
+}
+#endif
 
 #undef ASSERT
 

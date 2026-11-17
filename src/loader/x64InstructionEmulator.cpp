@@ -7,9 +7,14 @@
 #include <atomic>
 #include <bit>
 #include <cstring>
+// Native x86-64 instruction emulation only; ARM64 runs guest code through FEX.
+#if !defined(__aarch64__) && !defined(_M_ARM64)
 #include <emmintrin.h>
 #include <xmmintrin.h>
 #include <cpuid.h>
+#else
+#include "common/assert.h"
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -23,6 +28,7 @@
 
 namespace Loader::X64InstructionEmulator {
 
+#if !defined(__aarch64__) && !defined(_M_ARM64)
 static uint64_t ExtractBitField(uint64_t value, uint32_t length, uint32_t index) {
 	length &= 0x3fu;
 	index &= 0x3fu;
@@ -853,5 +859,25 @@ uint64_t LoadBaseR10(void* native_context) {
 	Context context {static_cast<decltype(Context::native)>(native_context)};
 	return static_cast<uint64_t>(context.Gpr(10));
 }
+#else
+// The saved context here is an ARM64 host context, not guest x86 registers. TryEmulate declines,
+// so the caller reports the fault and exits; the walker load helpers refuse instead of faking a load.
+bool TryEmulate(void* /*native_context*/) {
+	return false;
+}
+
+void SkipLoad(void* /*native_context*/, size_t /*length*/) {
+	EXIT("%s: native x86 instruction emulation is unavailable on ARM64 hosts\n", __func__);
+}
+
+void CompleteLoad(void* /*native_context*/, size_t /*length*/, uint32_t /*value*/) {
+	EXIT("%s: native x86 instruction emulation is unavailable on ARM64 hosts\n", __func__);
+}
+
+uint64_t LoadBaseR10(void* /*native_context*/) {
+	EXIT("%s: native x86 instruction emulation is unavailable on ARM64 hosts\n", __func__);
+	return 0; // EXIT terminates; never reached.
+}
+#endif
 
 } // namespace Loader::X64InstructionEmulator
