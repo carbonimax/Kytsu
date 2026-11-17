@@ -1063,6 +1063,21 @@ bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->CopySparseMemory<true>(vaddr, data, size);
 }
 
+SparseCopyStats GetSparseCopyStats() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetSparseCopyStats() : SparseCopyStats {};
+}
+
+void ReportSparseCopyCache() {
+	const auto s = GetSparseCopyStats();
+	if (s.mode == 0) {
+		return;
+	}
+	// Totals since start, so the last line covers the whole session.
+	std::printf("PERF sparsecopy total: mode=%d checked=%" PRIu64 " locked=%" PRIu64 " stale_bytes=%" PRIu64
+	            " stale_maps=%" PRIu64 " bumps_maps=%" PRIu64 " bumps_bytes=%" PRIu64 "\n",
+	            s.mode, s.checked, s.locked, s.stale_bytes, s.stale_maps, s.map_bumps, s.byte_bumps);
+}
+
 static bool SelfTestSub64SharedPlaceholderAlias() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	constexpr uint64_t PageSize    = 0x4000;
@@ -2729,10 +2744,6 @@ void TestSetBackingReadCallback(callback_func_t callback) {
 
 void TestSetSparseCopyCacheMode(int mode) {
 	g_test_sparse_copy_cache_mode = mode;
-}
-
-void TestSparseCopyCounts(uint64_t* checked, uint64_t* locked) {
-	g_guest_address_space->SparseCopyCounts(checked, locked);
 }
 
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {

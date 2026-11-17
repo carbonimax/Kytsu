@@ -132,6 +132,15 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// KYTY_SPARSE_COPY_CACHE totals since start. checked (lock-free copies) and locked (misses, of
+// which stale_bytes/stale_maps hit a slot flushed by a byte write / a mapping change) count in
+// mode 2 only; map_bumps and byte_bumps (generation bumps by kind) count in modes 1 and 2.
+struct SparseCopyStats {
+	int      mode;
+	uint64_t checked, locked, stale_bytes, stale_maps, map_bumps, byte_bumps;
+};
+SparseCopyStats GetSparseCopyStats();
+void            ReportSparseCopyCache(); // one PERF line (KYTY_PERF_STATS), none with the cache off
 // KYTY_MEM_IMPORT: host address of the writable backing alias of [vaddr, vaddr + size) when the whole
 // range is mapped from one contiguous run of direct memory (never protected: importable by the GPU);
 // 0 otherwise. BackingAliasBase/Size: the whole alias (0 when there is no backing).
@@ -256,7 +265,6 @@ void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, si
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 void     TestSetSparseCopyCacheMode(int mode); // -1 = KYTY_SPARSE_COPY_CACHE
-void     TestSparseCopyCounts(uint64_t* checked, uint64_t* locked);
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();

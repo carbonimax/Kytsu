@@ -1784,13 +1784,11 @@ void TestSparseCopyCacheMatchesLockedCopy() {
 		return out;
 	};
 	const auto compare_modes = [&](const std::string& phase) {
-		const auto locked = copy_all(0);
-		uint64_t   checked_before = 0, missed = 0, checked_after = 0;
-		TestSparseCopyCounts(&checked_before, &missed);
+		const auto locked         = copy_all(0);
+		const auto checked_before = GetSparseCopyStats().checked;
 		Check(test, copy_all(1) == locked, phase + ": mode 1 copied other bytes than mode 0");
 		Check(test, copy_all(2) == locked, phase + ": mode 2 copied other bytes than mode 0");
-		TestSparseCopyCounts(&checked_after, &missed);
-		Check(test, checked_after > checked_before, phase + ": no copy took the lock-free path");
+		Check(test, GetSparseCopyStats().checked > checked_before, phase + ": no copy took the lock-free path");
 		return locked;
 	};
 	const auto copy_byte = [&](uint64_t address, uint8_t expected) {
@@ -1810,10 +1808,35 @@ void TestSparseCopyCacheMatchesLockedCopy() {
 	Check(test, view0[8].back() == 1 && view0[10].back() == 0 && view0[10][1] == 0x55,
 	      "locked copy of an unbacked or unowned range changed its result");
 
+	// A locked backing write (end-of-pipe label, buffer write-back) flushes the slot: the next copy
+	// reads the new byte under the locks and counts a slot flushed by a byte write, then the
+	// refilled slot hits again.
+	TestSetSparseCopyCacheMode(2);
+	Check(test, copy_byte(base + page + 7, 0x11) && copy_byte(base + page + 7, 0x11),
+	      "lock-free copy before a backing write read wrong bytes");
+	const auto    before_write = GetSparseCopyStats();
+	const uint8_t label        = 0x77;
+	Check(test, TryWriteBacking(base + page + 7, &label, 1), "TryWriteBacking");
+	Check(test, copy_byte(base + page + 7, 0x77), "copy after a backing write read the old byte");
+	const auto after_write = GetSparseCopyStats();
+	Check(test,
+	      after_write.byte_bumps == before_write.byte_bumps + 1 &&
+	          after_write.map_bumps == before_write.map_bumps &&
+	          after_write.stale_bytes == before_write.stale_bytes + 1 &&
+	          after_write.stale_maps == before_write.stale_maps && after_write.checked == before_write.checked,
+	      "a backing write did not flush the slot as one byte-write miss");
+	Check(test, copy_byte(base + page + 7, 0x77) && GetSparseCopyStats().checked == after_write.checked + 1,
+	      "the slot did not refill after a backing write");
+
+	const auto before_remap = GetSparseCopyStats();
 	CheckOk(test, KernelMunmap(base, page * 4), "unmap view 0");
 	map_view(1, 0x20);
-	TestSetSparseCopyCacheMode(1);
+	TestSetSparseCopyCacheMode(2);
 	Check(test, copy_byte(base + page + 7, 0x21), "lock-free copy kept the unmapped view's offset");
+	Check(test,
+	      GetSparseCopyStats().stale_maps == before_remap.stale_maps + 1 &&
+	          GetSparseCopyStats().stale_bytes == before_remap.stale_bytes,
+	      "a remap did not flush the slot as one mapping-change miss");
 	compare_modes("view 1 at the same address");
 
 	CheckOk(test, KernelMunmap(base + page, page), "unmap the second page of view 1");

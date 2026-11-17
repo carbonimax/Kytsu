@@ -81,6 +81,7 @@ static thread_local BackingReadCache t_backing_read_cache;
 struct SparseCopyCache {
 	static constexpr uint32_t Ways = 4;
 	BackingReadCache          entries[Ways];
+	uint64_t                  map_bumps[Ways] {}; // m_map_bumps at the fill (mode 2 stale-miss cause)
 	uint32_t                  next = 0;
 };
 static thread_local SparseCopyCache t_sparse_copy_cache;
@@ -179,7 +180,7 @@ public:
 
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(false);
 		std::memset(m_backing_base + backing_offset, 0, size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		g_test_backing_bytes_zeroed += size;
@@ -189,7 +190,7 @@ public:
 	void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(false);
 		const auto*     source = static_cast<const uint8_t*>(data);
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
@@ -323,6 +324,7 @@ public:
 					slot.vaddr          = entry.vaddr;
 					slot.size           = entry.size;
 					slot.backing_offset = entry.backing_offset;
+					cache.map_bumps[&slot - cache.entries] = m_map_bumps.load(std::memory_order_relaxed);
 				}
 			}
 		}
@@ -352,16 +354,24 @@ public:
 
 	// Lock-free copy for GuestAddressSpace::CopySparseMemory. Same seqlock as
 	// TryReadBackingCached, over the thread's sparse-copy mappings. On success, *generation and
-	// *backing_offset tell what the copy was validated against (for the mode 2 check).
+	// *backing_offset tell what the copy was validated against (for the mode 2 check). In mode 2,
+	// a miss on a slot that covers the range sets *stale: 1 if only byte writes (WriteBacking,
+	// ZeroRange) bumped the generation since its fill, 2 if a mapping change did.
 	bool TryCopyCached(uint64_t vaddr, void* data, uint64_t size, uint64_t* generation,
-	                   uint64_t* backing_offset) {
+	                   uint64_t* backing_offset, int* stale) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_read != nullptr) {
 			return false;
 		}
 #endif
-		const auto& cache = t_sparse_copy_cache;
-		for (const auto& slot: cache.entries) {
+		const auto& cache       = t_sparse_copy_cache;
+		const auto  stale_cause = [&](uint32_t way) {
+			if (SparseCopyCacheMode() == 2) {
+				*stale = m_map_bumps.load(std::memory_order_relaxed) == cache.map_bumps[way] ? 1 : 2;
+			}
+		};
+		for (uint32_t way = 0; way < SparseCopyCache::Ways; ++way) {
+			const auto& slot = cache.entries[way];
 			if (slot.store != this || vaddr < slot.vaddr || size > slot.size ||
 			    vaddr - slot.vaddr > slot.size - size) {
 				continue;
@@ -370,11 +380,13 @@ public:
 			const auto offset  = slot.backing_offset + (vaddr - slot.vaddr);
 			// The slot was a store mapping at this generation, so the offset is inside the store.
 			if (current != slot.generation) {
+				stale_cause(way);
 				continue;
 			}
 			std::memcpy(data, m_backing_base + offset, size);
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (m_map_generation.load(std::memory_order_relaxed) != current) {
+				stale_cause(way);
 				return false;
 			}
 			*generation     = current;
@@ -411,10 +423,10 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(true);
 #else
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(true);
 		if (!MapView(vaddr, size, backing_offset, mode, failure_reason)) {
 			return false;
 		}
@@ -429,7 +441,7 @@ public:
 		std::vector<MapEntry> targets;
 		{
 			std::lock_guard lock(m_mutex);
-			BumpMapGeneration();
+			BumpMapGeneration(true);
 			auto            current = vaddr;
 			while (current < end) {
 				const auto* entry = FindContainingUnlocked(current);
@@ -457,7 +469,7 @@ public:
 		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size));
 
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(true);
 		RemoveMappingsUnlocked(vaddr, size);
 #endif
 		return true;
@@ -468,7 +480,7 @@ public:
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
-			BumpMapGeneration();
+			BumpMapGeneration(true);
 			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
 		}
 		const uint64_t left_size  = vaddr - old.vaddr;
@@ -679,10 +691,22 @@ private:
 
 	// The fence keeps the writer's later stores (mapping changes, ZeroRange/WriteBacking bytes)
 	// after the bump for lock-free readers on weakly ordered hosts (seqlock writer side).
-	void BumpMapGeneration() {
+	// maps: an m_maps change (false: a locked byte write). Counted per kind with the cache on.
+	void BumpMapGeneration(bool maps) {
 		m_map_generation.fetch_add(1, std::memory_order_release);
 		std::atomic_thread_fence(std::memory_order_release);
+		if (SparseCopyCacheMode() != 0) {
+			(maps ? m_map_bumps : m_byte_bumps).fetch_add(1, std::memory_order_relaxed);
+		}
 	}
+
+public:
+	void BumpCounts(uint64_t* maps, uint64_t* bytes) const {
+		*maps  = m_map_bumps.load(std::memory_order_relaxed);
+		*bytes = m_byte_bumps.load(std::memory_order_relaxed);
+	}
+
+private:
 
 	bool TryReadBackingCached(uint64_t vaddr, void* data, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -738,6 +762,8 @@ private:
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
 	std::atomic<uint64_t>        m_map_generation {0};
+	std::atomic<uint64_t>        m_map_bumps {0};  // KYTY_SPARSE_COPY_CACHE != 0 only
+	std::atomic<uint64_t>        m_byte_bumps {0}; // KYTY_SPARSE_COPY_CACHE != 0 only
 };
 
 class GuestAddressSpace {
@@ -808,12 +834,17 @@ public:
 		});
 	}
 
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-	void SparseCopyCounts(uint64_t* checked, uint64_t* locked) const {
-		*checked = m_sparse_checked.load(std::memory_order_relaxed);
-		*locked  = m_sparse_locked.load(std::memory_order_relaxed);
+	// Nothing (all zero) with KYTY_SPARSE_COPY_CACHE off.
+	[[nodiscard]] SparseCopyStats GetSparseCopyStats() const {
+		SparseCopyStats stats {};
+		stats.mode        = GuestBackingStore::SparseCopyCacheMode();
+		stats.checked     = m_sparse_checked.load(std::memory_order_relaxed);
+		stats.locked      = m_sparse_locked.load(std::memory_order_relaxed);
+		stats.stale_bytes = m_sparse_stale_bytes.load(std::memory_order_relaxed);
+		stats.stale_maps  = m_sparse_stale_maps.load(std::memory_order_relaxed);
+		m_backing->BumpCounts(&stats.map_bumps, &stats.byte_bumps);
+		return stats;
 	}
-#endif
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	[[nodiscard]] bool OverlapsOwned(uint64_t vaddr, uint64_t size) {
@@ -911,7 +942,8 @@ public:
 		    GuestBackingStore::SparseCopyCacheMode() != 0) {
 			uint64_t generation     = 0;
 			uint64_t backing_offset = 0;
-			if (m_backing->TryCopyCached(vaddr, data, size, &generation, &backing_offset)) {
+			int      stale          = 0;
+			if (m_backing->TryCopyCached(vaddr, data, size, &generation, &backing_offset, &stale)) {
 				if (GuestBackingStore::SparseCopyCacheMode() == 2) {
 					// Same lock order as the locked path: address space, then backing store.
 					EXIT_IF(!Owns(vaddr, size));
@@ -919,18 +951,15 @@ public:
 					const auto check = m_backing->CheckCopyTranslation(vaddr, size, generation,
 					                                                   backing_offset);
 					EXIT_IF(check == 0 || (check == 1 && OverlapsPrivateUnlocked(vaddr, size)));
-					const auto n = m_sparse_checked.fetch_add(1, std::memory_order_relaxed) + 1;
-					if ((n & 0xfffff) == 0) {
-						std::printf("KYTY_SPARSE_COPY_CACHE=2: %" PRIu64 " lock-free copies checked, %" PRIu64
-						     " locked\n",
-						     n, m_sparse_locked.load(std::memory_order_relaxed));
-						std::fflush(stdout);
-					}
+					m_sparse_checked.fetch_add(1, std::memory_order_relaxed);
 				}
 				return true;
 			}
 			if (GuestBackingStore::SparseCopyCacheMode() == 2) {
 				m_sparse_locked.fetch_add(1, std::memory_order_relaxed);
+				if (stale != 0) {
+					(stale == 1 ? m_sparse_stale_bytes : m_sparse_stale_maps).fetch_add(1, std::memory_order_relaxed);
+				}
 			}
 		}
 		// With the cache on, a miss also skips the lock Owns takes (m_owned is constant).
@@ -1525,4 +1554,6 @@ private:
 	GuestBackingStore*                         m_backing     = nullptr;
 	std::atomic<uint64_t>                      m_sparse_checked {0}; // KYTY_SPARSE_COPY_CACHE=2 only
 	std::atomic<uint64_t>                      m_sparse_locked {0};
+	std::atomic<uint64_t>                      m_sparse_stale_bytes {0}; // part of locked, mode 2 only
+	std::atomic<uint64_t>                      m_sparse_stale_maps {0};
 };
