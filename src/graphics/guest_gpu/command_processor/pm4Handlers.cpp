@@ -1290,13 +1290,13 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 }
 
 // A flip block: the tag (flip mode, signed 5-bit buffer index) and bus, the flip argument
-// written to USERDATA_3, then an end-of-pipe RELEASE_MEM with a GL2 writeback whose interrupt
-// carries the port.
-static uint32_t CpFlip(CommandProcessor& cp, const uint32_t* block, uint32_t remaining_dw) {
+// written to USERDATA_3, then a RELEASE_MEM with a GL2 writeback whose interrupt carries the port.
+static uint32_t CpFlip(CommandProcessor& cp, uint32_t user_data_r, const uint32_t* block,
+                       uint32_t remaining_dw) {
 	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(remaining_dw < Pm4::FLIP_PACKET_DW ||
-	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u) ||
+	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, user_data_r) ||
 	                     block[9] != KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u));
 
 	const auto tag = block[1];
@@ -1346,11 +1346,14 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
 	// Fork: ProcessPm4 drains the CP pipeline before every block Pm4::IsFlipBlock names.
-	if (Pm4::IsFlipBlock(cmd_id, buffer)) {
-		return (buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_FLIP ? CpFlip(cp, buffer, dw)
-		                                                          : CpWaitFlipDone(cp, buffer, dw);
+	// Driver user data has R = 1; a compute queue's flip has R = 0.
+	if (Pm4::IsFlipBlock(cmd_id, buffer, cp.IsAsyncComputeQueue())) {
+		return (buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_FLIP
+		           ? CpFlip(cp, KYTY_PM4_R(cmd_id), buffer, dw)
+		           : CpWaitFlipDone(cp, buffer, dw);
 	}
-	if (KYTY_PM4_R(cmd_id) == 1u && buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+	if ((KYTY_PM4_R(cmd_id) == 1u || cp.IsAsyncComputeQueue()) &&
+	    buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
 		if ((buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_RESET_QUEUE) {
 			cp.ResetQueue(buffer[1]);
 			return KYTY_PM4_LEN(cmd_id) - 1u;
