@@ -143,14 +143,15 @@ ImageHeap::~ImageHeap() {
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
-	// KYTY_CP_PIPELINE: a pipelined lookup that needs the heap runs its draw on the GPU thread.
-	CpPipeline::NoteHeapAcquire();
 	if (!m_context.GetGraphics().null_descriptor_enabled) return false;
 	const auto size = request.size & ~uint64_t {3};
 	if (request.count == 0u || request.step == 0u ||
 	    ((request.base | request.first | request.step) & 3u) != 0u) {
 		return false;
 	}
+	// KYTY_CP_PIPELINE: a pipelined lookup that needs the heap runs its draw on the GPU thread.
+	// Only after the stateless refusals, so a declined lookup stays pipelined; before m_memories.
+	CpPipeline::NoteHeapAcquire();
 	auto memory = std::ranges::find_if(
 	    m_memories, [&](const auto& candidate) { return candidate->base == request.base; });
 	// A table follows its descriptor's size, as the first program of a draw acquires it.
