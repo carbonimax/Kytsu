@@ -35,6 +35,12 @@ constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
 constexpr int32_t DEFAULT_USER_ID           = 1000;
+// Tessellation patches are drawn by default, except on macOS until MoltenVK is validated with them.
+#if defined(__APPLE__)
+constexpr bool DEFAULT_TESSELLATION = false;
+#else
+constexpr bool DEFAULT_TESSELLATION = true;
+#endif
 
 constexpr int     MAX_PLAYERS         = 4;
 constexpr int32_t PLAYER_USER_ID_STEP = 0x100;
@@ -98,7 +104,7 @@ struct ConfigOptions {
 	bool                   readback_tiled_images       = false;
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
-	bool                   tessellation_enabled        = true;
+	bool                   tessellation_enabled        = DEFAULT_TESSELLATION;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
 	bool                   lod_stats_enabled           = false;

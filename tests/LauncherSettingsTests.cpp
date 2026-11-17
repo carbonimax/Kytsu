@@ -31,13 +31,14 @@ int main(int argc, char* argv[]) {
 		out.ReadSettings(&settings);
 	};
 	Configuration defaults;
-	Check(defaults.shader_cache_enabled && defaults.tessellation_enabled, "shader store and tessellation on by default");
+	constexpr bool tess = Config::DEFAULT_TESSELLATION; // off on macOS
+	Check(defaults.shader_cache_enabled && defaults.tessellation_enabled == tess, "shader store and tessellation defaults");
 	Configuration unversioned;
 	read("unversioned.ini", -1, unversioned);
-	Check(unversioned.shader_cache_enabled && unversioned.tessellation_enabled, "no settings_version: both migrations");
+	Check(unversioned.shader_cache_enabled && unversioned.tessellation_enabled == tess, "no settings_version: both migrations");
 	Configuration version1;
 	read("version1.ini", 1, version1);
-	Check(!version1.shader_cache_enabled && version1.tessellation_enabled, "settings_version=1: tessellation on, shader store kept off");
+	Check(!version1.shader_cache_enabled && version1.tessellation_enabled == tess, "settings_version=1: tessellation migrated, shader store kept off");
 	Configuration version2;
 	read("version2.ini", 2, version2);
 	Check(!version2.shader_cache_enabled && !version2.tessellation_enabled, "settings_version=2: both choices kept");

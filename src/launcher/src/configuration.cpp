@@ -182,7 +182,7 @@ void Configuration::ReadSettings(QSettings* s) {
 	if (version < 1) {
 		shader_cache_enabled = true;
 	}
-	if (version < 2) {
+	if (version < 2 && Config::DEFAULT_TESSELLATION) {
 		tessellation_enabled = true;
 	}
 	name               = s->value("name").toString();

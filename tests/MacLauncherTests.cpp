@@ -53,7 +53,7 @@ int main(int argc, char* argv[]) {
 	Configuration upgraded;
 	upgraded.ReadSettings(&unversioned);
 	Check(defaults.shader_cache_enabled && upgraded.shader_cache_enabled, "settings without settings_version get the shader store on");
-	Check(defaults.tessellation_enabled && upgraded.tessellation_enabled, "settings without settings_version get tessellation on");
+	Check(!defaults.tessellation_enabled && !upgraded.tessellation_enabled, "tessellation stays off by default on macOS");
 	Configuration changed;
 	changed.mac_srt_readback_elide = false;
 	changed.mac_materialize_compiled = false;
