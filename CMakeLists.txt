@@ -759,6 +759,7 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
+target_link_libraries(gpu_blit_shader_tests Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # GoogleTest from the fmt submodule, for upstream tests written against gtest.
