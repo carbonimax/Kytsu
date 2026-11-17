@@ -2736,6 +2736,77 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// KYTY_VMA_MEMO answers against the locked map search, at probes around the page boundary. The
+// first memo call of each step comes right after an edit made while the memo held the old ranges.
+static void CheckVmaMemoStep(const char* test, int mode, uint64_t base, const char* step) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t page        = SceKernelPageSize;
+	const uint64_t     probes[][2] = {{base, 0x100},
+	                                  {base + page - 0x80, 0x100},
+	                                  {base + page, 0x10},
+	                                  {base + 2 * page - 0x10, 0x10}};
+	for (const auto& probe: probes) {
+		TestSetVmaMemoMode(0);
+		const bool known = IsVirtualAddressKnown(probe[0]);
+		const auto clamp = TryClampRangeSize(probe[0], probe[1]);
+		TestSetVmaMemoMode(mode);
+		for (int pass = 0; pass < 2; pass++) {
+			Check(test, IsVirtualAddressKnown(probe[0]) == known,
+			      std::string(step) + ": memo IsVirtualAddressKnown differs from the map");
+			Check(test, TryClampRangeSize(probe[0], probe[1]) == clamp,
+			      std::string(step) + ": memo ClampRangeSize differs from the map");
+		}
+	}
+}
+
+void TestVmaMemoInvalidation() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "VmaMemoInvalidation";
+	constexpr uint64_t page = SceKernelPageSize;
+
+	for (int mode = 1; mode <= 2; mode++) {
+		void* reserve = nullptr;
+		CheckOk(test, KernelReserveVirtualRange(&reserve, 2 * page, 0, page),
+		        "KernelReserveVirtualRange");
+		const auto base = reinterpret_cast<uint64_t>(reserve);
+		void*      addr = reserve;
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&addr, 2 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "vma_memo"),
+		        "KernelMapNamedFlexibleMemory");
+		CheckVmaMemoStep(test, mode, base, "mapped");
+
+		const auto hits = TestVmaMemoHits();
+		Check(test, ClampRangeSize(base, 0x100) == 0x100 && TestVmaMemoHits() == hits + 1,
+		      "a repeated lookup was not answered by the memo");
+
+		CheckOk(test, KernelMunmap(base + page, page), "KernelMunmap(second page)");
+		CheckVmaMemoStep(test, mode, base, "unmapped");
+		Check(test, TryClampRangeSize(base + page - 0x80, 0x100) == 0x80,
+		      "memo kept the unmapped page");
+
+		const auto before_protect = TestVmaMemoHits();
+		CheckOk(test, KernelMprotect(reinterpret_cast<void*>(base), page, SceKernelProtCpuRead),
+		        "KernelMprotect");
+		Check(test, ClampRangeSize(base, 0x100) == 0x100 && TestVmaMemoHits() == before_protect,
+		      "memo answered across a protect");
+		CheckVmaMemoStep(test, mode, base, "protected");
+
+		addr = reinterpret_cast<void*>(base + page);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&addr, page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "vma_memo"),
+		        "KernelMapNamedFlexibleMemory(remap)");
+		CheckVmaMemoStep(test, mode, base, "remapped");
+
+		CheckOk(test, KernelMunmap(base, 2 * page), "KernelMunmap");
+		CheckVmaMemoStep(test, mode, base, "released");
+	}
+	TestSetVmaMemoMode(-1);
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMunmapGpuRuns() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "MunmapGpuRuns";
@@ -5927,6 +5998,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestVmaMemoInvalidation);
 	RunTest(TestMunmapGpuRuns);
 	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
