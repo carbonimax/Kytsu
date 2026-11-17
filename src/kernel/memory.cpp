@@ -961,7 +961,7 @@ struct SrtSyncLog {
 	std::mutex                            mutex; // walker syncs run on the GPU thread; kept simple
 	FILE*                                 file  = nullptr;
 	uint64_t                              limit = 64, skip = 0, every = 1;
-	uint64_t                              seen = 0, changed = 0, lines = 0;
+	uint64_t                              seen = 0, changed = 0, lines = 0, clean_after_drain = 0;
 	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 	// Per DWORD address: synchronized reads, of which the download changed the value.
 	std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> words;
@@ -999,8 +999,16 @@ bool TryReadWalkerBacking(uint64_t vaddr, uint32_t* value, bool dirty, const cha
 	}
 	auto&           log = SyncLog();
 	std::lock_guard lock(log.mutex);
+	// The drain TryReadBufferBacking does, done first: queued CP work (WRITE_DATA, DMA, fills) may write
+	// the backing, and the compare below would count that as shader writes.
+	Graphics::CpPipeline::Drain();
+	auto& buffers = GetGpuResources().GetBufferCache();
+	if (!buffers.HasGpuDirtyBytes(vaddr, sizeof(*value))) {
+		log.clean_after_drain++;
+		return TryReadBufferBacking(vaddr, value, sizeof(*value));
+	}
 	// Before the read: it cleans the dirty range.
-	const auto info      = GetGpuResources().GetBufferCache().DescribeGpuDirty(vaddr);
+	const auto info      = buffers.DescribeGpuDirty(vaddr);
 	uint32_t   before    = 0;
 	const bool before_ok = TryReadBacking(vaddr, &before, sizeof(before));
 	const auto n         = log.seen++;
@@ -1079,8 +1087,9 @@ bool TryReadWalkerBacking(uint64_t vaddr, uint32_t* value, bool dirty, const cha
 		std::fprintf(log.file, "none");
 	}
 	std::fprintf(log.file,
-	             " word_seen=%u word_changes=%u seen=%" PRIu64 " changed=%" PRIu64 " ok=%d\n", word_stats.first,
-	             word_stats.second, log.seen, log.changed, ok ? 1 : 0);
+	             " word_seen=%u word_changes=%u seen=%" PRIu64 " changed=%" PRIu64 " clean_after_drain=%" PRIu64
+	             " ok=%d\n",
+	             word_stats.first, word_stats.second, log.seen, log.changed, log.clean_after_drain, ok ? 1 : 0);
 	std::fflush(log.file);
 	return ok;
 }
