@@ -235,6 +235,16 @@ static void CacheDmaBases(RenderContext& context, const ShaderStageRuntime& stag
 	const auto& flat = stage.resources->flattened_srt;
 	const auto& user = stage.resources->user_data;
 	for (const auto [low, high]: info.address_bases) back(flat[low], flat[high]);
+	// KYTY_USER_ADDRESS_BASES: off by default on Apple, a suspect in a macOS slowdown (PR #143).
+	static const bool user_bases = [] {
+		const char* value = std::getenv("KYTY_USER_ADDRESS_BASES");
+#if defined(__APPLE__)
+		return value != nullptr && value[0] != '0';
+#else
+		return value == nullptr || value[0] != '0';
+#endif
+	}();
+	if (!user_bases) return;
 	for (const auto [low, high]: info.user_address_bases) back(user[low], user[high]);
 }
 
