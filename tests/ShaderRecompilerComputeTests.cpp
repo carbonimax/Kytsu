@@ -7570,7 +7570,9 @@ public:
 
   void CheckTextureMetadataResize() {
     constexpr const char *name = "TextureMetadataResize";
-    constexpr uint64_t page = 0x4000;
+    // Direct memory: the depth upload reads the guest backing, which runtime memory lacks.
+    constexpr uintptr_t base = 0x0000000239000000ull;
+    constexpr uint64_t page = 0x10000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -7578,9 +7580,18 @@ public:
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
-    const auto base = LibKernel::Memory::AllocateRuntimeMemory(
-        0, page, Common::VirtualMemory::Mode::ReadWrite, name);
-    Require(name, "allocation", base != 0, "guest allocation failed");
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), page, page, 0,
+                &direct_offset) == 0,
+            "metadata-resize direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, page, 0x3, 0x10,
+                                                           direct_offset, page) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "metadata-resize fixed direct-memory mapping failed");
     context.MapMemory(base, page);
     auto &cache = context.GetTextureCache();
     auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eD32Sfloat,
@@ -7607,7 +7618,11 @@ public:
     }
     context.UnmapMemory(base, page);
     scheduler.Finish();
-    Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, page), "guest release failed");
+    Require(name, "unmap direct backing", Libs::LibKernel::Memory::KernelMunmap(base, page) == 0,
+            "metadata-resize mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, page) == 0,
+            "metadata-resize allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
