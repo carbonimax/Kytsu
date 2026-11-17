@@ -83,6 +83,7 @@ private:
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
 		bool                      yielded         = false;
+		uint64_t                  cmdbuf_id       = 0; // KYTY_CMDBUF_PROF, kept across a yield
 	};
 
 	void              Enqueue(Submission submission);

@@ -1005,6 +1005,7 @@ void GuestGpu::ThreadRun(void* data) {
 				    Common::DebugCounters::Counter::GpuThreadBusyNs);
 				CpSplitProf::BusyBegin();
 				CpPipeline::Drain();
+				if (PerfStats::CmdBufProfEnabled()) PerfStats::t_cmdbuf.store(0, std::memory_order_relaxed);
 				command();
 				CpSplitProf::BusyEnd();
 			}
@@ -1057,6 +1058,16 @@ bool GuestGpu::Process(Submission& submission) {
 
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
 	CpPipeline::Drain();
+	if (PerfStats::CmdBufProfEnabled()) {
+		static uint64_t next_cmdbuf = 0; // GPU thread only
+		if (submission.cmdbuf_id == 0) submission.cmdbuf_id = ++next_cmdbuf;
+		// After the drain: no queued record of the previous submission reads the new id.
+		PerfStats::t_cmdbuf.store(submission.cmdbuf_id, std::memory_order_relaxed);
+		// B time id queue type resumed(1/0) dwords
+		PerfStats::CompileLogLine("B %" PRIu64 " %" PRIu64 " %u %d %d %zu", PerfStats::SteadyUs(),
+		                          submission.cmdbuf_id, submission.queue_id, static_cast<int>(submission.type),
+		                          submission.started ? 1 : 0, submission.commands.size());
+	}
 	// After the drain: the previous slice's guest reads are attributed to its own submission.
 	if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
 		const uint32_t queue = submission.queue_id == 0 ? 0 : ComputeQueueBase + submission.queue_id - 1;

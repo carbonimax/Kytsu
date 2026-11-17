@@ -2243,9 +2243,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto feedback = pending != nullptr ? pending->feedback : LastPipelineCacheFeedback();
 	if (PerfStats::CompileLogEnabled()) {
 		// P time driver_hit(1/0, -1 unknown) us vs_id ps_id (a pending one: us = the wait, W line)
-		PerfStats::CompileLogLine("P %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64, diag_begin,
-		                          feedback.valid ? (feedback.hit ? 1 : 0) : -1,
-		                          PerfStats::SteadyUs() - diag_begin, vs_id, ps_id);
+		//   [KYTY_CMDBUF_PROF: submission id]
+		const int      hit = feedback.valid ? (feedback.hit ? 1 : 0) : -1;
+		const uint64_t us  = PerfStats::SteadyUs() - diag_begin;
+		if (PerfStats::CmdBufProfEnabled()) {
+			PerfStats::CompileLogLine("P %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64, diag_begin,
+			                          hit, us, vs_id, ps_id, PerfStats::t_cmdbuf.load(std::memory_order_relaxed));
+		} else {
+			PerfStats::CompileLogLine("P %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64, diag_begin, hit, us,
+			                          vs_id, ps_id);
+		}
 		if (pending != nullptr) {
 			PerfStats::CompileLogLine("W %" PRIu64, diag_begin);
 		}
@@ -2407,11 +2414,18 @@ void PipelineCache::LogSkip(PendingPipeline& job, bool may_skip) {
 		}
 	}
 	// A (first skip) / Q (every 5 guest frames) / X (past the cap, once a frame): time key_hash
-	//   age_frames queue_pos(-1: not queued) queue_len state skip_miss
-	PerfStats::CompileLogLine("%c %" PRIu64 " %zx %" PRIu64 " %" PRId64 " %zu %u %d",
-	                          !may_skip ? 'X' : first ? 'A' : 'Q', PerfStats::SteadyUs(),
-	                          GraphicsPipelineKeyHash {}(job.key), age, pos, len,
-	                          job.state.load(std::memory_order_acquire), job.skip_miss ? 1 : 0);
+	//   age_frames queue_pos(-1: not queued) queue_len state skip_miss [KYTY_CMDBUF_PROF: submission id]
+	const char     kind  = !may_skip ? 'X' : first ? 'A' : 'Q';
+	const auto     hash  = GraphicsPipelineKeyHash {}(job.key);
+	const uint32_t state = job.state.load(std::memory_order_acquire);
+	if (PerfStats::CmdBufProfEnabled()) {
+		PerfStats::CompileLogLine("%c %" PRIu64 " %zx %" PRIu64 " %" PRId64 " %zu %u %d %" PRIu64, kind,
+		                          PerfStats::SteadyUs(), hash, age, pos, len, state, job.skip_miss ? 1 : 0,
+		                          PerfStats::t_cmdbuf.load(std::memory_order_relaxed));
+	} else {
+		PerfStats::CompileLogLine("%c %" PRIu64 " %zx %" PRIu64 " %" PRId64 " %zu %u %d", kind, PerfStats::SteadyUs(),
+		                          hash, age, pos, len, state, job.skip_miss ? 1 : 0);
+	}
 }
 
 void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {

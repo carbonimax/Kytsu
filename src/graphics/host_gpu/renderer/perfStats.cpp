@@ -157,6 +157,14 @@ bool CompileLogEnabled() noexcept {
 	return enabled;
 }
 
+bool CmdBufProfEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CMDBUF_PROF");
+		return Enabled() && CompileLogEnabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
 void CompileLogLine(const char* format, ...) noexcept {
 	auto& log = GetCompileLog();
 	if (log.file == nullptr) {

@@ -205,6 +205,13 @@ void NoteFlipArg(int64_t arg) noexcept;
 [[nodiscard]] bool     CompileLogEnabled() noexcept;
 [[nodiscard]] uint64_t SteadyUs() noexcept;
 void                   CompileLogLine(const char* format, ...) noexcept;
+// KYTY_CMDBUF_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1 and KYTY_COMPILE_LOG): each
+// guest submission (a queued command buffer with its indirect buffers) gets an id, logged in a B line
+// at each start or resume, and the P and A/Q/X lines end with the id being processed (0: none).
+[[nodiscard]] bool CmdBufProfEnabled() noexcept;
+// KYTY_CMDBUF_PROF: id of the submission the GPU thread processes, stored after its CP pipeline drain,
+// so the CP back thread (which runs only records of the current submission) reads its draws' id too.
+inline std::atomic<uint64_t> t_cmdbuf {0};
 
 // Draws and dispatches recorded (GPU thread, and the KYTY_CP_PIPELINE back thread), always counted:
 // KYTY_IDLE_SUBMIT reads it (CommandScheduler::IdleSubmitDue).
