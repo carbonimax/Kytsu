@@ -200,7 +200,8 @@ void CheckRcp(VulkanHarness &vulkan) {
 }
 
 // v_sin_f32 / v_cos_f32: zero and infinite results exact, NaN a NaN; the others within 2^-10 (relative) of
-// RDNA 2 when the host is that accurate on the small positive inputs, as the source table checks it.
+// RDNA 2 when the host is that accurate on the small positive inputs, as the source table checks it, else
+// within the Vulkan bound of Sin (2^-11 absolute), so a wrong reduction still fails on a coarse host.
 void CheckSinCos(VulkanHarness &vulkan) {
   constexpr const char *name = "HardwareTableSinCosF32";
   std::vector<u32> inputs;
@@ -217,9 +218,12 @@ void CheckSinCos(VulkanHarness &vulkan) {
     if (x > 0.0f && x < 0.5f) accurate = accurate && within(got[0][i], kSinCos[i].sin) && within(got[1][i], kSinCos[i].cos);
   }
   if (!accurate) {
-    std::printf("[compute] %s: host sin/cos not within 2^-10 of RDNA 2 on small positive inputs, only zero, "
-                "infinite and NaN results checked\n", name);
+    std::printf("[compute] %s: host sin/cos not within 2^-10 of RDNA 2 on small positive inputs, the other "
+                "finite results checked against the Vulkan bound (2^-11 absolute)\n", name);
   }
+  const auto within_vulkan = [](u32 actual, u32 expected) {
+    return std::abs(double(std::bit_cast<float>(actual)) - double(std::bit_cast<float>(expected))) <= 0x1p-11;
+  };
   u32 exact = 0, failed = 0;
   for (size_t i = 0; i < kSinCos.size(); i++) {
     for (u32 k = 0; k < 2; k++) {
@@ -230,11 +234,14 @@ void CheckSinCos(VulkanHarness &vulkan) {
       // Any NaN for a NaN (the payload is the host's) unless every bit is required.
       const bool nan = std::isnan(value) && !ExactRequired();
       exact += have == want ? 1 : 0;
-      const bool ok = nan ? std::isnan(std::bit_cast<float>(have)) : bits ? have == want : !accurate || within(have, want);
+      const bool ok = nan    ? std::isnan(std::bit_cast<float>(have))
+                      : bits ? have == want
+                             : accurate ? within(have, want) : within_vulkan(have, want);
       if (!ok) {
         // Every failing result, then one failure: the run shows the whole gap.
         std::printf("[compute] %s: %s of %#010x is %#010x, RDNA 2 gives %#010x (%s)\n", name,
-                    k == 0 ? "v_sin_f32" : "v_cos_f32", kSinCos[i].x, have, want, bits ? "bits" : "2^-10");
+                    k == 0 ? "v_sin_f32" : "v_cos_f32", kSinCos[i].x, have, want,
+                    bits ? "bits" : accurate ? "2^-10" : "2^-11 absolute");
         failed++;
       }
     }
