@@ -1168,6 +1168,13 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+	if(BUILD_TESTING)
+		add_test(NAME launcher_settings COMMAND $<TARGET_FILE:launcher_settings_tests>)
+		# Windows: Qt's DLLs are not next to the test.
+		set_tests_properties(launcher_settings PROPERTIES
+		                     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
+		add_dependencies(kyty_tests launcher_settings_tests)
+	endif()
 
 	if(LINUX)
 		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
