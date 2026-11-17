@@ -753,12 +753,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (access == GpuAccess::Read && SrtBackingReadsEnabled()) {
 			if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
 			        info->exception_address)) {
-				uint32_t value = 0;
-				if (Libs::LibKernel::Memory::TryReadBufferBacking(
-				        Loader::X64InstructionEmulator::LoadBaseR10(info->native_context), &value,
-				        sizeof(value))) {
+				uint32_t   value   = 0;
+				const auto address = Loader::X64InstructionEmulator::LoadBaseR10(info->native_context);
+				// Tested before the read, which leaves the bytes clean (as ReadWalkerBacking does).
+				const bool synced = Libs::Graphics::ShaderRecompiler::IR::WalkStatsEnabled() &&
+				                    Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(value));
+				if (Libs::LibKernel::Memory::TryReadBufferBacking(address, &value, sizeof(value))) {
 					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
-					Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(true);
+					Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(true, synced);
 					Libs::Graphics::ShaderRecompiler::IR::SetProtectedLoadReader(&ReadWalkerBacking);
 					Libs::Graphics::ShaderRecompiler::IR::NoteProtectedLoad(
 					    Loader::X64InstructionEmulator::LoadBaseR10(info->native_context));

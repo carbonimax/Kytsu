@@ -1739,9 +1739,10 @@ void NoteProtectedLoad(uint64_t address) noexcept {
 	g_protected_pages[page & (ProtectedPageSlots - 1u)].store(page, std::memory_order_relaxed);
 }
 
-void NoteWalkerFaultRead(bool backing) noexcept {
+void NoteWalkerFaultRead(bool backing, bool synced) noexcept {
 	if (g_walk_stats.load(std::memory_order_relaxed)) {
 		(backing ? g_walk_backing_reads : g_walk_fault_reads).fetch_add(1, std::memory_order_relaxed);
+		if (synced) g_protected_synced.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 

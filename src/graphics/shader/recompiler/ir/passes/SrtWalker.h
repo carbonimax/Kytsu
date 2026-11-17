@@ -112,7 +112,9 @@ void SetProtectedLoadReader(ProtectedLoadReader reader) noexcept;
 void NoteProtectedLoad(uint64_t address) noexcept;
 void      EnableWalkStats() noexcept;
 [[nodiscard]] bool WalkStatsEnabled() noexcept;
-void      NoteWalkerFaultRead(bool backing) noexcept;
+// synced: the read synchronized GPU-written bytes first; counted in protected_synced like a
+// ProtectedLoad that did, so protected_synced covers every walker synchronization.
+void      NoteWalkerFaultRead(bool backing, bool synced = false) noexcept;
 WalkStats TakeWalkStats() noexcept;
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
