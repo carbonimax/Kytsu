@@ -130,6 +130,7 @@ public:
 	bool                   sync_raw_image_buffers      = false;
 	int                    flush_draws                 = 0;
 	bool                   tessellation_enabled        = false;
+	bool                   recommended_options         = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   shader_cache_enabled        = true;
 	bool                   relaxed_shader_float        = false;
@@ -194,6 +195,7 @@ public:
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		flush_draws                 = other.flush_draws;
 		tessellation_enabled        = other.tessellation_enabled;
+		recommended_options         = other.recommended_options;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		relaxed_shader_float        = other.relaxed_shader_float;
 		shader_cache_enabled        = other.shader_cache_enabled;

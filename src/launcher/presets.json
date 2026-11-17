@@ -1,0 +1,9 @@
+{
+	"_comment": "Recommended options for the launcher's 'Use recommended options' box. env names must start with KYTY_ or MVK_; env values and args are plain strings without % \" ^ ! or control characters. Entries under titles are keyed by title ID and win over global. The dialog settings and variables already set in the environment win over both. Set KYTY_PRESETS to use a file of your own: this one is overwritten by builds and installs.",
+	"version": 1,
+	"global": {
+		"env": {},
+		"args": []
+	},
+	"titles": {}
+}

@@ -47,6 +47,39 @@ target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
+add_executable(launcher_presets_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherPresetsTests.cpp"
+	src/presets.cpp
+)
+target_link_libraries(launcher_presets_tests Qt6::Core)
+target_include_directories(launcher_presets_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+if(TARGET kyty_tests)
+	add_dependencies(kyty_tests launcher_presets_tests)
+endif()
+if(BUILD_TESTING)
+	add_test(NAME launcher_presets COMMAND launcher_presets_tests)
+	if(WIN32)
+		# The test runs before windeployqt puts Qt6Core.dll next to it.
+		set_tests_properties(launcher_presets PROPERTIES
+			ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
+	endif()
+endif()
+
+# Shipped presets: global section only. Builds and installs overwrite this copy (see KYTY_PRESETS).
+if(APPLE)
+	set(launcher_presets_dir "$<TARGET_BUNDLE_CONTENT_DIR:launcher>/Resources")
+	set(launcher_presets_install "KytyPS5.app/Contents/Resources")
+else()
+	set(launcher_presets_dir "$<TARGET_FILE_DIR:launcher>")
+	set(launcher_presets_install ".")
+endif()
+add_custom_command(TARGET launcher POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${launcher_presets_dir}"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/presets.json"
+		"${launcher_presets_dir}/presets.json"
+	VERBATIM)
+install(FILES presets.json DESTINATION "${launcher_presets_install}")
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)
