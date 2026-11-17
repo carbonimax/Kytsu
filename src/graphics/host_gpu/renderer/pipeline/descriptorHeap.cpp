@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 
 namespace Libs::Graphics {
 namespace {
@@ -48,6 +49,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.sets.data());
 	if (result == vk::Result::eSuccess) {
 		batch.size = DescriptorSetBatch;
+		PerfStats::Add(PerfStats::Counter::DescSetAllocs, DescriptorSetBatch);
 		return batch.sets[--batch.size];
 	}
 	EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
@@ -61,6 +63,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		           vk::Result::eSuccess) {
 			target.size++;
 		}
+		PerfStats::Add(PerfStats::Counter::DescSetAllocs, target.size);
 		return target.size != 0;
 	};
 	allocate.descriptorSetCount = 1;
@@ -68,11 +71,13 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		return batch.sets[--batch.size];
 	}
 
+	PerfStats::Add(PerfStats::Counter::DescPoolFull, 1);
 	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();
 		EXIT_IF(m_graphics.device.resetDescriptorPool(m_current_pool, {}) != vk::Result::eSuccess);
+		PerfStats::Add(PerfStats::Counter::DescPoolResets, 1);
 	} else {
 		CreateDescriptorPool();
 	}
@@ -91,6 +96,7 @@ void DescriptorHeap::CreateDescriptorPool() {
 	create.pPoolSizes    = DescriptorPoolSizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
+	PerfStats::Add(PerfStats::Counter::DescPoolCreates, 1);
 }
 
 } // namespace Libs::Graphics

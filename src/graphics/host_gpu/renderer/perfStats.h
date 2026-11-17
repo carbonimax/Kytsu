@@ -158,6 +158,12 @@ enum class Counter : uint32_t {
 	StagingWriteNs,      // guest bytes written into the upload staging ring (any thread)
 	StagingWriteBytes,
 	StagingWriteCount,
+	// Descriptor heaps ("PERF descheap" line): sets allocated, pools recycled once the GPU is done
+	// with them, allocations that found the current pool full, and new pools.
+	DescSetAllocs,
+	DescPoolResets,
+	DescPoolFull,
+	DescPoolCreates,
 	Count
 };
 
