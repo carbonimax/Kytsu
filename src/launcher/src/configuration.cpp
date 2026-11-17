@@ -181,10 +181,13 @@ void Configuration::WriteSettings(QSettings* s) const {
 
 void Configuration::ReadSettings(QSettings* s) {
 	ReadGameSettingsValues(*s);
-	if (s->value("settings_version", 0).toInt() < 1) {
-		// Saved before the shader store became the default: the stored false was the old default,
-		// not a choice.
+	// Saved before these became the defaults: the stored false was the old default, not a choice.
+	const int version = s->value("settings_version", 0).toInt();
+	if (version < 1) {
 		shader_cache_enabled = true;
+	}
+	if (version < 2) {
+		tessellation_enabled = true;
 	}
 	name               = s->value("name").toString();
 	basedir            = s->value("basedir").toString();
