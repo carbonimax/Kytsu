@@ -1776,15 +1776,8 @@ static void ColorAttachmentPassBarrier(vk::CommandBuffer vk_buffer) {
 
 // KYTY_ASYNC_PIPELINE: buffer, image or by-address writes, whose effects outlive this frame's colors.
 static bool DrawWritesAnything(const DrawRenderState& state) {
-	const auto writes = [](const ShaderStageRuntime& stage) {
-		// Conservative: a written buffer counts even when its descriptor is empty.
-		const auto& info    = stage.program->info;
-		const auto  written = [](const auto& resource) { return resource.written || resource.atomic; };
-		return stage.program->has_address_writes || std::ranges::any_of(info.buffers, written) ||
-		       std::ranges::any_of(info.images, written);
-	};
-	return std::ranges::any_of(state.VertexStages(), [&](const auto& vs) { return writes(vs.stage); }) ||
-	       (state.ps_active && writes(state.ps_input_info.stage));
+	return std::ranges::any_of(state.VertexStages(), [](const auto& vs) { return StageWritesAnything(vs.stage); }) ||
+	       (state.ps_active && StageWritesAnything(state.ps_input_info.stage));
 }
 
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,

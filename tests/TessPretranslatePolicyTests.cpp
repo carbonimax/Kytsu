@@ -22,6 +22,12 @@ static_assert(TessPretranslateDecide(false, false, false, true, false) == T::Inl
 static_assert(TessPretranslateDecide(false, false, false, false, true) == T::Inline);
 // A job still held keeps its draw pending even once stopped (its worker finishes it).
 static_assert(TessPretranslateDecide(true, false, true, true, true) == T::Pending);
+// After a deferred stage of the same draw: a new key is still queued, nothing is taken or inline.
+using Libs::Graphics::TessPretranslatePeek;
+static_assert(TessPretranslatePeek(T::Queue) == T::Queue);
+static_assert(TessPretranslatePeek(T::Ready) == T::Pending);
+static_assert(TessPretranslatePeek(T::Pending) == T::Pending);
+static_assert(TessPretranslatePeek(T::Inline) == T::Pending);
 
 } // namespace
 

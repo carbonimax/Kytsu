@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStore.h"
 
 #include "common/assert.h"
@@ -713,12 +714,16 @@ struct PipelineCache::ProgramCache {
 				                          {static_cast<uint32_t>(options.stage), params.user_data_count,
 				                           lookup_key.code_size});
 				const auto take = ShaderPretranslate::TakeTess(params.hash, pretranslate_words, params.code,
-				                                               options, input_info, translated);
+				                                               options, input_info, translated, tess_deferred);
 				if (take == TessPretranslateTake::Pending || take == TessPretranslateTake::Queue) {
 					tess_deferred = true;
 					return {};
 				}
 				pretranslated = take == TessPretranslateTake::Ready;
+			} else if (tess_defer && tess_stage && tess_deferred) {
+				// The draw is skipped and an earlier stage did not advance the push data cursor: a
+				// translation here would be emitted at the wrong cursor. The next draw does it.
+				return {};
 			}
 		}
 		PerfStats::ScopedTimer recompile_timer(PerfStats::Counter::RecompileNs,
@@ -874,7 +879,11 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::Local)],
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-		return bind(entry->second.permutations.back());
+		const auto handle = bind(entry->second.permutations.back());
+		if (pretranslated && tess_stage && StageWritesAnything(input_info.stage)) {
+			ShaderPretranslate::NoteTessWrites();
+		}
+		return handle;
 	}
 
 	// Reads the plan of a loaded program at its first lookup. Should the store fail to read it
@@ -1986,11 +1995,14 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	// KYTY_TESS_PRETRANSLATE: with skipped tessellation draws (KYTY_ASYNC_TESS), the new LS, HS and DS
 	// programs of a draw go to workers together and the draw is skipped; it then has no vertex program.
-	// shortcut: whether the untranslated stages write memory, and aliased-target passes, are only known
-	// once translated, so such a draw is skipped too until then; check them first if a game needs it.
+	// A draw whose pixel program (translated above) writes memory is not deferred, as the async rules
+	// would not skip it. Aliased-target passes only lose colors, like any skipped draw.
+	// shortcut: only the untranslated LS/HS/DS writes are unknown, so a draw whose stages write is
+	// skipped too until translated ("PERF tesspre writes" counts them); check them first if one does.
 	auto& cache         = *m_program_cache;
 	cache.tess_defer    = may_defer_tess && tess_active && m_async_tess && ShaderPretranslate::TessEnabled() &&
-	                      !command.GetContext().GetOcclusionQueries().Counting();
+	                      !command.GetContext().GetOcclusionQueries().Counting() &&
+	                      !(pixel_active && pixel_info.stage.program != nullptr && StageWritesAnything(pixel_info.stage));
 	cache.tess_deferred = false;
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);

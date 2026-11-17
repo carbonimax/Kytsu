@@ -93,8 +93,8 @@ struct Stats {
 	    queued_at_use {0}, remembered {0},
 	    code_changed {0}, evicted {0}, refills {0}, worker_us {0}, verified {0}, verify_diffs {0}, packed {0},
 	    unpacked_bytes {0}, packed_bytes {0}, pack_us {0}, unpack_us {0};
-	// KYTY_TESS_PRETRANSLATE: TakeTess outcomes.
-	std::atomic<uint64_t> tess_queued {0}, tess_pending {0}, tess_taken {0}, tess_inline {0};
+	// KYTY_TESS_PRETRANSLATE: TakeTess outcomes; `tess_writes`: taken stages that write memory.
+	std::atomic<uint64_t> tess_queued {0}, tess_pending {0}, tess_taken {0}, tess_inline {0}, tess_writes {0};
 };
 
 struct Pool {
@@ -314,16 +314,19 @@ void WorkerMain() {
 	}
 }
 
-// Pool lock held. `first`: ahead of the queue (a skipped draw waits for it).
-void Enqueue(Pool& pool, std::shared_ptr<Job> job, bool first = false) {
+// Pool lock held. Tessellation jobs (a skipped draw waits for them) go ahead of the pixel ones, in
+// draw order among themselves: LS, HS, DS of a draw, older draws first.
+void Enqueue(Pool& pool, std::shared_ptr<Job> job) {
 	if (pool.stopped) {
 		return;
 	}
 	job->order = pool.next_order++;
 	pool.ids.insert(job->id);
 	pool.jobs[job->id] = job;
-	if (first) {
-		pool.queue.push_front(std::move(job));
+	if (job->tess != nullptr) {
+		const auto last_tess = std::find_if(pool.queue.rbegin(), pool.queue.rend(),
+		                                    [](const auto& queued) { return queued->tess != nullptr; });
+		pool.queue.insert(last_tess.base(), std::move(job));
 	} else {
 		pool.queue.push_back(std::move(job));
 	}
@@ -472,7 +475,7 @@ void Remember(uint64_t hash, std::span<const uint32_t> key, std::span<const uint
 
 TessPretranslateTake TakeTess(uint64_t hash, std::span<const uint32_t> key, std::span<const uint32_t> code,
                               const ShaderRecompiler::CompileOptions& options, const ShaderVertexInputInfo& info,
-                              ShaderRecompiler::TranslateResult& out) {
+                              ShaderRecompiler::TranslateResult& out, bool peek) {
 	auto&            pool = GetPool();
 	const auto       id   = XXH3_64bits_withSeed(key.data(), key.size_bytes(), hash);
 	std::unique_lock lock(pool.mutex);
@@ -481,9 +484,15 @@ TessPretranslateTake TakeTess(uint64_t hash, std::span<const uint32_t> key, std:
 	const bool       found = it != pool.jobs.end() && it->second->state != State::Dropped;
 	const bool       held  = found && it->second->hash == hash && std::ranges::equal(it->second->key, key);
 	const auto       job   = held ? it->second : nullptr;
-	const auto       take  = TessPretranslateDecide(held, held && job->state == State::Ready,
+	auto             take  = TessPretranslateDecide(held, held && job->state == State::Ready,
 	                                                held && std::ranges::equal(job->code, code),
 	                                                found || pool.ids.contains(id), pool.stopped);
+	if (peek) {
+		take = TessPretranslatePeek(take);
+		if (take != TessPretranslateTake::Queue) {
+			return take; // nothing taken, dropped or counted
+		}
+	}
 	switch (take) {
 		case TessPretranslateTake::Pending: pool.stats.tess_pending++; return take;
 		case TessPretranslateTake::Inline:
@@ -513,7 +522,7 @@ TessPretranslateTake TakeTess(uint64_t hash, std::span<const uint32_t> key, std:
 			queued->tess->options.back_code         = {};
 			queued->tess->options.input_info.vertex = nullptr;
 			pool.stats.tess_queued++;
-			Enqueue(pool, std::move(queued), true);
+			Enqueue(pool, std::move(queued));
 			return take;
 		}
 		case TessPretranslateTake::Ready: break;
@@ -531,6 +540,10 @@ TessPretranslateTake TakeTess(uint64_t hash, std::span<const uint32_t> key, std:
 	return TessPretranslateTake::Ready;
 }
 
+void NoteTessWrites() noexcept {
+	GetPool().stats.tess_writes++;
+}
+
 void NoteVerify(bool equal) noexcept {
 	auto& pool = GetPool();
 	pool.stats.verified++;
@@ -543,9 +556,9 @@ void Report() {
 	if (TessEnabled()) {
 		const auto& s = GetPool().stats;
 		std::printf("PERF tesspre queued=%" PRIu64 " pending=%" PRIu64 " taken=%" PRIu64 " inline=%" PRIu64
-		            " abandoned=%" PRIu64 " evicted=%" PRIu64 "\n",
+		            " writes=%" PRIu64 " abandoned=%" PRIu64 " evicted=%" PRIu64 "\n",
 		            s.tess_queued.load(), s.tess_pending.load(), s.tess_taken.load(), s.tess_inline.load(),
-		            s.abandoned.load(), s.evicted.load());
+		            s.tess_writes.load(), s.abandoned.load(), s.evicted.load());
 	}
 	if (!Enabled()) {
 		return;

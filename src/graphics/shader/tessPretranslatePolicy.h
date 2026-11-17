@@ -24,6 +24,13 @@ enum class TessPretranslateTake { Ready, Pending, Queue, Inline };
 	return seen || stopped ? TessPretranslateTake::Inline : TessPretranslateTake::Queue;
 }
 
+// A later stage of a draw already skipped for a deferred stage: its push data cursor is wrong (the
+// deferred stage did not advance it), so it is only queued if new; a ready translation stays for
+// the next draw and nothing is translated inline. Queue: queue it; Pending: leave the pool as is.
+[[nodiscard]] constexpr TessPretranslateTake TessPretranslatePeek(TessPretranslateTake take) {
+	return take == TessPretranslateTake::Queue ? TessPretranslateTake::Queue : TessPretranslateTake::Pending;
+}
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_SRC_GRAPHICS_SHADER_TESSPRETRANSLATEPOLICY_H_ */

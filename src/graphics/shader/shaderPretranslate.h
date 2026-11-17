@@ -59,11 +59,15 @@ void Remember(uint64_t hash, std::span<const uint32_t> key, std::span<const uint
 // GPU thread, on a LS, HS or DS miss without a program entry (KYTY_TESS_PRETRANSLATE). `key`: the
 // program cache key words; `options`: the draw thread's finished options for `info`. Ready: `out`
 // is the translation of `code`. Pending or Queue: skip the draw. Inline: translate it there.
+// `peek`: a later stage of a draw already skipped (TessPretranslatePeek): only queues a new key.
 [[nodiscard]] TessPretranslateTake TakeTess(uint64_t hash, std::span<const uint32_t> key,
                                             std::span<const uint32_t> code,
                                             const ShaderRecompiler::CompileOptions& options,
                                             const ShaderVertexInputInfo&            info,
-                                            ShaderRecompiler::TranslateResult&      out);
+                                            ShaderRecompiler::TranslateResult& out, bool peek);
+
+// A taken LS, HS or DS translation writes memory: its draw was skipped meanwhile ("PERF tesspre writes").
+void NoteTessWrites() noexcept;
 
 void NoteVerify(bool equal) noexcept;
 
