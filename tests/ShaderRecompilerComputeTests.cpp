@@ -45013,7 +45013,8 @@ TestCase Wave64AppendIndexFromExecRank() {
 }
 
 TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
-                                  bool store_completion = false, bool flat = false) {
+                                  bool store_completion = false, bool flat = false,
+                                  bool body_poll = false) {
   using O = ShaderOpcode;
   constexpr u32 groups = 31;
   TestCase test;
@@ -45021,6 +45022,7 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                                       : "FlatWorkgroupPublicationWave32")
              : store_completion ? (wave_size == 64 ? "Wave64StoreCompletionPublication"
                                                  : "Wave32StoreCompletionPublication")
+             : body_poll ? "BufferWorkgroupPublicationBodyPoll"
              : dlc_only ? "BufferWorkgroupPublicationDlc"
              : wave_size == 64 ? "BufferWorkgroupPublicationWave64"
                                : "BufferWorkgroupPublicationWave32";
@@ -45059,6 +45061,13 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
     }
     code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
   };
+  if (body_poll) {
+    // s21 < s22 always holds here, so the S_ADD is never run, but it is live: the poll lands in a
+    // loop body block after a join, not in the loop header.
+    code.push_back(EncodeSopc(0x0a, 21, 22));
+    code.push_back(EncodeSopp(0x05, 1)); // S_CBRANCH_SCC1 over the next instruction.
+    code.push_back(EncodeSop2(0x00, 21, 21, InlineU32(1)));
+  }
   append_poll_load();
   code.push_back(EncodeVop1(0x02, 23, Vgpr(store_completion ? 3 : 2)));
   code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
@@ -53533,6 +53542,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferWorkgroupPublication(64, false, true));
   cases.push_back(BufferWorkgroupPublication(32, false, false, true));
   cases.push_back(BufferWorkgroupPublication(64, false, false, true));
+  cases.push_back(BufferWorkgroupPublication(32, false, false, false, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
@@ -62198,6 +62208,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferWorkgroupPublication(64, false, true));
     RunCase(&vulkan, BufferWorkgroupPublication(32, false, false, true));
     RunCase(&vulkan, BufferWorkgroupPublication(64, false, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, false, false, false, true));
     RunCase(&vulkan, BufferAtomicVariants());
     return 0;
   }
