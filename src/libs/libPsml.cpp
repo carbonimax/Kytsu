@@ -624,6 +624,19 @@ uint64_t ContextBlockCount(const ContextParameters& params) {
 	return (bytes + MEMORY_BLOCK_SIZE - 1) / MEMORY_BLOCK_SIZE;
 }
 
+// A rejected dispatch upscales nothing and leaves no PSSRPARAM sample: name the first ones.
+void LogRejectedDispatch(const Context* context, const DispatchParameters* params, int error) {
+	static std::atomic<uint32_t> logged {};
+	if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) {
+		return;
+	}
+	std::printf("PSSR mfsr2 dispatch rejected: error=0x%08x pre=%g reserved=%u render=%ux%u ctx=%ux%u\n",
+	            static_cast<unsigned>(error), params != nullptr ? params->pre_exposure : 0.0f,
+	            params != nullptr ? unsigned {params->reserved} : 0u, params != nullptr ? params->width : 0u,
+	            params != nullptr ? params->height : 0u, context != nullptr ? context->width : 0u,
+	            context != nullptr ? context->height : 0u);
+}
+
 int CheckDispatch(const Context* context, const CommandSpace* space,
                   const DispatchParameters* params) {
 	if (context == nullptr) {
@@ -782,6 +795,7 @@ int KYTY_SYSV_ABI GetDispatchPackets(Context* context, const CommandSpace* space
 		return NOT_INITIALIZED;
 	}
 	if (const int error = CheckDispatch(context, space, params); error != OK) {
+		LogRejectedDispatch(context, params, error);
 		if (space->dwords != 0) {
 			space->cmd[0] = KYTY_PM4(space->dwords, Pm4::IT_NOP, Pm4::R_ZERO);
 		}
