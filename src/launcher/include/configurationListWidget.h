@@ -53,7 +53,7 @@ public:
 
 signals:
 
-	void Run();
+	void Run(const QString& activity = {});
 	void Select();
 	void PreviewControllerColor(const QString& color);
 
