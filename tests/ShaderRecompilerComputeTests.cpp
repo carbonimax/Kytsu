@@ -7052,6 +7052,8 @@ public:
     const auto write_only_input =
         MakeInput(write_only_meta, false, true, write_only_program,
                   write_only_snapshot);
+    // The size checks are opt-in (KYTY_META_CLEAR_SIZE).
+    TextureCache::SetMetaClearSizeCheck(true);
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta,
                                               64);
     const bool mismatched_size_consumed =
@@ -7071,6 +7073,7 @@ public:
             !empty_write_consumed &&
                 !texture_cache.IsMetaCleared(write_only_meta, 0),
             "an empty metadata descriptor consumed a clear");
+    TextureCache::SetMetaClearSizeCheck(false);
     write_only_snapshot.buffers[0].dwords[2] = 8;
     const bool write_only_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
@@ -7594,6 +7597,7 @@ public:
             "metadata-resize fixed direct-memory mapping failed");
     context.MapMemory(base, page);
     auto &cache = context.GetTextureCache();
+    TextureCache::SetMetaClearSizeCheck(true);
     auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eD32Sfloat,
         Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
     desc.type = TextureCache::BindingType::DepthTarget;
@@ -7623,6 +7627,7 @@ public:
     Require(name, "release direct backing",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, page) == 0,
             "metadata-resize allocation release failed");
+    TextureCache::SetMetaClearSizeCheck(false);
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -17393,6 +17398,8 @@ public:
 
   void CheckPackedTextureComponents() {
     constexpr const char *name = "PackedTextureComponents";
+    // The 1- and 2-channel cases need the opt-in channel replication.
+    SetTextureChannelReplication(true);
     constexpr uintptr_t base = 0x0000000204200000ull;
     constexpr uint64_t allocation_size = 0x10000;
     struct FormatCase {
@@ -17707,6 +17714,7 @@ public:
                 Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                     direct_offset, allocation_size) == 0,
             "packed texture backing release failed");
+    SetTextureChannelReplication(false);
     std::printf("[gpu]     %-32s ok\n", name);
   }
 

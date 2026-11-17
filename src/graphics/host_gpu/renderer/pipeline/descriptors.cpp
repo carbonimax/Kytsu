@@ -408,7 +408,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage,
-	                                     vk::componentCount(format));
+	                                     TextureChannelReplication() ? vk::componentCount(format) : 4u);
 	const auto base_layer = descriptor.Type() == Prospero::ImageType::kColor1D ||
 	                                descriptor.Type() == Prospero::ImageType::kColor2D
 	                            ? 0u

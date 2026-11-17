@@ -11,9 +11,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 namespace {
+
+std::atomic<bool> g_channel_replication {[] {
+	const char* value = std::getenv("KYTY_TEXTURE_CHANNEL_REPLICATE");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}()};
 
 // Rows are channel order; columns are the number of physical components minus one. Unused
 // selectors complete each entry to a permutation so logical write masks can be inverted.
@@ -94,6 +101,14 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(const GraphicContext&   grap
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n",
 	     static_cast<uint32_t>(layout), static_cast<uint32_t>(type), static_cast<uint32_t>(order));
+}
+
+bool TextureChannelReplication() noexcept {
+	return g_channel_replication.load(std::memory_order_relaxed);
+}
+
+void SetTextureChannelReplication(bool enabled) noexcept {
+	g_channel_replication.store(enabled, std::memory_order_relaxed);
 }
 
 vk::ComponentMapping TextureGetComponentMapping(uint32_t                        swizzle,
