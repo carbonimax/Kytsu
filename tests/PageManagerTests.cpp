@@ -486,6 +486,61 @@ void TestDeferredProtectCoalesces() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// KYTY_PROTECT_OUT_PROF: immediate calls inside a SyncScope are counted by thread and mode; a call
+// within the batch gap of another call or of a batched span is mergeable, per frame and per window.
+void TestProtectOutProf() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto base = (reinterpret_cast<uint64_t>(memory) + region_size - 1) & ~(region_size - 1);
+  const auto page = [&](uint64_t i) { return base + i * page_size; };
+
+  PageManager::SetProtectOutProf(true);
+  (void)PageManager::TakeProtectOutStats();
+  {
+    PageManager::SyncScope scope(false, true);
+    manager.UpdatePageWatchers<true>(page(1), page_size);
+    manager.UpdatePageWatchers<true>(page(2), page_size);   // merges with page 1
+    manager.UpdatePageWatchers<true>(page(100), page_size); // alone
+    manager.UpdatePageWatchers<false>(page(100), page_size); // ReadWrite: never mergeable
+  }
+  manager.UpdatePageWatchers<true>(page(200), page_size); // outside the scope
+  PageManager::EndProtectOutFrame();
+  auto s = PageManager::TakeProtectOutStats();
+  Check(s.frames == 1 && s.calls[1][1] == 3 && s.calls[1][0] == 1 && s.calls[0][1] == 0 &&
+            s.written_calls == 0 && s.outside_calls == 1,
+        "protect-out counts by thread and mode are wrong");
+  Check(s.group_calls == 2 && s.group_saved == 1 && s.window_calls == 2 && s.window_saved == 1,
+        "adjacent immediate calls were not counted as mergeable");
+
+  // Frame 2: a batched span, an immediate call next to it, a flush, then another next to both.
+  PageManager::BeginDeferredProtect();
+  {
+    PageManager::DeferCapture capture;
+    manager.UpdatePageWatchers<true>(page(10), page_size);
+  }
+  {
+    PageManager::SyncScope scope(true, false);
+    manager.UpdatePageWatchers<true>(page(11), page_size);
+    PageManager::FlushDeferredProtect();
+    manager.UpdatePageWatchers<true>(page(12), page_size);
+  }
+  PageManager::EndDeferredProtect();
+  PageManager::EndProtectOutFrame();
+  s = PageManager::TakeProtectOutStats();
+  Check(s.frames == 1 && s.calls[0][1] == 2 && s.written_calls == 2 && s.batch_spans == 1,
+        "protect-out counts around the batch are wrong");
+  Check(s.group_calls == 2 && s.group_saved == 2 && s.window_calls == 1 && s.window_saved == 1,
+        "mergeable calls next to a batched span are wrong");
+  PageManager::SetProtectOutProf(false);
+
+  for (const uint64_t i : {1, 2, 10, 11, 12, 200}) {
+    manager.UpdatePageWatchers<false>(page(i), page_size);
+  }
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 // A watch placed over a live guest stack leaves the stack's pages (whole pages, also a partial one)
 // writable and protects the rest; releasing the stack reports the range as unseen CPU writes.
 void TestLiveStackPagesKeepAccess() {
@@ -819,6 +874,7 @@ int main(int argc, char **argv) {
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestDeferredProtectCoalesces();
+  TestProtectOutProf();
   TestRegionEndpointBatching();
   TestLiveStackPagesKeepAccess();
   TestReadWriteWatcherInteractions();

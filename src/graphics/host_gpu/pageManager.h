@@ -63,6 +63,45 @@ public:
 		bool m_previous = false;
 	};
 
+	// KYTY_PROTECT_OUT_PROF=1 (measurement, default 0; reported with KYTY_PERF_STATS=1): host
+	// protection calls applied at once (not recorded by, nor made by the flush of, the deferred
+	// batch) inside a SyncScope (BufferCache::SynchronizeBuffer). Per frame: calls and time by
+	// thread and mode, and the calls the batch could have merged: same mode (not ReadWrite) and
+	// within its 16-page gap of another protection of the frame (such a call or a batched span),
+	// also counted within one flush window. Immediate calls outside a scope: count and time only.
+	class SyncScope final {
+	public:
+		SyncScope(bool is_written, bool gpu_thread) noexcept;
+		~SyncScope();
+		SyncScope(const SyncScope&)            = delete;
+		SyncScope& operator=(const SyncScope&) = delete;
+
+	private:
+		uint8_t m_previous = 0;
+		bool    m_active   = false;
+	};
+	struct ProtectOutStats {
+		uint64_t frames        = 0;
+		uint64_t calls[2][3]   = {}; // [other thread, GPU thread][ReadWrite, Read, NoAccess]
+		uint64_t ns[2][3]      = {};
+		uint64_t written_calls = 0; // of which in an is_written synchronization
+		uint64_t written_ns    = 0;
+		uint64_t group_calls   = 0; // mergeable in the frame
+		uint64_t group_ns      = 0;
+		uint64_t group_saved   = 0; // protection calls a merge would remove
+		uint64_t window_calls  = 0; // mergeable within one flush window
+		uint64_t window_ns     = 0;
+		uint64_t window_saved  = 0;
+		uint64_t batch_spans   = 0;
+		uint64_t outside_calls = 0;
+		uint64_t outside_ns    = 0;
+	};
+	static void                          SetProtectOutProf(bool on) noexcept;
+	[[nodiscard]] static bool            ProtectOutProfEnabled() noexcept;
+	static void                          EndProtectOutFrame() noexcept; // at each frame boundary
+	[[nodiscard]] static ProtectOutStats TakeProtectOutStats() noexcept;
+	static void                          ReportProtectOut(double seconds) noexcept;
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

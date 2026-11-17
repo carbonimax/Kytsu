@@ -384,6 +384,7 @@ void MaybeReport() noexcept {
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	MemTrackProf::Report(seconds, n(Counter::Frames));
+	PageManager::ReportProtectOut(seconds);
 	LateRead::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();

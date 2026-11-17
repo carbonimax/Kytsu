@@ -100,6 +100,103 @@ std::atomic<bool>     g_verify_deferred {false};
 std::atomic<uint64_t> g_verify_checked {0};
 std::atomic<uint64_t> g_verify_mismatch {0};
 
+// FlushDeferredProtect merges recorded spans separated by up to this gap.
+constexpr uint64_t DEFERRED_MAX_GAP = 16 * PAGE_SIZE;
+
+// KYTY_PROTECT_OUT_PROF (PageManager::SyncScope).
+struct ProtRecord {
+	void*    impl;
+	uint64_t begin;
+	uint64_t end;
+	uint64_t ns;
+	uint32_t window; // flush epoch
+	uint8_t  mode;   // 0 ReadWrite, 1 Read, 2 NoAccess
+	bool     batched;
+};
+constexpr uint8_t SCOPE_ACTIVE  = 1;
+constexpr uint8_t SCOPE_GPU     = 2;
+constexpr uint8_t SCOPE_WRITTEN = 4;
+
+std::atomic<bool> g_prof_on {[] {
+	const char* value = std::getenv("KYTY_PROTECT_OUT_PROF");
+	return value != nullptr && std::strtol(value, nullptr, 10) != 0;
+}()};
+thread_local uint8_t           t_sync_scope = 0;
+std::atomic<uint32_t>          g_prof_window {0};
+std::atomic<uint64_t>          g_prof_outside_calls {0};
+std::atomic<uint64_t>          g_prof_outside_ns {0};
+std::atomic_flag               g_prof_lock = ATOMIC_FLAG_INIT; // innermost lock
+std::vector<ProtRecord>        g_prof_frame;
+PageManager::ProtectOutStats   g_prof_stats;
+
+uint8_t ModeIndex(Common::VirtualMemory::Mode mode) noexcept {
+	return mode == Common::VirtualMemory::Mode::Read       ? 1
+	       : mode == Common::VirtualMemory::Mode::NoAccess ? 2
+	                                                       : 0;
+}
+
+// Sorts `records` and adds the immediate calls that share a merged run with another record (same
+// impl, mode not ReadWrite, gap <= DEFERRED_MAX_GAP, and same flush window if `by_window`).
+void CountMergeable(std::vector<ProtRecord>& records, bool by_window, uint64_t& calls, uint64_t& ns,
+                    uint64_t& saved) noexcept {
+	std::sort(records.begin(), records.end(), [&](const ProtRecord& a, const ProtRecord& b) {
+		if (by_window && a.window != b.window) return a.window < b.window;
+		if (a.impl != b.impl) return a.impl < b.impl;
+		if (a.mode != b.mode) return a.mode < b.mode;
+		return a.begin < b.begin;
+	});
+	for (size_t i = 0; i < records.size();) {
+		const auto& first   = records[i];
+		uint64_t    end     = first.end;
+		uint64_t    run_ns  = first.batched ? 0 : first.ns;
+		uint64_t    out     = first.batched ? 0 : 1;
+		bool        batched = first.batched;
+		size_t      j       = i + 1;
+		for (; first.mode != 0 && j < records.size(); j++) {
+			const auto& next = records[j];
+			if ((by_window && next.window != first.window) || next.impl != first.impl ||
+			    next.mode != first.mode || next.begin > end + DEFERRED_MAX_GAP) {
+				break;
+			}
+			end = std::max(end, next.end);
+			run_ns += next.batched ? 0 : next.ns;
+			out += next.batched ? 0 : 1;
+			batched |= next.batched;
+		}
+		if (j - i >= 2 && out != 0) {
+			calls += out;
+			ns += run_ns;
+			saved += batched ? out : out - 1;
+		}
+		i = j;
+	}
+}
+
+void ProfNote(void* impl, uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode, uint64_t ns,
+              bool batched) noexcept {
+	if (!batched && t_sync_scope == 0) {
+		g_prof_outside_calls.fetch_add(1, std::memory_order_relaxed);
+		g_prof_outside_ns.fetch_add(ns, std::memory_order_relaxed);
+		return;
+	}
+	const auto mode_index = ModeIndex(mode);
+	SpinGuard  lock(g_prof_lock);
+	g_prof_frame.push_back({impl, vaddr, vaddr + size, ns, g_prof_window.load(std::memory_order_relaxed),
+	                        mode_index, batched});
+	auto& stats = g_prof_stats;
+	if (batched) {
+		stats.batch_spans++;
+		return;
+	}
+	const auto thread = (t_sync_scope & SCOPE_GPU) != 0 ? 1 : 0;
+	stats.calls[thread][mode_index]++;
+	stats.ns[thread][mode_index] += ns;
+	if ((t_sync_scope & SCOPE_WRITTEN) != 0) {
+		stats.written_calls++;
+		stats.written_ns += ns;
+	}
+}
+
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		Fatal("invalid range vaddr=0x%016" PRIx64 ", size=0x%016" PRIx64, vaddr, size);
@@ -225,17 +322,24 @@ struct PageManager::Impl {
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
 		if (t_deferred.capture && t_deferred.active && !t_deferred.applying &&
 		    mode != Common::VirtualMemory::Mode::ReadWrite) [[unlikely]] {
-			SpinGuard lock(g_deferred_lock);
-			auto&     spans = g_deferred_spans;
-			if (!spans.empty() && spans.back().impl == this && spans.back().mode == mode &&
-			    spans.back().end == vaddr) {
-				spans.back().end = vaddr + size;
-			} else {
-				spans.push_back({this, vaddr, vaddr + size, mode});
+			{
+				SpinGuard lock(g_deferred_lock);
+				auto&     spans = g_deferred_spans;
+				if (!spans.empty() && spans.back().impl == this && spans.back().mode == mode &&
+				    spans.back().end == vaddr) {
+					spans.back().end = vaddr + size;
+				} else {
+					spans.push_back({this, vaddr, vaddr + size, mode});
+				}
+				g_deferred_any.store(true, std::memory_order_relaxed);
 			}
-			g_deferred_any.store(true, std::memory_order_relaxed);
+			if (g_prof_on.load(std::memory_order_relaxed)) [[unlikely]] {
+				ProfNote(this, vaddr, size, mode, 0, true);
+			}
 			return;
 		}
+		const bool prof       = !t_deferred.applying && g_prof_on.load(std::memory_order_relaxed);
+		const auto prof_start = prof ? MemTrackProf::NowNs() : 0;
 		ForEachOutsideStacks(vaddr, size, mode, [](uint64_t begin, uint64_t bytes, Common::VirtualMemory::Mode m) {
 			const auto start = MemTrackProf::Enabled() ? MemTrackProf::NowNs() : 0;
 			if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(begin, bytes, m)) {
@@ -249,6 +353,9 @@ struct PageManager::Impl {
 				                          bytes, MemTrackProf::NowNs() - start);
 			}
 		});
+		if (prof) [[unlikely]] {
+			ProfNote(this, vaddr, size, mode, MemTrackProf::NowNs() - prof_start, false);
+		}
 	}
 
 	// Applies `protect` to [vaddr, vaddr + size) except the pages of live guest stacks, which keep
@@ -488,10 +595,13 @@ bool PageManager::DeferringProtect() noexcept {
 }
 
 void PageManager::FlushDeferredProtect() noexcept {
+	if (g_prof_on.load(std::memory_order_relaxed)) [[unlikely]] {
+		g_prof_window.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (!g_deferred_any.load(std::memory_order_acquire)) {
 		return;
 	}
-	constexpr uint64_t MaxGap = 16 * PAGE_SIZE;
+	constexpr uint64_t MaxGap = DEFERRED_MAX_GAP;
 	auto&              spans  = t_deferred.scratch;
 	spans.clear();
 	{
@@ -534,6 +644,94 @@ PageManager::DeferredVerifyStats PageManager::GetDeferredVerifyStats() noexcept 
 void PageManager::EndDeferredProtect() noexcept {
 	FlushDeferredProtect();
 	t_deferred.active = false;
+}
+
+PageManager::SyncScope::SyncScope(bool is_written, bool gpu_thread) noexcept {
+	if (!g_prof_on.load(std::memory_order_relaxed)) [[likely]] {
+		return;
+	}
+	m_active   = true;
+	m_previous = t_sync_scope;
+	t_sync_scope = static_cast<uint8_t>(SCOPE_ACTIVE | (gpu_thread ? SCOPE_GPU : 0) |
+	                                    (is_written ? SCOPE_WRITTEN : 0));
+}
+
+PageManager::SyncScope::~SyncScope() {
+	if (m_active) {
+		t_sync_scope = m_previous;
+	}
+}
+
+void PageManager::SetProtectOutProf(bool on) noexcept {
+	g_prof_on.store(on, std::memory_order_relaxed);
+}
+
+bool PageManager::ProtectOutProfEnabled() noexcept {
+	return g_prof_on.load(std::memory_order_relaxed);
+}
+
+void PageManager::EndProtectOutFrame() noexcept {
+	if (!g_prof_on.load(std::memory_order_relaxed)) [[likely]] {
+		return;
+	}
+	thread_local std::vector<ProtRecord> records;
+	{
+		SpinGuard lock(g_prof_lock);
+		std::swap(records, g_prof_frame);
+		g_prof_stats.frames++;
+	}
+	ProtectOutStats add;
+	CountMergeable(records, false, add.group_calls, add.group_ns, add.group_saved);
+	CountMergeable(records, true, add.window_calls, add.window_ns, add.window_saved);
+	records.clear();
+	SpinGuard lock(g_prof_lock);
+	auto&     stats = g_prof_stats;
+	stats.group_calls += add.group_calls;
+	stats.group_ns += add.group_ns;
+	stats.group_saved += add.group_saved;
+	stats.window_calls += add.window_calls;
+	stats.window_ns += add.window_ns;
+	stats.window_saved += add.window_saved;
+}
+
+PageManager::ProtectOutStats PageManager::TakeProtectOutStats() noexcept {
+	ProtectOutStats stats;
+	{
+		SpinGuard lock(g_prof_lock);
+		std::swap(stats, g_prof_stats);
+	}
+	stats.outside_calls = g_prof_outside_calls.exchange(0, std::memory_order_relaxed);
+	stats.outside_ns    = g_prof_outside_ns.exchange(0, std::memory_order_relaxed);
+	return stats;
+}
+
+void PageManager::ReportProtectOut(double seconds) noexcept {
+	if (!g_prof_on.load(std::memory_order_relaxed)) [[likely]] {
+		return;
+	}
+	const auto s  = TakeProtectOutStats();
+	const auto fr = static_cast<double>(std::max<uint64_t>(s.frames, 1));
+	const auto n  = [&](uint64_t v) { return static_cast<double>(v) / fr; };
+	const auto ms = [&](uint64_t v) { return static_cast<double>(v) / 1e6 / fr; };
+	uint64_t   calls = 0;
+	uint64_t   ns    = 0;
+	for (int t = 0; t < 2; t++) {
+		for (int m = 0; m < 3; m++) {
+			calls += s.calls[t][m];
+			ns += s.ns[t][m];
+		}
+	}
+	// Units: counts and ms per frame (frames = boundaries seen by EndProtectOutFrame).
+	std::printf("PERF protout %.1fs frames=%" PRIu64 " (per frame): sync=%.1f(%.3fms) gpu ro=%.1f(%.3fms)"
+	            " na=%.1f(%.3fms) rw=%.1f(%.3fms) other ro=%.1f(%.3fms) na=%.1f(%.3fms) rw=%.1f(%.3fms)"
+	            " written=%.1f(%.3fms) | mergeable frame=%.1f(%.3fms,saved=%.1f) window=%.1f(%.3fms,saved=%.1f)"
+	            " batch_spans=%.1f | outside_sync=%.1f(%.3fms)\n",
+	            seconds, s.frames, n(calls), ms(ns), n(s.calls[1][1]), ms(s.ns[1][1]), n(s.calls[1][2]),
+	            ms(s.ns[1][2]), n(s.calls[1][0]), ms(s.ns[1][0]), n(s.calls[0][1]), ms(s.ns[0][1]),
+	            n(s.calls[0][2]), ms(s.ns[0][2]), n(s.calls[0][0]), ms(s.ns[0][0]), n(s.written_calls),
+	            ms(s.written_ns), n(s.group_calls), ms(s.group_ns), n(s.group_saved), n(s.window_calls),
+	            ms(s.window_ns), n(s.window_saved), n(s.batch_spans), n(s.outside_calls), ms(s.outside_ns));
+	std::fflush(stdout);
 }
 
 template <bool track, bool is_read>

@@ -2600,6 +2600,8 @@ void BufferCache::EndUploadBatch() {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	MemTrackProf::Timer prof_timer(MemTrackProf::Counter::SyncNs, MemTrackProf::Counter::SyncCount);
+	const PageManager::SyncScope protect_scope(
+	    is_written, PageManager::ProtectOutProfEnabled() && GuestGpu::IsGpuThread());
 	if (buffer.IsImported()) {
 		// The GPU reads the guest's bytes at execution: nothing to upload, no re-protection. A
 		// write only takes GPU ownership (CPU readers wait for the writer, see PublishImported).

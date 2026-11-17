@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssrProf.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1111,6 +1112,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			PerfStats::Add(PerfStats::Counter::Frames, 1);
+			PageManager::EndProtectOutFrame();
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
