@@ -6,6 +6,7 @@
 #include <QColor>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFontMetrics>
 #include <QImage>
 #include <QScrollBar>
 #include <QTemporaryDir>
@@ -97,6 +98,17 @@ int main(int argc, char **argv) {
   const auto tile = grid->TileRect(0);
   Check(tile.width() == 128 * 3 / 4, "the selected tile is not three quarters of the slider size");
   Check(image.pixelColor(tile.center()) == QColor(Qt::blue), "the tile does not show the cover");
+
+  // A title that supports PS5 Pro mode carries the badge in the tile's top-right corner.
+  item->setData(GAME_NAME_COLUMN, Qt::UserRole, true);
+  QApplication::processEvents();
+  auto font = grid->font();
+  font.setBold(true);
+  const int    inset = QFontMetrics(font).height() / 3;
+  const QPoint badge = tile.topRight() + QPoint(-inset - 2, inset + QFontMetrics(font).height() / 2);
+  const auto   pro   = grid->viewport()->grab().toImage().pixelColor(badge);
+  Check(qAbs(pro.red() - 0x53) < 24 && qAbs(pro.green() - 0x4a) < 24 && qAbs(pro.blue() - 0xb7) < 24,
+        "the carousel tile does not show the PS5 Pro badge");
 
   std::printf("LauncherGameViewsTests: passed%s\n", breeze ? "" : " (Breeze checks skipped)");
   return 0;

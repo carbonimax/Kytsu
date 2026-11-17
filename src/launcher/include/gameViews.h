@@ -136,6 +136,9 @@ public:
 			                                        Qt::SmoothTransformation));
 		}
 		painter->setClipping(false);
+		if (index.data(Qt::UserRole).toBool()) {
+			PaintProBadge(painter, rect, option.font, QStringLiteral("PS5 PRO"));
+		}
 
 		if (selected) {
 			const QRectF outline = QRectF(rect).adjusted(-2, -2, 2, 2);
