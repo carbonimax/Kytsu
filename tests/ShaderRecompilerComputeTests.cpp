@@ -52251,6 +52251,90 @@ TestCase ComputeWave64Reduction(const WaveReduction &op, bool masked = false) {
   return test;
 }
 
+// A wave32 whole-wave reduction and the host operation it computes.
+struct PackedWave32Reduction {
+  const char *name;
+  spv::Op spirv;
+  u32 vector_op, scalar_op; // VOP2 and SOP2 opcodes
+  u32 (*combine)(u32, u32);
+};
+
+constexpr std::array kPackedWave32Reductions{
+    PackedWave32Reduction{"PackedWave32Add", spv::OpGroupNonUniformIAdd, 0x25u, 0x00u,
+        +[](u32 a, u32 b) { return a + b; }},
+    PackedWave32Reduction{"PackedWave32SignedMinimum", spv::OpGroupNonUniformSMin, 0x11u, 0x06u,
+        +[](u32 a, u32 b) { return static_cast<int32_t>(a) < static_cast<int32_t>(b) ? a : b; }},
+    PackedWave32Reduction{"PackedWave32SignedMaximum", spv::OpGroupNonUniformSMax, 0x12u, 0x08u,
+        +[](u32 a, u32 b) { return static_cast<int32_t>(a) > static_cast<int32_t>(b) ? a : b; }},
+    PackedWave32Reduction{"PackedWave32Minimum", spv::OpGroupNonUniformUMin, 0x13u, 0x07u,
+        +[](u32 a, u32 b) { return std::min(a, b); }},
+    PackedWave32Reduction{"PackedWave32Maximum", spv::OpGroupNonUniformUMax, 0x14u, 0x09u,
+        +[](u32 a, u32 b) { return std::max(a, b); }},
+    PackedWave32Reduction{"PackedWave32And", spv::OpGroupNonUniformBitwiseAnd, 0x1bu, 0x0eu,
+        +[](u32 a, u32 b) { return a & b; }},
+    PackedWave32Reduction{"PackedWave32Or", spv::OpGroupNonUniformBitwiseOr, 0x1cu, 0x10u,
+        +[](u32 a, u32 b) { return a | b; }},
+    PackedWave32Reduction{"PackedWave32Xor", spv::OpGroupNonUniformBitwiseXor, 0x1du, 0x12u,
+        +[](u32 a, u32 b) { return a ^ b; }}};
+
+// Two wave32 guest waves of one 64-thread workgroup reduce a loaded value with a row scan and
+// lanes 15 and 31; each lane must get its own wave's result. Wave 0 loads positive values with
+// bit 28 set, wave 1 negative ones with bits 31 and 29, so a reduction over both waves (or a
+// wrong identity for the other wave's lanes in a packed 64-lane host subgroup) changes a result.
+TestCase ComputePackedWave32Reduction(const PackedWave32Reduction &op) {
+  TestCase test;
+  test.name = op.name;
+  auto &code = test.code;
+  code = {EncodeVop2(0x1a, 20, InlineU32(2), 0)};
+  AppendBufferLoadDword(&code, 13, 20);
+  code.insert(code.end(), {EncodeSop1(0x40, 106, 126)}); // s_orn2_saveexec_b32: full EXEC.
+  for (u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(EncodeVop2(op.vector_op, 13, 250, 13));
+    code.push_back(EncodeVop2Dpp(13, 0x110u + shift));
+  }
+  code.insert(code.end(), {EncodeSop1(0x03, 126, 106), // Restore EXEC.
+      0xd7600006u, 0x00011f0du, 0xd7600007u, 0x00013f0du, // v_readlane_b32 s6/s7, v13, 15/31
+      EncodeSop2(op.scalar_op, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
+  AppendBufferStoreDword(&code, 0, 20);
+  AppendEnd(&code);
+  test.initial.resize(64);
+  for (u32 lane = 0; lane < 64; lane++) {
+    const u32 bits = (lane * 0x9e3779b9u + 0x7f4a7c15u) & 0x0fffffffu;
+    test.initial[lane] = bits | (lane < 32 ? 0x10000000u : 0xa0000000u);
+  }
+  const auto reduce = [&](u32 first, u32 count) {
+    return std::accumulate(test.initial.begin() + first + 1, test.initial.begin() + first + count,
+                           test.initial[first], op.combine);
+  };
+  const u32 wave0 = reduce(0, 32), wave1 = reduce(32, 32), both = reduce(0, 64);
+  Require(test.name, "test data", wave0 != both || wave1 != both,
+          "the values do not tell a two-wave reduction from a one-wave one");
+  test.expected.assign(32, wave0);
+  test.expected.resize(64, wave1);
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.ir_counts = {{" = SubgroupReduceU32 ", 1}};
+  return test;
+}
+
+// The case on the device, after checking that a 64-lane host subgroup gets one reduction per
+// guest wave.
+void RunPackedWave32Reduction(VulkanHarness *vulkan, const PackedWave32Reduction &op) {
+  const auto test = ComputePackedWave32Reduction(op);
+  const auto packed = CompileCase(test, 64);
+  size_t reductions = 0;
+  for (size_t offset = 5; offset < packed.spirv.size(); offset += packed.spirv[offset] >> 16u) {
+    reductions += (packed.spirv[offset] & 0xffffu) == static_cast<u32>(op.spirv);
+  }
+  Require(test.name, "packed SPIR-V", reductions == 2,
+          "a packed wave32 subgroup did not reduce each guest wave apart");
+  std::printf("[compute] %-32s host subgroup %u\n", test.name, vulkan->SubgroupSize());
+  RunCase(vulkan, test);
+}
+
 GraphicsCase GraphicsInterpolationExport() {
   using O = ShaderOpcode;
 
@@ -53486,6 +53570,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorReadFirstLaneExecMasks(64));
   for (const auto &op : kWaveReductions) cases.push_back(ComputeWave64Reduction(op));
   cases.push_back(ComputeWave64Reduction(kWaveMinimum, true));
+  for (const auto &op : kPackedWave32Reductions) cases.push_back(ComputePackedWave32Reduction(op));
   AddCase(VectorDppBankMaskPreservesDestination);
   for (const bool row_shift : {false, true})
     for (const bool bound_ctrl : {false, true})
@@ -61270,6 +61355,7 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, ComputeWave64Reduction(op));
     }
     RunCase(&vulkan, ComputeWave64Reduction(kWaveMinimum, true));
+    for (const auto &op : kPackedWave32Reductions) RunPackedWave32Reduction(&vulkan, op);
     RunCase(&vulkan, VectorDpp8Captured(false));
     for (const u32 wave_size : {32u, 64u})
       for (const bool fi : {false, true})
