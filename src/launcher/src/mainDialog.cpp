@@ -613,6 +613,9 @@ void MainDialogPrivate::Run() {
 	auto* process = new QProcess(this);
 	connect(process, &QProcess::stateChanged, this,
 	        [this, process, item](QProcess::ProcessState state) {
+		        if (state == QProcess::Running) {
+			        m_main_dialog->showMinimized();
+		        }
 		        if (state == QProcess::NotRunning) {
 			        if (item != nullptr) {
 				        item->SetRunning(false);
@@ -620,6 +623,17 @@ void MainDialogPrivate::Run() {
 			        m_running_games--;
 			        process->deleteLater();
 			        Update();
+			        // The launcher comes back, with its title music, once the last game has exited.
+			        if (m_running_games == 0) {
+				        m_main_dialog->setWindowState(m_main_dialog->windowState() &
+				                                      ~Qt::WindowMinimized);
+				        m_main_dialog->show();
+				        m_main_dialog->raise();
+				        m_main_dialog->activateWindow();
+				        const auto* selected = m_ui->widget->GetSelectedItem();
+				        m_title_sound.SetTitle(selected != nullptr ? selected->GetInfo().basedir
+				                                                   : QString());
+			        }
 		        }
 	        });
 	auto info = m_ui->widget->CreateConfiguration(*item);
