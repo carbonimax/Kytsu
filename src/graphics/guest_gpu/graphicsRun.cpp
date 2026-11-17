@@ -1351,7 +1351,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		auto handler = g_cp_op_func[opcode];
 		// A flip or flip-done wait block opens with a SET_UCONFIG_REG of its tag, a pipelined packet,
 		// but it drains and is a sync point like any flip: labels, EOP and flips keep their point.
-		const bool flip_block = remaining_dw >= 3 && Pm4::IsFlipBlock(packet_header, packet + 1);
+		const bool flip_block = remaining_dw >= 3 &&
+		                        Pm4::IsFlipBlock(packet_header, packet + 1, IsAsyncComputeQueue());
 		if (flip_block) {
 			CpSplitProf::Drain(CpSplitProf::Cause::Flip);
 		} else {
