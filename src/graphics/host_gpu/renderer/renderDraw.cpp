@@ -1707,7 +1707,6 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
 	EXIT_NOT_IMPLEMENTED(
-	    !m_context.GetGraphics().maintenance8_enabled ||
 	    !Prospero::IsRectList(ucfg.GetPrimType()) || draw.indexed || draw.index_count != 3 ||
 	    draw.instance_count != 1 || emit.vertex_offset != 0 || emit.first_instance != 0 ||
 	    state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
@@ -1730,7 +1729,21 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	                     destination.backing.format != vk::Format::eR32Sfloat);
 	const auto rect = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
 	                                    {rendering.width, rendering.height}, 0);
-	if (rect.right > rect.left && rect.bottom > rect.top) {
+	if (rect.right > rect.left && rect.bottom > rect.top &&
+	    !m_context.GetGraphics().maintenance8_enabled) {
+		// A depth-to-color vkCmdCopyImage needs maintenance8: without it, only a full single-level
+		// surface is copied, through a buffer (the bits are kept, no conversion).
+		EXIT_NOT_IMPLEMENTED(rect.left != 0 || rect.top != 0 ||
+		                     rect.right != static_cast<int>(source.backing.extent.width) ||
+		                     rect.bottom != static_cast<int>(source.backing.extent.height) ||
+		                     source.backing.extent != destination.backing.extent ||
+		                     source.backing.mip_levels != 1 || destination.backing.mip_levels != 1 ||
+		                     source.backing.layers != 1 || destination.backing.layers != 1 ||
+		                     depth.desc.view_info.base_level != 0 || depth.desc.view_info.base_layer != 0 ||
+		                     color.desc.view_info.base_level != 0 || color.desc.view_info.base_layer != 0);
+		buffer.EndRendering();
+		cache.CopyImageThroughBuffer(color.image_id, depth.image_id);
+	} else if (rect.right > rect.left && rect.bottom > rect.top) {
 		const vk::ImageCopy region {
 		    {vk::ImageAspectFlagBits::eDepth, depth.desc.view_info.base_level,
 		     depth.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},

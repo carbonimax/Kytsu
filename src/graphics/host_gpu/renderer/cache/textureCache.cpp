@@ -668,6 +668,13 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	destination.ClearBufferModified();
 }
 
+void TextureCache::CopyImageThroughBuffer(ImageId destination_id, ImageId source_id) {
+	auto& destination = m_slot_images[destination_id];
+	auto& source      = m_slot_images[source_id];
+	destination.CopyImageWithBuffer(source, m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal),
+	                                m_tiler);
+}
+
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
 	RefreshCopySource(source_id);
