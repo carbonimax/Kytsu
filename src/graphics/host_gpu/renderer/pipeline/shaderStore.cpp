@@ -471,6 +471,15 @@ std::vector<uint8_t> ShaderStoreHostKey(const GraphicContext& graphics) {
 		std::string entry = std::string(name) + "=" + (value != nullptr ? value : "");
 		IoAll(key, entry);
 	}
+	// Its default differs on Apple; unset elsewhere it leaves the key, so those stores stay valid.
+	const char* heap = std::getenv("KYTY_SAMPLED_TABLE_HEAP");
+#if !defined(__APPLE__)
+	if (heap != nullptr)
+#endif
+	{
+		std::string entry = std::string("KYTY_SAMPLED_TABLE_HEAP=") + (heap != nullptr ? heap : "");
+		IoAll(key, entry);
+	}
 	return std::move(key.bytes);
 }
 

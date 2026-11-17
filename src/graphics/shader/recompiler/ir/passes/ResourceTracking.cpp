@@ -122,6 +122,20 @@ const Inst* AddressBaseRead(Value word, Value active) {
 	return scalar ? inst : nullptr;
 }
 
+// KYTY_SAMPLED_TABLE_HEAP: sampled static-domain address tables keep their GPU key over an image
+// heap. Off by default on Apple, a suspect in a macOS slowdown (PR #143); keyed in the shader store.
+bool SampledTableHeap() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SAMPLED_TABLE_HEAP");
+#if defined(__APPLE__)
+		return value != nullptr && value[0] != '0';
+#else
+		return value == nullptr || value[0] != '0';
+#endif
+	}();
+	return enabled;
+}
+
 bool IsNoncanonicalFlatAddress(Value high, Value active) {
 	high = ActiveValue(high, active);
 	uint32_t lower = 0, upper = UINT32_MAX;
@@ -3406,7 +3420,7 @@ private:
 					maximum = ClampedTableMaximum(key, table_source, indirect);
 				// A static key range can cover other operations' slots, so samples keep their GPU key
 				// over an image heap, which reads slots of another type or invalid T#s as null.
-				if (maximum < MaxIndirectDescriptorProbes && !sampler &&
+				if (maximum < MaxIndirectDescriptorProbes && !sampler && SampledTableHeap() &&
 				    std::ranges::all_of(handle.Uses(), [](const Use& use) {
 					    return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw;
 				    })) {

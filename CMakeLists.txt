@@ -1018,6 +1018,8 @@ if(BUILD_TESTING)
 		get_property(kyty_all_tests DIRECTORY PROPERTY TESTS)
 		foreach(kyty_test IN LISTS kyty_all_tests)
 			set_property(TEST ${kyty_test} APPEND PROPERTY ENVIRONMENT KYTY_HARNESS_RELAXED_FULL=1)
+			# The tests check the sampled table heap, off by default on Apple (KYTY_SAMPLED_TABLE_HEAP).
+			set_property(TEST ${kyty_test} APPEND PROPERTY ENVIRONMENT KYTY_SAMPLED_TABLE_HEAP=1)
 		endforeach()
 	endif()
 
