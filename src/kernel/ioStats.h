@@ -12,8 +12,9 @@
 // histogram. With KYTY_COMPILE_LOG, one "I time api bytes ns" line per call (same clock as its other lines).
 namespace Libs::LibKernel::IoStats {
 
-// AprCopy: the memcpy from the APR bounce buffer into guest memory (part of Apr).
-enum class Api : uint32_t { Read, Pread, Preadv, Aio, Apr, AprCopy, Open, AprOpen, Close, Count };
+// AprCopy: the memcpy from the APR bounce buffer into guest memory (part of Apr). AprPreopen: KYTY_APR_PREOPEN
+// opens off the engine thread (not part of AprOpen). AprResolve: guest path resolution (stat of a new path).
+enum class Api : uint32_t { Read, Pread, Preadv, Aio, Apr, AprCopy, Open, AprOpen, Close, AprPreopen, AprResolve, Count };
 
 [[nodiscard]] bool Enabled() noexcept;
 void               Note(Api api, uint64_t bytes, uint64_t ns) noexcept;

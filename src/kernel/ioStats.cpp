@@ -18,7 +18,7 @@ namespace Libs::LibKernel::IoStats {
 namespace {
 
 constexpr auto ApiCount = static_cast<size_t>(Api::Count);
-constexpr std::array<const char*, ApiCount> ApiNames = {"read", "pread", "preadv", "aio", "apr", "apr_copy", "open", "apr_open", "close"};
+constexpr std::array<const char*, ApiCount> ApiNames = {"read", "pread", "preadv", "aio", "apr", "apr_copy", "open", "apr_open", "close", "apr_preopen", "apr_resolve"};
 
 struct Slot {
 	uint64_t                                  calls  = 0;

@@ -7,6 +7,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/ioStats.h"
+#include "libs/aprPreopen.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -124,6 +126,30 @@ static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	return true;
 }
 
+// KYTY_APR_PREOPEN=1 (aprPreopen.h). Leaked on purpose: workers may still be opening at exit and use g_files.
+static AprPreopener* Preopener() {
+	static AprPreopener* preopener = []() -> AprPreopener* {
+		const char* value = std::getenv("KYTY_APR_PREOPEN");
+		if (value == nullptr || std::strcmp(value, "1") != 0) {
+			return nullptr;
+		}
+		return new AprPreopener(8, 4096, [](uint32_t id) {
+			std::filesystem::path host_path;
+			if (!TryGetHostPath(id, &host_path)) {
+				return false;
+			}
+			LibKernel::IoStats::Timer io(LibKernel::IoStats::Api::AprPreopen);
+			Common::File              file;
+			if (!file.Open(host_path, Common::File::Mode::Read)) {
+				return false;
+			}
+			file.Close();
+			return true;
+		});
+	}();
+	return preopener;
+}
+
 static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	std::scoped_lock lock(g_mutex);
 	if (file_id == 0 || file_id > g_files.size()) {
@@ -145,6 +171,7 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 	if (guest_path == nullptr || guest_path[0] == '\0') {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
+	LibKernel::IoStats::Timer io(LibKernel::IoStats::Api::AprResolve);
 
 	ResolvedPathInfo  info {};
 	const std::string path(guest_path);
@@ -195,6 +222,9 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	if (info.result != OK) {
 		return info.result;
+	}
+	if (auto* preopener = Preopener(); preopener != nullptr && !info.is_dir) {
+		preopener->Queue(info.file_id);
 	}
 
 	if (id != nullptr) {
@@ -1325,6 +1355,13 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	const uint32_t id = out_submission_id != nullptr ? AprShared::AllocateSubmissionId() : 0;
 	if (out_submission_id != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id);
+	}
+	if (auto* preopener = AprShared::Preopener(); preopener != nullptr && !amm) {
+		for (const auto& command: state.commands) {
+			if (const auto* read = std::get_if<CommandBufferState::ReadFileCommand>(&command.data)) {
+				preopener->Queue(read->file_id);
+			}
+		}
 	}
 	static CommandEngine apr_engine(7);
 	static CommandEngine amm_engine(3);
