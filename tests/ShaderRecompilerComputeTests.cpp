@@ -62750,6 +62750,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--volume-shape-reuse-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckVolumeShapeReuse();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorMetadataClear();
