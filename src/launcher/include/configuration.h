@@ -79,8 +79,8 @@ public:
 	static constexpr int MIN_SCREEN_SIZE = 320;
 	static constexpr int MAX_SCREEN_SIZE = 16384;
 
-	// Written with every configuration; 1 = shader store on by default.
-	static constexpr int SETTINGS_VERSION = 1;
+	// Written with every configuration; 1 = shader store on by default, 2 = tessellation on by default.
+	static constexpr int SETTINGS_VERSION = 2;
 
 	static QString NormalizeResolution(const QString& text);
 
