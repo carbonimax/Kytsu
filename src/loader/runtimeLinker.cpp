@@ -662,19 +662,33 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 // SRT walker loads from pages listed after a fault (SrtWalker.h, KYTY_SRT_PROTECTED_LOADS): the
 // same backing read the fault path below does, while the page may hold GPU-written bytes (the
 // pages the tracker protects against reads); other pages leave the list and are loaded directly.
+// The backing read of a walker load. dirty: GPU-dirty bytes, tested before (the read cleans them).
+// rip: the faulting load, or 0 inside ProtectedLoad. KYTY_SRT_SYNC_LOG names the load (path walk or
+// memo check, through ProtectedLoad or a fault) in its line.
+static bool ReadWalkerWord(uint64_t address, uint32_t* value, bool dirty, uint64_t rip) {
+	char context[160] = "";
+	if (dirty && Libs::LibKernel::Memory::SrtSyncLogEnabled()) {
+		const auto site = Libs::Graphics::ShaderRecompiler::IR::CurrentWalkerSync(rip);
+		std::snprintf(context, sizeof(context), "path=%s%s shader=%016" PRIx64 " stage=%u site=+0x%x imm=0x%x",
+		              rip != 0 ? "fault-" : "", site.memo ? "memo" : "walk", site.shader_hash, site.stage,
+		              site.code_offset, site.immediate);
+	}
+	return Libs::LibKernel::Memory::TryReadWalkerBacking(address, value, dirty, context);
+}
+
+static bool WalkerSyncTested() {
+	return Libs::Graphics::ShaderRecompiler::IR::WalkStatsEnabled() || Libs::LibKernel::Memory::SrtSyncLogEnabled();
+}
+
 static uint32_t ReadWalkerBacking(uint64_t address, uint32_t* value) {
 	using namespace Libs::Graphics::ShaderRecompiler::IR;
 	if (!Libs::LibKernel::Memory::MaybeGpuModifiedPage(address)) {
 		return 0;
 	}
-	const uint32_t synced =
-	    WalkStatsEnabled() && Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(*value))
-	        ? ProtectedLoadSynced
-	        : 0u;
-	return (Libs::LibKernel::Memory::TryReadBufferBacking(address, value, sizeof(*value))
-	            ? ProtectedLoadValue | ProtectedLoadKeep
-	            : ProtectedLoadKeep) |
-	       synced;
+	const bool dirty =
+	    WalkerSyncTested() && Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(*value));
+	return (ReadWalkerWord(address, value, dirty, 0) ? ProtectedLoadValue | ProtectedLoadKeep : ProtectedLoadKeep) |
+	       (dirty ? ProtectedLoadSynced : 0u);
 }
 
 static bool SrtBackingReadsEnabled() {
@@ -756,9 +770,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				uint32_t   value   = 0;
 				const auto address = Loader::X64InstructionEmulator::LoadBaseR10(info->native_context);
 				// Tested before the read, which leaves the bytes clean (as ReadWalkerBacking does).
-				const bool synced = Libs::Graphics::ShaderRecompiler::IR::WalkStatsEnabled() &&
+				const bool synced = WalkerSyncTested() &&
 				                    Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(value));
-				if (Libs::LibKernel::Memory::TryReadBufferBacking(address, &value, sizeof(value))) {
+				if (ReadWalkerWord(address, &value, synced, info->exception_address)) {
 					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 					Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(true, synced);
 					Libs::Graphics::ShaderRecompiler::IR::SetProtectedLoadReader(&ReadWalkerBacking);

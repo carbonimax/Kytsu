@@ -178,6 +178,15 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+// KYTY_SRT_SYNC_LOG: the plan whose walk (or memo check) runs on this thread, and the return
+// address of the current ProtectedLoad call (inside the walker code).
+thread_local const ResourcePlan* t_running_plan   = nullptr;
+thread_local uint64_t            t_protected_site = 0;
+
+bool SyncLogSites() {
+	static const bool enabled = std::getenv("KYTY_SRT_SYNC_LOG") != nullptr;
+	return enabled;
+}
 
 std::atomic<bool>     g_walk_stats {false};
 std::atomic<uint64_t> g_walks {0};
@@ -219,7 +228,9 @@ uint64_t KYTY_SYSV_ABI ProtectedLoad(uint64_t address) {
 	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const auto reader = g_protected_reader.load(std::memory_order_acquire);
 	uint32_t   value  = 0;
+	t_protected_site  = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 	const auto result = reader != nullptr ? reader(address, &value) : ProtectedLoadKeep;
+	t_protected_site  = 0;
 	if (timed) {
 		g_protected_calls.fetch_add(1, std::memory_order_relaxed);
 		g_protected_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -248,7 +259,18 @@ uint64_t KYTY_SYSV_ABI ProtectedLoad(uint64_t address) {
 // With KYTY_SRT_PROTECTED_LOADS (default 1), loads from pages that faulted on a tracker protection
 // before call ProtectedLoad instead of faulting again (a Windows exception costs microseconds).
 // Free here: rax, rcx, r9, r11; live: rdi, rsi, rdx, r8 and the address in r10.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+// sites (KYTY_SRT_SYNC_LOG): gets the code range of this load and its immediate offset.
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address,
+               std::vector<std::array<uint32_t, 3>>* sites = nullptr, uint32_t immediate = 0) {
+	struct Site {
+		Xbyak::CodeGenerator&                 code;
+		std::vector<std::array<uint32_t, 3>>* sites;
+		uint32_t                              immediate, begin;
+		~Site() {
+			if (sites != nullptr && SyncLogSites())
+				sites->push_back({begin, static_cast<uint32_t>(code.getSize()), immediate});
+		}
+	} site {code, sites, immediate, static_cast<uint32_t>(code.getSize())};
 	code.lea(code.r10, code.ptr[address]);
 	if (ProtectedLoadsEnabled()) {
 		Xbyak::Label direct, done;
@@ -1054,7 +1076,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax);
+			LoadGuest(c, c.rax, &m_plan.srt_load_sites, static_cast<uint32_t>(immediate));
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -1084,7 +1106,8 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), &m_plan.srt_load_sites,
+			          static_cast<uint32_t>(immediate));
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1499,6 +1522,7 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 #if KYTY_SRT_X86_WALKER
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	plan.srt_memo_loads = UINT32_MAX;
+	plan.srt_load_sites.clear();
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 #else
 	plan.srt_memo_loads = UINT32_MAX;
@@ -1566,8 +1590,10 @@ bool MemoLoadsHold(const ResourcePlan& plan) {
 	const auto* begin = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	const auto& code  = LoadValidatorCode();
 	t_running_walker  = &code;
+	t_running_plan    = &plan;
 	const auto same   = code.getCode<LoadValidator>()(begin, begin + 2u * plan.srt_memo_loads);
 	t_running_walker  = nullptr;
+	t_running_plan    = nullptr;
 	return same != 0u;
 #else
 	(void)plan;
@@ -1628,9 +1654,11 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	flat.assign(plan.srt_reads.size(), 0u);
 	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	t_running_walker = plan.srt_code.get();
+	t_running_plan   = &plan;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
+	t_running_plan   = nullptr;
 	if (timed) {
 		g_walks.fetch_add(1, std::memory_order_relaxed);
 		g_walk_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1759,6 +1787,25 @@ WalkStats TakeWalkStats() noexcept {
 	        .reuse_hits   = g_reuse_hits.exchange(0, std::memory_order_relaxed),
 	        .reuse_ns     = g_reuse_ns.exchange(0, std::memory_order_relaxed),
 	        .reuse_diffs  = g_reuse_diffs.exchange(0, std::memory_order_relaxed)};
+}
+
+WalkerSyncSite CurrentWalkerSync(uint64_t rip) noexcept {
+	WalkerSyncSite site;
+	if (t_running_plan == nullptr || t_running_walker == nullptr) return site;
+	site.shader_hash = t_running_plan->shader_hash;
+	site.stage       = static_cast<uint32_t>(t_running_plan->stage);
+	site.memo        = t_running_walker != t_running_plan->srt_code.get();
+	const auto code  = reinterpret_cast<uint64_t>(t_running_walker->getCode());
+	const auto at    = rip != 0 ? rip : t_protected_site;
+	if (at - code < t_running_walker->getSize()) {
+		site.code_offset = static_cast<uint32_t>(at - code);
+		if (!site.memo) {
+			for (const auto& [begin, end, immediate]: t_running_plan->srt_load_sites) {
+				if (site.code_offset >= begin && site.code_offset < end) site.immediate = immediate;
+			}
+		}
+	}
+	return site;
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

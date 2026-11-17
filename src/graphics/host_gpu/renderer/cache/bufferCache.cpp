@@ -3123,6 +3123,47 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	       (AsyncFaultReadbacks() && FindPendingPublish(vaddr, size) != nullptr);
 }
 
+bool BufferCache::SyncLogEnabled() {
+	static const bool enabled = std::getenv("KYTY_SRT_SYNC_LOG") != nullptr;
+	return enabled;
+}
+
+void BufferCache::NoteWrittenBinding(const WrittenBinding& binding) {
+	std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+	for (const auto& known: m_written_bindings) {
+		if (known.vaddr == binding.vaddr && known.size == binding.size && known.shader_hash == binding.shader_hash) {
+			return; // one per frame would flush the ring
+		}
+	}
+	m_written_bindings[m_written_next++ % m_written_bindings.size()] = binding;
+}
+
+BufferCache::GpuDirtyInfo BufferCache::DescribeGpuDirty(uint64_t vaddr) {
+	GpuDirtyInfo info;
+	{
+		std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+		(void)m_gpu_modified_ranges.Find(vaddr, info.dirty_begin, info.dirty_end);
+		// Newest first.
+		for (size_t i = 0; i < m_written_bindings.size(); i++) {
+			const auto& known = m_written_bindings[(m_written_next - 1 - i) % m_written_bindings.size()];
+			if (known.size != 0 && vaddr - known.vaddr < known.size) {
+				info.binding = known;
+				break;
+			}
+		}
+	}
+	// Same window as ReadMemoryWindow.
+	if (const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits); owner != nullptr && *owner) {
+		auto& buffer = m_slot_buffers[*owner];
+		if (buffer.IsInBounds(vaddr, sizeof(uint32_t))) {
+			const auto window = ReadbackWindowBytes();
+			info.window_begin = std::max(buffer.CpuAddress(), Common::AlignDown(vaddr, window));
+			info.window_end   = std::min(buffer.CpuAddress() + buffer.Size(), Common::AlignUp(vaddr + 4, window));
+		}
+	}
+	return info;
+}
+
 bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Contains(vaddr, size);
 }

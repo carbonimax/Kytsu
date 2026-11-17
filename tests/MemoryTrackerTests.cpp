@@ -297,6 +297,12 @@ void TestRangeSet() {
             intersections[0].second == 0x1100 &&
             intersections[1].first == 0x1200 && intersections[1].second == 0x1220,
         "range set did not merge and intersect exact byte ranges");
+  uint64_t begin = 0, end = 0;
+  Check(ranges.Find(0x10ff, begin, end) && begin == 0x1000 && end == 0x1100 &&
+            ranges.Find(0x1200, begin, end) && begin == 0x1200 && end == 0x1240 &&
+            !ranges.Find(0x1100, begin, end) && !ranges.Find(0x1240, begin, end) &&
+            !ranges.Find(0x0fff, begin, end),
+        "range set find did not return the half-open range holding the address");
   ranges.Subtract(0x1040, 0x1e0);
   intersections.clear();
   ranges.ForEachInRange(0x1000, 0x300, [&](uint64_t start, uint64_t end) {

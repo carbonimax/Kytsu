@@ -1055,6 +1055,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
+		if (const auto& source = prepared.buffer_sources[index];
+		    resource.written && source.size != 0 && BufferCache::SyncLogEnabled()) {
+			m_context.GetBufferCache().NoteWrittenBinding({.vaddr = source.address, .size = source.size,
+			                                               .shader_hash = program.shader_hash,
+			                                               .max_byte_extent = resource.max_byte_extent,
+			                                               .atomic = resource.atomic});
+		}
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);

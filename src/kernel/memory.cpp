@@ -20,11 +20,15 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -944,6 +948,141 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return true;
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+bool SrtSyncLogEnabled() {
+	static const bool enabled = std::getenv("KYTY_SRT_SYNC_LOG") != nullptr;
+	return enabled;
+}
+
+namespace {
+
+struct SrtSyncLog {
+	std::mutex                            mutex; // walker syncs run on the GPU thread; kept simple
+	FILE*                                 file  = nullptr;
+	uint64_t                              limit = 64, skip = 0, every = 1;
+	uint64_t                              seen = 0, changed = 0, lines = 0;
+	std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	// Per DWORD address: synchronized reads, of which the download changed the value.
+	std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> words;
+	std::vector<uint32_t>                                       before, after;
+};
+
+SrtSyncLog& SyncLog() {
+	static SrtSyncLog* log = [] {
+		const auto env = [](const char* name, uint64_t fallback) {
+			const char* value = std::getenv(name);
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : fallback;
+		};
+		auto* l  = new SrtSyncLog;
+		l->limit = env("KYTY_SRT_SYNC_LOG_LINES", 64);
+		l->skip  = env("KYTY_SRT_SYNC_LOG_SKIP", 0);
+		l->every = std::max<uint64_t>(env("KYTY_SRT_SYNC_LOG_EVERY", 1), 1);
+		l->file  = std::fopen(std::getenv("KYTY_SRT_SYNC_LOG"), "w");
+		if (l->file != nullptr) {
+			std::fprintf(l->file, "# SRTSYNC v1 lines=%" PRIu64 " skip=%" PRIu64 " every=%" PRIu64
+			                      " written=unknown (no store offsets in the recompiler) proxy=backing before/after"
+			                      " the download\n",
+			             l->limit, l->skip, l->every);
+			std::fflush(l->file);
+		}
+		return l;
+	}();
+	return *log;
+}
+
+} // namespace
+
+bool TryReadWalkerBacking(uint64_t vaddr, uint32_t* value, bool dirty, const char* context) {
+	if (!dirty || !SrtSyncLogEnabled() || g_gpu_resources == nullptr) {
+		return TryReadBufferBacking(vaddr, value, sizeof(*value));
+	}
+	auto&           log = SyncLog();
+	std::lock_guard lock(log.mutex);
+	// Before the read: it cleans the dirty range.
+	const auto info      = GetGpuResources().GetBufferCache().DescribeGpuDirty(vaddr);
+	uint32_t   before    = 0;
+	const bool before_ok = TryReadBacking(vaddr, &before, sizeof(before));
+	const auto n         = log.seen++;
+	const bool sampled   = log.file != nullptr && log.lines < log.limit && n >= log.skip &&
+	                     (n - log.skip) % log.every == 0;
+	// Compared span: the written binding (else the dirty range) inside the download window.
+	const bool bound     = info.binding.size != 0;
+	uint64_t   cmp_begin = vaddr, cmp_end = vaddr + sizeof(uint32_t);
+	if (sampled && info.window_end > info.window_begin) {
+		const auto lo = bound ? info.binding.vaddr : info.dirty_begin;
+		const auto hi = bound ? info.binding.vaddr + info.binding.size : info.dirty_end;
+		const auto b  = (std::max(lo, info.window_begin) + 3u) & ~uint64_t {3};
+		const auto e  = std::min(hi, info.window_end) & ~uint64_t {3};
+		if (b < e && b <= vaddr && vaddr < e && e - b <= (uint64_t {16} << 20u)) {
+			cmp_begin = b;
+			cmp_end   = e;
+		}
+	}
+	const auto dwords = (cmp_end - cmp_begin) / sizeof(uint32_t);
+	bool       cmp_ok = false;
+	if (sampled) {
+		log.before.resize(dwords);
+		cmp_ok = TryReadBacking(cmp_begin, log.before.data(), dwords * sizeof(uint32_t));
+	}
+
+	const bool ok           = TryReadBufferBacking(vaddr, value, sizeof(*value));
+	const bool word_changed = ok && before_ok && *value != before;
+	log.changed += word_changed ? 1u : 0u;
+	std::pair<uint32_t, uint32_t> word_stats {1, word_changed ? 1u : 0u};
+	if (log.words.size() < 65536 || log.words.contains(vaddr)) {
+		auto& stats = log.words[vaddr];
+		stats.first++;
+		stats.second += word_changed ? 1u : 0u;
+		word_stats = stats;
+	}
+	if (!sampled) {
+		return ok;
+	}
+	log.lines++;
+	uint64_t changed_dwords = 0, first = UINT64_MAX, last = 0;
+	if (cmp_ok) {
+		log.after.resize(dwords);
+		cmp_ok = TryReadBacking(cmp_begin, log.after.data(), dwords * sizeof(uint32_t));
+		for (uint64_t i = 0; cmp_ok && i < dwords; i++) {
+			if (log.before[i] != log.after[i]) {
+				changed_dwords++;
+				first = std::min(first, i);
+				last  = i;
+			}
+		}
+	}
+	// Offsets are from the binding start (else from the compared span).
+	const auto base = bound ? info.binding.vaddr : cmp_begin;
+	const auto rel  = [&](uint64_t dword) { return cmp_begin - base + dword * sizeof(uint32_t); };
+	char       binding[160];
+	if (bound) {
+		std::snprintf(binding, sizeof(binding),
+		              "bind=0x%" PRIx64 "+0x%" PRIx64 " off=0x%" PRIx64 " wshader=%016" PRIx64 " atomic=%d extent=%u",
+		              info.binding.vaddr, info.binding.size, vaddr - base, info.binding.shader_hash,
+		              info.binding.atomic ? 1 : 0, info.binding.max_byte_extent);
+	} else {
+		std::snprintf(binding, sizeof(binding), "bind=none");
+	}
+	std::fprintf(log.file,
+	             "SRTSYNC line=%" PRIu64 " n=%" PRIu64 " t=%.3f addr=0x%" PRIx64 " %s %s dirty=0x%" PRIx64 "-0x%" PRIx64
+	             " win=0x%" PRIx64 "-0x%" PRIx64 " word=0x%08x->0x%08x word_changed=%d cmp=0x%" PRIx64 "+0x%" PRIx64
+	             " cmp_ok=%d changed_dwords=%" PRIu64 "/%" PRIu64 " changed_span=",
+	             log.lines, n,
+	             std::chrono::duration<double>(std::chrono::steady_clock::now() - log.start).count(), vaddr,
+	             context, binding, info.dirty_begin, info.dirty_end, info.window_begin, info.window_end, before,
+	             *value, word_changed ? 1 : 0, cmp_begin, cmp_end - cmp_begin, cmp_ok ? 1 : 0, changed_dwords,
+	             static_cast<uint64_t>(dwords));
+	if (changed_dwords != 0) {
+		std::fprintf(log.file, "0x%" PRIx64 "-0x%" PRIx64, rel(first), rel(last) + sizeof(uint32_t));
+	} else {
+		std::fprintf(log.file, "none");
+	}
+	std::fprintf(log.file,
+	             " word_seen=%u word_changes=%u seen=%" PRIu64 " changed=%" PRIu64 " ok=%d\n", word_stats.first,
+	             word_stats.second, log.seen, log.changed, ok ? 1 : 0);
+	std::fflush(log.file);
+	return ok;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

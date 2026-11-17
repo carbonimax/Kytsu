@@ -95,6 +95,18 @@ public:
 		}
 	}
 
+	// The range [begin, end) holding address.
+	[[nodiscard]] bool Find(uint64_t address, uint64_t& begin, uint64_t& end) const {
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin() || std::prev(it)->second <= address) {
+			return false;
+		}
+		--it;
+		begin = it->first;
+		end   = it->second;
+		return true;
+	}
+
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:

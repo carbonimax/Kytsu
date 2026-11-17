@@ -146,6 +146,14 @@ bool                   MaybeGpuModifiedPage(uint64_t vaddr);
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread: true when a byte of the range holds GPU-written data not yet in the backing.
 bool                   IsGpuDirtyBufferRange(uint64_t vaddr, uint64_t size);
+// KYTY_SRT_SYNC_LOG=<file> (diagnostic, off by default): SRT walker reads that synchronize GPU-dirty
+// bytes. TryReadBufferBacking of one DWORD; when dirty (tested by the caller before), the DWORD's
+// backing before and after the download is compared (proxy for "the GPU wrote it": the recompiler
+// keeps no store offsets) and a line is written with context, the written binding covering it,
+// the dirty range and the changed DWORDs of binding ∩ download window.
+// KYTY_SRT_SYNC_LOG_LINES (64): line cap; _SKIP (0): dirty reads skipped first; _EVERY (1): stride.
+[[nodiscard]] bool     SrtSyncLogEnabled();
+bool                   TryReadWalkerBacking(uint64_t vaddr, uint32_t* value, bool dirty, const char* context);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

@@ -145,6 +145,22 @@ public:
 	[[nodiscard]] bool MaybeGpuModifiedPage(uint64_t vaddr) {
 		return m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, sizeof(uint32_t));
 	}
+	// KYTY_SRT_SYNC_LOG=<file> (diagnostic, kernel/memory.h): storage bindings shaders write, kept
+	// (last 256 distinct) so a walker synchronization can name the binding that made its word dirty.
+	struct WrittenBinding {
+		uint64_t vaddr = 0, size = 0, shader_hash = 0;
+		uint32_t max_byte_extent = 0;
+		bool     atomic = false;
+	};
+	struct GpuDirtyInfo {
+		WrittenBinding binding;                                   // size 0: none covers vaddr
+		uint64_t       dirty_begin = 0, dirty_end = 0;           // GPU-dirty range holding vaddr
+		uint64_t       window_begin = 0, window_end = 0;         // what ReadMemoryWindow downloads
+	};
+	[[nodiscard]] static bool SyncLogEnabled();
+	void                      NoteWrittenBinding(const WrittenBinding& binding);
+	// GPU thread, before the synchronizing read (which cleans the range).
+	[[nodiscard]] GpuDirtyInfo DescribeGpuDirty(uint64_t vaddr);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -333,6 +349,8 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	// KYTY_CP_PIPELINE: the GPU thread's program lookups test the ranges while the back thread runs.
 	std::mutex                                        m_gpu_ranges_mutex;
+	std::array<WrittenBinding, 256>                   m_written_bindings {}; // m_gpu_ranges_mutex
+	size_t                                            m_written_next = 0;
 	struct OwnedWrite {
 		uint64_t             vaddr = 0, tick = 0;
 		std::vector<uint8_t> bytes;

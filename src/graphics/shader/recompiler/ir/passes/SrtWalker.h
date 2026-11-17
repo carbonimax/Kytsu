@@ -116,6 +116,15 @@ void      EnableWalkStats() noexcept;
 // ProtectedLoad that did, so protected_synced covers every walker synchronization.
 void      NoteWalkerFaultRead(bool backing, bool synced = false) noexcept;
 WalkStats TakeWalkStats() noexcept;
+// KYTY_SRT_SYNC_LOG: the walker load being synchronized on this thread. rip = the faulting load,
+// or 0 inside a ProtectedLoad reader. memo: the load is a KYTY_SRT_WALK_REUSE check of the memo.
+// immediate: the load's immediate offset (UINT32_MAX when unknown, always for memo checks).
+struct WalkerSyncSite {
+	uint64_t shader_hash = 0;
+	uint32_t stage = UINT32_MAX, code_offset = UINT32_MAX, immediate = UINT32_MAX;
+	bool     memo = false;
+};
+[[nodiscard]] WalkerSyncSite CurrentWalkerSync(uint64_t rip) noexcept;
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
