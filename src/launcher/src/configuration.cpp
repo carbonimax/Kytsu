@@ -169,6 +169,7 @@ void Configuration::WriteSettings(QSettings* s) const {
 	for (auto it = values.constBegin(); it != values.constEnd(); ++it) {
 		s->setValue(it.key(), it.value());
 	}
+	s->setValue("settings_version", SETTINGS_VERSION);
 	s->setValue("name", name);
 	s->setValue("basedir", basedir);
 	s->setValue("game_path", game_path);
@@ -178,6 +179,11 @@ void Configuration::WriteSettings(QSettings* s) const {
 
 void Configuration::ReadSettings(QSettings* s) {
 	ReadGameSettingsValues(*s);
+	if (s->value("settings_version", 0).toInt() < 1) {
+		// Saved before the shader store became the default: the stored false was the old default,
+		// not a choice.
+		shader_cache_enabled = true;
+	}
 	name               = s->value("name").toString();
 	basedir            = s->value("basedir").toString();
 	game_path          = s->value("game_path").toString();

@@ -33,7 +33,8 @@ namespace Libs::Graphics {
 // of the loaded modules and pipelines each launch used. A record that no launch used for
 // RetainedLaunches launches is dead, as is every duplicate and every use list; once dead records
 // are a quarter of the file, the store thread rewrites it next to the old one with the live
-// records only and renames it over the old one, which stays complete until then.
+// records only and renames it over the old one, which stays complete until then. A file larger
+// than the size cap at Open keeps only the records the last launch wrote or used, and compacts.
 //
 // Adapted from upstream ec8b75b2 (store and prewarm), dd5bc26c (background writer) and 83f8bfd3
 // (console messages).
@@ -102,6 +103,8 @@ struct ShaderStoreContents {
 	bool                             header_match = false;
 	// Open: the store thread rewrites the file with the live records before it appends.
 	bool                             compacting   = false;
+	// Open: the file was larger than the size cap.
+	bool                             over_cap     = false;
 };
 
 // Host state that changes the emitted SPIR-V; part of the store header.
@@ -117,14 +120,22 @@ public:
 	// Records waiting for the store thread are held to this many bytes; the GPU thread leaves the
 	// others to a later launch rather than wait.
 	static constexpr uint64_t MaxPendingBytes = 64'000'000;
+	// The size cap: about twice the store of a heavy title after its first launch.
+	static constexpr uint32_t DefaultMaxMegabytes = 512;
+
+	// KYTY_SHADER_STORE_MAX_MB (0: no cap), else DefaultMaxMegabytes, in bytes.
+	[[nodiscard]] static uint64_t MaxBytes();
 
 	ShaderStore();
 	~ShaderStore();
 	KYTY_CLASS_NO_COPY(ShaderStore);
 
 	// Reads the live records of the store at `path` whose header matches `host_key`, then keeps
-	// the file open to append; a mismatching or unreadable store starts over. Call once.
-	ShaderStoreContents Open(const std::filesystem::path& path, std::span<const uint8_t> host_key);
+	// the file open to append; a mismatching or unreadable store starts over. A file larger than
+	// `max_bytes` (0: no cap) keeps only what the last launch wrote or used. The cap is checked
+	// here only: a launch may append past it. Call once.
+	ShaderStoreContents Open(const std::filesystem::path& path, std::span<const uint8_t> host_key,
+	                         uint64_t max_bytes = MaxBytes());
 	[[nodiscard]] bool IsOpen() const { return m_thread.joinable(); }
 
 	// Encode on the calling thread; compression and writes run on the store thread, in order.

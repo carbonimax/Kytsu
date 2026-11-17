@@ -218,10 +218,11 @@ struct ShaderStore::Layout {
 namespace {
 
 // `layout`: what compaction keeps; `spirv_offsets` and `program_offsets`: where each loaded
-// module's SPIR-V and each loaded program are.
+// module's SPIR-V and each loaded program are; `retained`: a record unused for this many
+// launches is dead.
 ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const uint8_t> host_key,
                                ShaderStore::Layout* layout, std::vector<uint64_t>* spirv_offsets,
-                               std::vector<uint64_t>* program_offsets) {
+                               std::vector<uint64_t>* program_offsets, uint32_t retained) {
 	ShaderStoreContents contents;
 	contents.file_bytes = bytes.size();
 	const auto header   = FileHeader(host_key);
@@ -274,8 +275,8 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 	}
 	contents.kept_bytes = offset;
 	contents.launch     = last_launch + 1;
-	const auto live     = [&contents](uint32_t used) {
-		return used + ShaderStore::RetainedLaunches >= contents.launch;
+	const auto live     = [&contents, retained](uint32_t used) {
+		return used + retained >= contents.launch;
 	};
 	// The record's own count, plus the later launches whose use lists name it.
 	const auto count_uses = [](std::unordered_map<uint64_t, std::vector<uint32_t>>& launches,
@@ -477,11 +478,18 @@ std::vector<uint8_t> ShaderStoreHostKey(const GraphicContext& graphics) {
 
 ShaderStoreContents ShaderStore::Parse(std::span<const uint8_t> bytes,
                                        std::span<const uint8_t> host_key) {
-	return ParseStore(bytes, host_key, nullptr, nullptr, nullptr);
+	return ParseStore(bytes, host_key, nullptr, nullptr, nullptr, RetainedLaunches);
+}
+
+uint64_t ShaderStore::MaxBytes() {
+	const char* value     = std::getenv("KYTY_SHADER_STORE_MAX_MB");
+	const auto  megabytes = value != nullptr && value[0] != 0 ? std::strtoull(value, nullptr, 10)
+	                                                          : uint64_t {DefaultMaxMegabytes};
+	return megabytes * 1'000'000;
 }
 
 ShaderStoreContents ShaderStore::Open(const std::filesystem::path& path,
-                                      std::span<const uint8_t>     host_key) {
+                                      std::span<const uint8_t> host_key, uint64_t max_bytes) {
 	EXIT_IF(IsOpen() || host_key.empty());
 	m_path = path;
 	// A compaction cut short leaves its file; the store is still the old file, whole.
@@ -498,8 +506,12 @@ ShaderStoreContents ShaderStore::Open(const std::filesystem::path& path,
 			bytes.resize(read);
 		}
 	}
-	auto layout   = std::make_unique<Layout>();
-	auto contents = ParseStore(bytes, host_key, layout.get(), &m_spirv_offsets, &m_program_offsets);
+	// Past the cap, only the records of the last launch stay live (retained 1), and they compact.
+	const bool over_cap = max_bytes != 0 && bytes.size() > max_bytes;
+	auto       layout   = std::make_unique<Layout>();
+	auto       contents = ParseStore(bytes, host_key, layout.get(), &m_spirv_offsets,
+	                                 &m_program_offsets, over_cap ? 1 : RetainedLaunches);
+	contents.over_cap   = over_cap;
 	bytes         = {};
 	m_launch      = contents.launch;
 	Common::File::CreateDirectories(path.parent_path());
@@ -528,9 +540,10 @@ ShaderStoreContents ShaderStore::Open(const std::filesystem::path& path,
 	}
 	m_unused_modules   = m_known_modules;
 	m_unused_pipelines = m_known_pipelines;
-	contents.compacting = contents.kept_bytes != 0 &&
-	                      (contents.kept_bytes - contents.live_bytes) * CompactDeadDivisor >
-	                          contents.kept_bytes;
+	const auto dead_bytes = contents.kept_bytes - contents.live_bytes;
+	contents.compacting =
+	    contents.kept_bytes != 0 &&
+	    (over_cap ? dead_bytes != 0 : dead_bytes * CompactDeadDivisor > contents.kept_bytes);
 	if (contents.compacting) {
 		layout->header = FileHeader(host_key);
 		m_compaction   = std::move(layout);

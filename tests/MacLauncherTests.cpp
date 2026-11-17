@@ -47,7 +47,13 @@ int main(int argc, char* argv[]) {
 	Configuration legacy;
 	legacy.ReadSettings(&settings);
 	Check(legacy.mac_srt_readback_elide && legacy.mac_materialize_compiled && legacy.mac_commit_overlap_fast && legacy.mac_image_lookup_fast && legacy.mac_pervertex_unique_disabled, "old settings retain Mac defaults");
+	QSettings unversioned(temporary.filePath("unversioned.ini"), QSettings::IniFormat);
+	unversioned.setValue("shader_cache_enabled", false);
+	Configuration upgraded;
+	upgraded.ReadSettings(&unversioned);
+	Check(defaults.shader_cache_enabled && upgraded.shader_cache_enabled, "settings without settings_version get the shader store on");
 	Configuration changed;
+	changed.shader_cache_enabled = false;
 	changed.mac_srt_readback_elide = false;
 	changed.mac_materialize_compiled = false;
 	changed.mac_commit_overlap_fast = false;

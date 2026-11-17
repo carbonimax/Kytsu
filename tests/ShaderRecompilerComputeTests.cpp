@@ -1780,9 +1780,10 @@ void CheckShaderStore() {
   const auto stem = "kyty_shader_store_test_" + std::to_string(std::rand());
   const auto path = directory / (stem + ".shaders");
   const auto other_path = directory / (stem + "_cut.shaders");
+  const auto cap_path = directory / (stem + "_cap.shaders");
   auto temp = path;
   temp += ".tmp";
-  for (const auto &file : {path, other_path, temp}) {
+  for (const auto &file : {path, other_path, cap_path, temp}) {
     std::filesystem::remove(file, error);
   }
   const std::vector<uint8_t> host_key{1, 2, 3, 4};
@@ -2069,6 +2070,40 @@ void CheckShaderStore() {
             "a module unused for two launches was kept");
   }
 
+  // A store over the size cap keeps only what the last launch wrote or used: at launch 3 the
+  // pixel module, its program and the pipeline, last used at launch 1, go and the store
+  // compacts, where without the cap they stay (launch 3 above). A store at the cap is untouched.
+  {
+    ShaderStore store;
+    store.Open(cap_path, host_key);
+    store.AppendProgram(vertex_program);
+    store.AppendProgram(pixel_program);
+    store.AppendModule(first);
+    store.AppendModule(second);
+    store.AppendPipeline(pipeline);
+  }
+  {
+    ShaderStore store;
+    const auto contents = store.Open(cap_path, host_key, read_file(cap_path).size());
+    check_contents("at cap", contents, {&first, &second}, 1);
+    Require(name, "at cap", !contents.over_cap && !contents.compacting,
+            "a store at the size cap was taken as over it");
+    store.NoteUsedModule(first.module.handle.id);
+  }
+  const auto capped = read_file(cap_path).size();
+  {
+    ShaderStore store;
+    const auto contents = store.Open(cap_path, host_key, capped - 1);
+    check_contents("over cap", contents, {&first}, 0);
+    Require(name, "over cap", contents.launch == 3 && contents.over_cap && contents.compacting,
+            "a store over the size cap did not compact to the last launch");
+    store.WaitForWrites();
+    check_spirv("over cap", store, contents);
+  }
+  Require(name, "over cap size", read_file(cap_path).size() < capped / 2,
+          "the store over the size cap was not replaced with a smaller file");
+  check_contents("after cap", ShaderStore::Parse(read_file(cap_path), host_key), {&first}, 0);
+
   // Another host key starts the store over.
   {
     ShaderStore store;
@@ -2080,7 +2115,7 @@ void CheckShaderStore() {
           ShaderStore::Parse(read_file(path), host_key).modules.empty() &&
               ShaderStore::Parse(read_file(path), other_key).header_match,
           "the store was not rewritten for the new host key");
-  for (const auto &file : {path, other_path, temp}) {
+  for (const auto &file : {path, other_path, cap_path, temp}) {
     std::filesystem::remove(file, error);
   }
   std::printf("[host]    ShaderStore                       ok\n");
