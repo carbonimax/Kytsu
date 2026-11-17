@@ -584,7 +584,6 @@ bool RenderExecutor::LookUpDispatch(const HW::ComputeShaderInfo& cs_regs, uint32
 		     thread_group_x, thread_group_y, thread_group_z, mode);
 		return false;
 	}
-	const ImportShaderScope import_scope(m_context.GetBufferCache(), cs_regs.cs_regs.data_addr);
 
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS     = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS = 0xa038u;
@@ -760,6 +759,8 @@ void RenderExecutor::DispatchDirectBody(CommandBuffer& buffer,
                                         uint32_t thread_group_y, uint32_t thread_group_z,
                                         uint32_t mode, uint64_t epoch,
                                         const CpPipeline::DrawRecord* record) {
+	// The bindings below (FindBuffers) are what KYTY_MEM_IMPORT_SHADERS acts on.
+	const ImportShaderScope import_scope(m_context.GetBufferCache(), cs_regs.cs_regs.data_addr);
 	const bool use_thread_dimensions = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
