@@ -39144,8 +39144,9 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
                   O::V_READLANE_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   // A whole subgroup votes (OpGroupNonUniformAny %bool) unless wave32 is packed into a 64-lane
-  // host subgroup, where each half votes on its own ballot (OpAny %bool).
-  test.required_spirv = {"Any %bool"};
+  // host subgroup, where each half votes on its own ballot (OpAny %bool). Wave64 is never packed.
+  test.required_spirv = {wave_size == 64 ? "OpGroupNonUniformAny %bool" : "Any %bool"};
+  if (wave_size == 64) test.forbidden_spirv = {"OpAny"};
   test.compute_info.wave_size = wave_size;
   test.compute_info.threads_num[0] = threads;
   test.compute_info.thread_ids_num = 1;
