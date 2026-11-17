@@ -1573,6 +1573,8 @@ struct TestCase {
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
   size_t max_spirv_words = 0;
+  // Words equal to .first may all read back as .second instead (a host-chosen rounding); logged.
+  std::optional<std::pair<u32, u32>> expected_or;
 };
 
 struct GraphicsCase {
@@ -27607,6 +27609,17 @@ private:
 void CompareWords(const TestCase &test, const char *stage,
                   const std::vector<u32> &expected,
                   const std::vector<u32> &actual) {
+  if (test.expected_or) {
+    // One rounding for every such word: a host either gives .first everywhere or .second everywhere.
+    const auto [word, other] = *test.expected_or;
+    for (const u32 host : {word, other}) {
+      if (std::equal(expected.begin(), expected.end(), actual.begin(), actual.end(),
+                     [&](u32 e, u32 a) { return a == (e == word ? host : e); })) {
+        std::printf("[compute] %s: host stores %#010x where RDNA 2 stores %#010x\n", test.name, host, word);
+        return;
+      }
+    }
+  }
   if (actual == expected) {
     return;
   }
@@ -41128,9 +41141,14 @@ bool F16StoreRoundTowardZero() {
   return value != nullptr && value[0] == '1';
 }
 
-// 0x3f807e63 is 3.95 f16 ulps above 1.0. The hardware stores it toward zero as 0x3c03 (#1588); a host
-// pack that rounds to nearest (0x3c04) fails here unless KYTY_F16_STORE_RTZ=1.
+// 0x3f807e63 is 3.95 f16 ulps above 1.0. The hardware stores it toward zero as 0x3c03 (#1588). With
+// KYTY_F16_STORE_RTZ=1 the emulator must too; unset, the host PackHalf2x16 may also round to nearest
+// (0x3c04, MSL half conversions do), so either word passes and the log says which one the host gave.
 u32 Float16StoreOneWord() { return 0xc0003c03u; }
+std::optional<std::pair<u32, u32>> Float16StoreHostWord() {
+  if (F16StoreRoundTowardZero()) return std::nullopt;
+  return std::pair{Float16StoreOneWord(), 0xc0003c04u};
+}
 
 TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   using O = ShaderOpcode;
@@ -41156,6 +41174,7 @@ TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   test.code = std::move(code);
   test.initial = std::vector<u32>(4, 0xdeadbeefu);
   test.expected = {Float16StoreOneWord(), 0x34003800u, 0x4200c400u, 0x40000000u};
+  test.expected_or = Float16StoreHostWord();
   test.user_data = MakeStructuredStorageBufferData(
       8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
   test.has_user_data = true;
@@ -48324,6 +48343,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     AppendEnd(&producer.code);
     const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
     test.expected = test.initial;
+    if (wide) test.expected_or = Float16StoreHostWord();
     auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
     for (u32 group = 0; group < keys.size(); ++group) {
       const auto row = keys[group];
