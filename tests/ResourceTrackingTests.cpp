@@ -354,9 +354,10 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
   };
   put(16u, 0u);
   put(64u, 1u);
-  // A structurally valid but unsupported format at an unreachable DWORD start.
+  // A structurally valid but unsupported format (k8SScaled, named but unsampled) at an
+  // unreachable DWORD start. A gap format would now bind null instead of failing when read.
   const std::array<uint32_t, 8> unreachable{
-      0x00fff000u, 0x09500000u, 0u, 0x900003acu, 0u, 0u, 0u, 0u};
+      0x00fff000u, 0x00400000u, 0u, 0x900003acu, 0u, 0u, 0u, 0u};
   std::copy(unreachable.begin(), unreachable.end(), memory.words.begin() + 0x1064u / 4u);
   SrtRuntime runtime{.user_data = data, .userdata = &memory,
                      .read_specialization_memory = ReadLinearTestMemory};
@@ -4221,7 +4222,8 @@ void TestCompactScalarImageTable() {
       if (sharing != Sharing::None)
         std::copy_n(at, width, memory.words.begin() + (0x1000u + row * stride + image_offset) / 4u);
     }
-    const std::array poison{0x00fff000u, 0x09500000u, 0u, 0x900003acu};
+    // k8SScaled: named but unsampled, so it is read and still fails (a gap format now binds null).
+    const std::array poison{0x00fff000u, 0x00400000u, 0u, 0x900003acu};
     if (member == 0x16cu)
       std::copy(poison.begin(), poison.end(), memory.words.begin() + (0x1000u + 0x17cu) / 4u);
     memory.fail_address = 0x2000u + bytes; // Last descriptor ends at the readable boundary.

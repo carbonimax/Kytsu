@@ -1,4 +1,6 @@
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/shaderBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
@@ -1788,6 +1790,68 @@ void TestNullDescriptorFallbackTransitions() {
   Check(program.info.images[0].null_fallback && program.info.buffers[0].null_fallback, "fallback state was not propagated to native IR");
 }
 
+// The 8 words of a fatal "unsupported format 84" T# (2D array, swizzle 0). 84 lies in the
+// encoding gap 78..127, so the image binds null instead of failing specialization (upstream #1019).
+void TestUndefinedImageFormatBindsNull() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using namespace Libs::Graphics;
+  constexpr std::array<uint32_t, 8> words{0x00000000u, 0x0548bd40u, 0x00000009u, 0xd0e00000u,
+                                          0x00000012u, 0x00000002u, 0x00000004u, 0xd14ee930u};
+  const auto format = static_cast<Prospero::BufferFormat>((words[1] >> 20u) & 0x1ffu);
+  Check(static_cast<uint32_t>(format) == 84u && !Prospero::IsDefinedBufferFormat(format),
+        "the recorded descriptor does not decode to the undefined format 84");
+  for (const uint32_t gap : {78u, 127u, 137u, 139u, 155u, 183u})
+    Check(!Prospero::IsDefinedBufferFormat(Prospero::BufferFormat(gap)), "a gap format counts as defined");
+  // Named formats stay defined, including scaled ones that kFormatInfo has no row for.
+  for (const auto named : {Prospero::BufferFormat::k8UNorm, Prospero::BufferFormat::k8SScaled,
+                           Prospero::BufferFormat::k16_16_16_16SScaled, Prospero::BufferFormat::k32_32_32_32Float,
+                           Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k4_4_4_4UNorm,
+                           Prospero::BufferFormat::kFmask8_S2_F1, Prospero::BufferFormat::kBc7Srgb})
+    Check(Prospero::IsDefinedBufferFormat(named), "a named format counts as undefined");
+  // The T# comes from user data, so the walk reads it the way a draw does.
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 8u;
+  auto &block = AddValueBlock(program);
+  DescriptorSource image;
+  image.dword_count = 8u;
+  for (uint32_t i = 0; i < 8u; ++i)
+    image.dwords[i] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(i))}));
+  program.descriptor_sources.push_back(image);
+  program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Sampled, .read = true});
+  const auto plan = ExtractResourcePlan(program);
+  ShaderTextureResource input{};
+  std::copy_n(words.begin(), 8, input.fields);
+  Check(!input.IsNull(), "the recorded descriptor is already null, the format check would not be what rejects it");
+  auto data = words;
+  for (const bool native_null : {false, true}) {
+    SrtRuntime runtime{.user_data = data, .null_descriptor_supported = native_null};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    // Twice: the second rejection of the same format must not log again (checked by eye on stderr).
+    for (int pass = 0; pass < 2; ++pass) {
+      Check(MaterializeResources(plan, runtime, snapshot, specialization), "an undefined image format failed specialization");
+      ShaderTextureResource bound{};
+      std::copy_n(snapshot.images[0].dwords.begin(), 8, bound.fields);
+      Check(std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t w) { return w == 0u; }) && bound.IsNull(),
+            "an undefined image format did not bind a null image");
+      Check(specialization.images[0].null_fallback == !native_null, "the null image did not follow null descriptor support");
+    }
+  }
+  // Control, same plan: a defined format keeps its descriptor untouched, so the walk did read the T#.
+  data = {};
+  data[0] = 0x1000u;
+  data[1] = uint32_t(Prospero::BufferFormat::k32Float) << 20u;
+  data[3] = DstSel(4, 5, 6, 7) | (uint32_t(Prospero::ImageType::kColor2D) << 28u);
+  const SrtRuntime runtime{.user_data = data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            std::ranges::equal(snapshot.images[0].dwords, data) && !specialization.images[0].null_fallback,
+        "a defined format was rejected or altered");
+}
+
 // One descriptor serves a store, an atomic that a user-data condition guards, and an image no
 // block lists. Unreached, the atomic reads a zero descriptor instead of the RGBA8 format the
 // others use; reached, it rejects that format.
@@ -1986,6 +2050,7 @@ int main() {
   for (const bool compact : {false, true}) TestSamplerVariantRemaps(compact);
   TestSignedStorageSpecialization();
   TestNullDescriptorFallbackTransitions();
+  TestUndefinedImageFormatBindsNull();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) {
     for (const bool exact : {false, true}) TestIndirectImageSamplerClasses(mixed, exact);
