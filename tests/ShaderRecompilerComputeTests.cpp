@@ -292,6 +292,25 @@ struct RecordedCommandCounter {
   }
 };
 
+struct RayTracingTestAccess {
+  static vk::DeviceAddress Triangles(const RayTracing &mirror, uint32_t blas) {
+    return mirror.m_blases[blas].triangles->BufferDeviceAddress();
+  }
+  // TLASes, pairs, BLASes and readbacks in flight.
+  static std::array<size_t, 4> Counts(const RayTracing &mirror) {
+    const auto busy = std::ranges::count_if(
+        mirror.m_areas, [](const auto &area) { return area.tick != 0; });
+    return {mirror.m_tlases.size(), mirror.m_pairs.size(),
+            mirror.m_blases.size(), static_cast<size_t>(busy)};
+  }
+  // Runs suspend points up to the next eviction pass.
+  static void Evict(RayTracing &mirror) {
+    for (uint32_t frame = 0; frame < RayTracing::EvictFrames; ++frame) {
+      mirror.RunGarbageCollector();
+    }
+  }
+};
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
@@ -26454,6 +26473,7 @@ public:
 
 #include "PssrGpuTests.inc"
 #include "BvhMirrorGpuTests.inc"
+#include "RayQueryTraversalGpuTests.inc"
 
 private:
   Mode m_mode = Mode::Full;
@@ -62096,6 +62116,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bvh-mirror-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBvhMirror();
+    vulkan.CheckRayQueryTraversal();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pssr-only") == 0) {
@@ -62514,6 +62535,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckBvhMirror();
+  vulkan.CheckRayQueryTraversal();
   vulkan.CheckFaultBufferScan();
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();

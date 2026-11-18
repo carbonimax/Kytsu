@@ -47,6 +47,7 @@ struct GraphicContext {
 	bool                               maintenance8_enabled                  = false;
 	// Stencil image -> image copies into attachment images are lost (ResolveStencilCopyViaBuffer).
 	bool                               stencil_copy_via_buffer               = false;
+	bool                               ray_query_enabled                     = false;
 	bool                               r8_srgb_views                         = false;
 	bool                               r8g8_srgb_views                       = false;
 	bool                               r4g4b4a4_render_targets               = false;
