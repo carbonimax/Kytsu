@@ -167,6 +167,7 @@ struct ImageResource {
 	bool                          implicit_only = false;
 	uint32_t                      sample_min_lod = 0;
 	uint32_t                      view_min_level = 0;
+	bool                          sample_access_only     = true; // Every use is a sample.
 	bool                          depth_compare     = false;
 	bool                          skip_degamma      = false; // A sampler reads sRGB as stored.
 	bool                          cube              = false;
@@ -536,6 +537,7 @@ struct ShaderInfo {
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
+	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;

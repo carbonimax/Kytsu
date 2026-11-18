@@ -72,14 +72,15 @@ constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT  = 0x9F;
 /* Custom codes. Implemented via IT_NOP */
 
 constexpr uint32_t R_ZERO           = 0x00;
-constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
 constexpr uint32_t R_DISPATCH_RESET = 0x09;
 constexpr uint32_t R_PUSH_MARKER    = 0x0B;
 constexpr uint32_t R_POP_MARKER     = 0x0C;
 // Fork: cpSplitProf names these packets' drain causes.
 constexpr uint32_t R_WRITE_DATA     = 0x15;
-constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_DMA_DATA       = 0x19;
+// Fork: flips of GPU captures taken before the native flip blocks (replayed only).
+constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
+constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
 constexpr uint32_t R_PSSR           = 0x1B;
 
@@ -899,6 +900,38 @@ constexpr uint32_t GDS_OA_COUNTER           = 0x41E;
 constexpr uint32_t GDS_OA_ADDRESS           = 0x41F;
 
 constexpr uint32_t UC_NOP = 0xA2;
+
+// A tag written to SQ_THREAD_TRACE_USERDATA_2 names an operation in bits 24..31. A flip and a
+// flip-done wait each open a block of fixed size; a reset carries its operations in bits 0..15.
+constexpr uint32_t SQ_THREAD_TRACE_USERDATA_2  = 0x342;
+constexpr uint32_t USERDATA_TAG_FLIP           = 0xC7000000;
+constexpr uint32_t USERDATA_TAG_WAIT_FLIP_DONE = 0xCB000000;
+constexpr uint32_t USERDATA_TAG_RESET_QUEUE    = 0xCE000000;
+constexpr uint32_t FLIP_PACKET_DW              = 64;
+constexpr uint32_t WAIT_FLIP_DONE_PACKET_DW    = 32;
+
+// Fork: a flip or flip-done wait block (cmd_id, then at least 2 payload dw). The SET_UCONFIG_REG
+// handler runs exactly these blocks and ProcessPm4 drains the CP pipeline before them.
+constexpr bool IsFlipBlock(uint32_t cmd_id, const uint32_t* payload) {
+	const auto op = (cmd_id >> 8u) & 0xffu;
+	if ((op != IT_SET_UCONFIG_REG && op != IT_SET_UCONFIG_REG_INDEX) || KYTY_PM4_R(cmd_id) != 1u ||
+	    payload[0] != SQ_THREAD_TRACE_USERDATA_2) {
+		return false;
+	}
+	const auto tag = payload[1] & 0xff000000u;
+	return tag == USERDATA_TAG_FLIP || tag == USERDATA_TAG_WAIT_FLIP_DONE;
+}
+
+namespace ResetQueueOp {
+constexpr uint32_t CxState              = 1u << 0u;
+constexpr uint32_t ShState              = 1u << 1u;
+constexpr uint32_t UcState              = 1u << 2u;
+constexpr uint32_t InstanceCount        = 1u << 3u;
+constexpr uint32_t IndexAttributes      = 1u << 4u;
+constexpr uint32_t BaseIndirectPointers = 1u << 5u;
+constexpr uint32_t FlushCaches          = 1u << 6u;
+constexpr uint32_t PopContext           = 1u << 10u;
+} // namespace ResetQueueOp
 
 constexpr uint32_t UC_NUM = 0x3FFF + 1;
 

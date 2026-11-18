@@ -961,6 +961,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
 	add_test(NAME video_out_flip_rate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-rate-only)
+	add_test(NAME pm4_reset_queue
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --reset-queue-only)
 	add_test(NAME video_out_hdr10_to_sdr
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --video-out-only)
 	add_test(NAME depth_bits
@@ -1016,6 +1018,8 @@ if(BUILD_TESTING)
 		get_property(kyty_all_tests DIRECTORY PROPERTY TESTS)
 		foreach(kyty_test IN LISTS kyty_all_tests)
 			set_property(TEST ${kyty_test} APPEND PROPERTY ENVIRONMENT KYTY_HARNESS_RELAXED_FULL=1)
+			# The tests check the sampled table heap, off by default on Apple (KYTY_SAMPLED_TABLE_HEAP).
+			set_property(TEST ${kyty_test} APPEND PROPERTY ENVIRONMENT KYTY_SAMPLED_TABLE_HEAP=1)
 		endforeach()
 	endif()
 
