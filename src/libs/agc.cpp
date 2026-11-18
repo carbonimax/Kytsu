@@ -1862,8 +1862,8 @@ static uint32_t* set_registers_direct(CommandBuffer* buf, const volatile ShaderR
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
 
-	// num_regs comes from the guest: an unbounded alloca could overflow a guest thread's stack
-	// (and num_regs * 4 wraps past 2^30), so stage up to 256 values on the stack, more on the heap.
+	// num_regs comes from the guest: an unbounded alloca (up to 16 GiB) could overflow a guest
+	// thread's stack, so stage up to 256 values on the stack, more on the heap.
 	constexpr uint32_t    StackValues = 256;
 	uint32_t              stack_values[StackValues];
 	std::vector<uint32_t> heap_values;
