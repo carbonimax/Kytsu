@@ -280,7 +280,7 @@ struct InputUsage {
 };
 
 void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs,
-           const Inst& inst) {
+           const Inst& inst, bool buffer_int64_atomics) {
 	auto& info = program.info;
 	const auto op = inst.GetOpcode();
 	if (ImageOpcodeInfoOf(op).access != ImageAccess::None) {
@@ -342,8 +342,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
+				// Without host 64-bit buffer atomics a coherent pair store keeps its two word stores.
 				info.buffer_int64_atomics |=
-				    memory.IsCoherentBufferPairLoad(op) || memory.IsCoherentBufferPairStore(op);
+				    memory.IsCoherentBufferPairLoad(op) ||
+				    (buffer_int64_atomics && memory.IsCoherentBufferPairStore(op));
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
@@ -581,7 +583,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 
 } // namespace
 
-void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
+void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info,
+                       bool buffer_int64_atomics) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
 		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
 		                                                : "shader info already collected");
@@ -604,7 +607,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	uint32_t merged_exports = 0;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			Visit(program, input_info, inputs, inst);
+			Visit(program, input_info, inputs, inst, buffer_int64_atomics);
 			if (program.stage == ShaderType::Pixel && inst.GetOpcode() == ValueOpcode::SetAttribute) {
 				const auto& exp = program.export_info[inst.Flags<ExportFlags>().index];
 				if (exp.kind == ExportTargetKind::Mrt && exp.en != 0 && exp.index < 8u) merged_exports |= 1u << exp.index;

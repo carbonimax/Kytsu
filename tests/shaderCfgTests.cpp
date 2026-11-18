@@ -11267,6 +11267,21 @@ void TestOptionalShaderHostFeatures() {
   Check(supported.spirv == limited.spirv,
         "unused optional host features changed the shader");
   CheckSpirvBinaryValidates(limited.spirv);
+  // buffer_store_dwordx2 v[2:3], off, s[0:3], 0 glc: one 64-bit store with host 64-bit buffer
+  // atomics, two word stores (and no Int64Atomics) without them.
+  const uint32_t pair_store_shader[] = {0xe0744000u, 0x80000200u, EncodeSopp(0x01)};
+  options.host_features = {true, true};
+  const auto wide_store = RecompileForTest(pair_store_shader, options);
+  CheckSpirvBinaryValidates(wide_store.spirv);
+  Check(SpirvContainsCapability(wide_store.spirv, 12u) &&
+            DisassembleSpirvBinary(wide_store.spirv).find("OpAtomicStore") != std::string::npos,
+        "glc DWORDX2 store was not one 64-bit store with host support");
+  options.host_features.buffer_int64_atomics = false;
+  const auto split_store = RecompileForTest(pair_store_shader, options);
+  CheckSpirvBinaryValidates(split_store.spirv);
+  Check(!SpirvContainsCapability(split_store.spirv, 12u) &&
+            DisassembleSpirvBinary(split_store.spirv).find("OpAtomicStore") == std::string::npos,
+        "glc DWORDX2 store needed 64-bit buffer atomics without host support");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   const uint32_t atomic_shader[] = {0xe1680018u, 0x80000000u, EncodeSopp(0x01)};
   options.host_features = {true, false};
