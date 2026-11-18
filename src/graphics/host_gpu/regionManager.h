@@ -29,18 +29,18 @@
 
 namespace Libs::Graphics {
 
-// KYTY_TRACKING_LOCK (measurement, default 0): owner check of TrackingSpinLock.
-//   0: OS thread id at every lock and unlock;
+// KYTY_TRACKING_LOCK (default 1): owner check of TrackingSpinLock.
+//   0: OS thread id at every lock and unlock (the former path, also used before static init);
 //   1: thread id cached per thread, same check;
 //   2: no owner (a recursive lock spins forever, a non-owner unlock goes unnoticed).
 // Bit 4 (set from KYTY_MEMTRACK_PROF=1): acquisitions counted for the "PERF memtrack" line.
-// One value, so the default path costs a single load and branch. Defined in memTrackProf.cpp.
+// One value, so either path costs a single load and branch. Defined in memTrackProf.cpp.
 extern const uint32_t g_tracking_lock_flags;
 
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
-		if (g_tracking_lock_flags != 0) [[unlikely]] {
+		if (g_tracking_lock_flags != 0) [[likely]] {
 			LockWith(g_tracking_lock_flags);
 			return;
 		}

@@ -108,10 +108,11 @@ PFN_vkDestroyShaderModule         g_orig_vkDestroyShaderModule         = nullptr
 int  g_mode   = -1;
 bool g_submit = false;
 
-// KYTY_CP_RECORD_SPIN_TICKS: recorder spin before sleeping (TSC ticks; 0 = sleep at once).
+// KYTY_CP_RECORD_SPIN_TICKS: recorder spin before sleeping (TSC ticks; 0 = sleep at once, measured
+// slower: every resume then costs a wake).
 uint64_t g_spin_ticks = 1000000;
-// KYTY_CP_RECORD_PUBLISH_PER_DRAW=1 (mode 1): publish g_write at draws, dispatches, non-vkCmd calls
-// and before any wait on the recorder, instead of after every command.
+// Mode 1, on unless KYTY_CP_RECORD_PUBLISH_PER_DRAW=0: publish g_write at draws, dispatches,
+// non-vkCmd calls and before any wait on the recorder, instead of after every command.
 bool                      g_per_draw = false;
 std::array<bool, F_Count> g_publishes {};
 
@@ -1380,7 +1381,7 @@ void Install(vk::Device device) {
 			g_spin_ticks = std::strtoull(spin, nullptr, 10);
 		}
 		const char* per_draw = std::getenv("KYTY_CP_RECORD_PUBLISH_PER_DRAW");
-		g_per_draw = Mode() == 1 && per_draw != nullptr && std::strtol(per_draw, nullptr, 10) != 0;
+		g_per_draw = Mode() == 1 && (per_draw == nullptr || std::strtol(per_draw, nullptr, 10) != 0);
 		for (uint32_t i = 0; i < F_Count; i++) {
 			const char* name = g_func_names[i];
 			g_publishes[i]   = std::strncmp(name, "vkCmd", 5) != 0 || std::strncmp(name, "vkCmdDraw", 9) == 0 ||

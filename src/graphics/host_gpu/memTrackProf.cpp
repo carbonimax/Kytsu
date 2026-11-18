@@ -202,11 +202,12 @@ void NoteProtect(Prot mode, uint64_t bytes, uint64_t ns) noexcept {
 
 namespace Libs::Graphics {
 
-// regionManager.h (TrackingSpinLock). Zero (default path) for locks taken before static init.
+// regionManager.h (TrackingSpinLock). Zero (OS thread id, same owner value) for locks taken before
+// static init.
 extern const uint32_t g_tracking_lock_flags;
 const uint32_t        g_tracking_lock_flags = [] {
     const char* mode = std::getenv("KYTY_TRACKING_LOCK");
-    const int   m    = mode != nullptr ? std::atoi(mode) : 0;
+    const int   m    = mode != nullptr ? std::atoi(mode) : 1;
     return (m == 1 || m == 2 ? static_cast<uint32_t>(m) : 0u) | (MemTrackProf::Enabled() ? 16u : 0u);
 }();
 

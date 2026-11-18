@@ -1245,7 +1245,8 @@ void TestFatalPaths() {
   }
   CheckDeathCase("tracking-lock-exclusion", false);
   // KYTY_TRACKING_LOCK is read at process start, so each mode runs in a child.
-  SetTestEnv("KYTY_TRACKING_LOCK", "1"); // cached thread id: same owner checks
+  // Unset is mode 1 (cached thread id), run above; 0 is the off switch (OS thread id).
+  SetTestEnv("KYTY_TRACKING_LOCK", "0");
   CheckDeathCase("recursive-tracking-lock");
   CheckDeathCase("non-owner-tracking-unlock");
   CheckDeathCase("tracking-lock-exclusion", false);
