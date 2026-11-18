@@ -53,15 +53,24 @@ add_executable(launcher_presets_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(launcher_presets_tests Qt6::Core)
 target_include_directories(launcher_presets_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_executable(launcher_input_icons_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherInputIconsTests.cpp"
+	src/inputIcons.cpp
+)
+target_link_libraries(launcher_input_icons_tests Qt6::Gui)
+target_include_directories(launcher_input_icons_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 if(TARGET kyty_tests)
-	add_dependencies(kyty_tests launcher_presets_tests)
+	add_dependencies(kyty_tests launcher_presets_tests launcher_input_icons_tests)
 endif()
 if(BUILD_TESTING)
 	add_test(NAME launcher_presets COMMAND launcher_presets_tests)
+	add_test(NAME launcher_input_icons COMMAND launcher_input_icons_tests)
 	if(WIN32)
-		# The test runs before windeployqt puts Qt6Core.dll next to it.
-		set_tests_properties(launcher_presets PROPERTIES
+		# The tests run before windeployqt puts the Qt DLLs and platform plugins next to them.
+		set_tests_properties(launcher_presets launcher_input_icons PROPERTIES
 			ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
+		set_tests_properties(launcher_input_icons PROPERTIES
+			ENVIRONMENT "QT_PLUGIN_PATH=${Qt6_DIR}/../../../plugins")
 	endif()
 endif()
 
