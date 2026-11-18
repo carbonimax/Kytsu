@@ -492,6 +492,10 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(apr_preopen_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AprPreopenTests.cpp")
+target_link_libraries(apr_preopen_tests PRIVATE common)
+target_include_directories(apr_preopen_tests PRIVATE ${inc_headers})
+
 add_executable(driver_cache_policy_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DriverCachePolicyTests.cpp")
 target_link_libraries(driver_cache_policy_tests PRIVATE common)
 target_include_directories(driver_cache_policy_tests PRIVATE ${inc_headers})
@@ -843,6 +847,7 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME driver_cache_policy COMMAND $<TARGET_FILE:driver_cache_policy_tests>)
+	add_test(NAME apr_preopen COMMAND $<TARGET_FILE:apr_preopen_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
@@ -1033,6 +1038,7 @@ if(BUILD_TESTING)
 		page_manager_tests
 		build_flags_tests
 		driver_cache_policy_tests
+		apr_preopen_tests
 		archive_file_tests
 		trophy_system_tests
 		avplayer_file_tests
