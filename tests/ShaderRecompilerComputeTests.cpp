@@ -33360,8 +33360,9 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
                   O::S_ENDPGM};
   test.decoded_counts = {
       {"V_ADDC_U32 v2, vcc_lo, 0, v26.sdwa(sel=4,sext=1), vcc_lo", 1}};
-  // Carry-out of (0 + sext) + carry-in: 0 + x folds to x, leaving two unsigned compares.
-  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 2}};
+  // No ULessThan32 count: whether 0 + x folds differs by host (2 compares on Windows, 3 on macOS);
+  // the stored carry results check the behaviour.
+  test.ir_counts = {{" = BitFieldSExtract ", 1}};
   test.required_spirv = {"OpBitFieldSExtract"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
