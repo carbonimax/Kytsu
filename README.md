@@ -1,29 +1,32 @@
-# KytyPS5
+# Kytsu
 
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
+[![Build (Windows)](https://img.shields.io/github/check-runs/carbonimax/Kytsu/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20%28Windows%29)](https://github.com/carbonimax/Kytsu/actions/workflows/build.yml)
+[![Build (Linux)](https://img.shields.io/github/check-runs/carbonimax/Kytsu/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20%28Linux%29)](https://github.com/carbonimax/Kytsu/actions/workflows/build.yml)
+[![Build (macOS)](https://img.shields.io/github/check-runs/carbonimax/Kytsu/main?nameFilter=Build%20KytyPS5%20%28macOS%29&label=Build%20%28macOS%29)](https://github.com/carbonimax/Kytsu/actions/workflows/build.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
-**[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes, and ongoing development.
+Kytsu is based on KytyPS5 (https://github.com/KytyPS5/KytyPS5). It is a modified version; the git
+history records what changed and when.
+
+**[KytyPS5 weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes, and ongoing development upstream.
 
 **[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
 
-KytyPS5 is a free and open-source PlayStation 5 translation layer written in C++ for Windows
+Kytsu is a free and open-source PlayStation 5 translation layer written in C++ for Windows
 and Linux, with experimental macOS support. It is based on a heavily modified version of
 [Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
 can change significantly between builds.
 
 > [!IMPORTANT]
-> KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
+> Kytsu is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
 > not distribute games or copyrighted system software. Use only game files that you have obtained
 > legally.
 
 ## Current Status
 
-KytyPS5 can boot 2D and 3D games, including titles built with Unreal Engine
+Kytsu can boot 2D and 3D games, including titles built with Unreal Engine
 4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
 planned.
 
@@ -103,7 +106,7 @@ Keep each PR focused. Name the affected game, describe the exact problem, and pr
 
 Windows and Linux are the primary target platforms, so changes to shared code should not
 introduce regressions on either platform. Changes confined to a platform's own code paths
-only need to build on that platform. Because KytyPS5 is still evolving quickly, consider
+only need to build on that platform. Because Kytsu is still evolving quickly, consider
 opening an issue before starting a large change.
 
 ### Formatting
@@ -451,6 +454,7 @@ licenses included with those components.
 
 ## Special Thanks
 
+- [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5) — Kytsu is a modified version of KytyPS5.
 - [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
   of the original Kyty project.
 - [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4

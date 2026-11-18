@@ -133,7 +133,7 @@ void UpdateChecker::ShowPreviousResult(QWidget* parent) {
 		message = success ? tr("The update was installed successfully.")
 		                  : tr("The update could not be installed.");
 	}
-	QMessageBox(success ? QMessageBox::Information : QMessageBox::Warning, tr("KytyPS5 Update"),
+	QMessageBox(success ? QMessageBox::Information : QMessageBox::Warning, tr("Kytsu Update"),
 	            message, QMessageBox::Ok, parent)
 	    .exec();
 }
@@ -216,7 +216,7 @@ void UpdateChecker::CheckCurrent(const UpdateRelease::Info& current, bool manual
 }
 
 void UpdateChecker::OfferUpdate() {
-	QMessageBox question(QMessageBox::Information, tr("KytyPS5 Update"),
+	QMessageBox question(QMessageBox::Information, tr("Kytsu Update"),
 	                     tr("Version %1 is available.\n\nCurrent: %2\n\n"
 	                        "Download and install it now? The launcher will restart. Your settings "
 	                        "and games are kept.")
@@ -251,7 +251,7 @@ void UpdateChecker::Download() {
 	m_workspace = std::make_unique<QTemporaryDir>(
 	    QDir(directory).filePath(QStringLiteral(".kyty-update-XXXXXX")));
 	if (!m_workspace->isValid()) {
-		Finish(tr("The installation folder is not writable. Move KytyPS5 to a writable folder and "
+		Finish(tr("The installation folder is not writable. Move Kytsu to a writable folder and "
 		          "try again."));
 		return;
 	}
@@ -273,7 +273,7 @@ void UpdateChecker::Download() {
 	emit InstallingChanged(true);
 	m_progress = new QProgressDialog(tr("Downloading %1…").arg(m_release.tag), tr("Cancel"), 0, 100,
 	                                 m_parent);
-	m_progress->setWindowTitle(tr("KytyPS5 Update"));
+	m_progress->setWindowTitle(tr("Kytsu Update"));
 	m_progress->setWindowModality(Qt::ApplicationModal);
 	m_progress->setAutoClose(false);
 	m_progress->setAutoReset(false);
@@ -428,7 +428,7 @@ void UpdateChecker::Finish(QString error, bool report) {
 	if (!report) {
 		return;
 	}
-	QMessageBox message(QMessageBox::Warning, tr("KytyPS5 Update"), error, QMessageBox::Close,
+	QMessageBox message(QMessageBox::Warning, tr("Kytsu Update"), error, QMessageBox::Close,
 	                    m_parent);
 	if (!release_page.isEmpty()) {
 		message.addButton(QMessageBox::Open);

@@ -2,8 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleName</key><string>KytyPS5</string>
-	<key>CFBundleDisplayName</key><string>KytyPS5</string>
+	<key>CFBundleName</key><string>Kytsu</string>
+	<key>CFBundleDisplayName</key><string>Kytsu</string>
 	<key>CFBundleIdentifier</key><string>org.kytyps5.kytyps5</string>
 	<key>CFBundleVersion</key><string>@PROJECT_VERSION@</string>
 	<key>CFBundleShortVersionString</key><string>@PROJECT_VERSION@</string>
