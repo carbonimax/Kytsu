@@ -347,6 +347,7 @@ private:
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::atomic<uint64_t>                             m_color_metadata_epoch {0};
+	// Leaf lock: taken under TextureCache::m_lock (WritePublishTick), never takes another lock.
 	std::mutex                                        m_pending_mutex;
 	std::vector<PendingPublish>                       m_pending_publishes;
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;

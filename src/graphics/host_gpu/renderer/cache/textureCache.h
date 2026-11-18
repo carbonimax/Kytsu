@@ -361,6 +361,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	// KYTY_TC_LOCK_ORDER: never wait for priority operations under m_lock (they take it to deliver labels).
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
