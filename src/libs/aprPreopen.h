@@ -11,8 +11,8 @@
 #include <unordered_set>
 #include <vector>
 
-// KYTY_APR_PREOPEN=1 (default off). The APR engine reads on one thread and its first open of a file is slow
-// when the host cache is cold (~2-4 ms each, ~28k files per level). This opens and closes the files of resolved
+// On by default; KYTY_APR_PREOPEN=0 turns it off. The APR engine reads on one thread and its first open of a file
+// is slow when the host cache is cold (~2-4 ms each, ~28k files per level). This opens and closes the files of resolved
 // paths and queued reads on a few threads ahead of the engine, so those cold opens overlap and the engine's own
 // open is warm. No handle is kept: file changes, deletes and exit need nothing special.
 namespace Libs::AprShared {

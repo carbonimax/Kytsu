@@ -126,11 +126,12 @@ static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	return true;
 }
 
-// KYTY_APR_PREOPEN=1 (aprPreopen.h). Leaked on purpose: workers may still be opening at exit and use g_files.
+// On by default, KYTY_APR_PREOPEN=0 turns it off (aprPreopen.h). Leaked on purpose: workers may still be opening at
+// exit and use g_files.
 static AprPreopener* Preopener() {
 	static AprPreopener* preopener = []() -> AprPreopener* {
 		const char* value = std::getenv("KYTY_APR_PREOPEN");
-		if (value == nullptr || std::strcmp(value, "1") != 0) {
+		if (value != nullptr && std::strcmp(value, "0") == 0) {
 			return nullptr;
 		}
 		return new AprPreopener(8, 4096, [](uint32_t id) {
