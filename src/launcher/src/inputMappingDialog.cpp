@@ -521,6 +521,7 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 				auto* glyph = new QLabel(group);
 				glyph->setPixmap(icon.pixmap(QSize(24, 24), devicePixelRatioF()));
 				auto* cell = new QHBoxLayout;
+				cell->setSpacing(6);
 				cell->addWidget(glyph);
 				cell->addWidget(name, 1);
 				rows->addLayout(cell, row, 0);
