@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -117,6 +118,7 @@
 #include <tuple>
 #include <variant>
 #include <vector>
+#include <xxhash.h>
 
 // Thumbnail PNGs of failing capture replays (the emulator's copy in libPngEnc.cpp is not linked here).
 #define STB_IMAGE_WRITE_STATIC
@@ -242,6 +244,54 @@ struct BufferCacheTestAccess {
   static void DeleteBuffer(BufferCache &cache, BufferId id) { cache.DeleteBuffer(id); }
 };
 
+// Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
+// barriers whose only destination stage is indirect argument reads, and keeps the last vertex
+// buffer bindings.
+struct RecordedCommandCounter {
+  struct VertexBuffers {
+    std::vector<VkBuffer> buffers;
+    std::vector<VkDeviceSize> offsets;
+    std::vector<VkDeviceSize> sizes;
+  };
+  static inline uint32_t barriers = 0;
+  static inline uint32_t indirect_barriers = 0;
+  static inline uint32_t copies = 0;
+  static inline VertexBuffers vertex_buffers;
+  static inline PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
+  static inline PFN_vkCmdCopyBuffer copy_buffer = nullptr;
+  static inline PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers = nullptr;
+
+  RecordedCommandCounter() {
+    auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+    barriers = indirect_barriers = copies = 0;
+    vertex_buffers = {};
+    bind_vertex_buffers = std::exchange(
+        dispatcher.vkCmdBindVertexBuffers2,
+        [](VkCommandBuffer command, uint32_t first, uint32_t count, const VkBuffer *buffers,
+           const VkDeviceSize *offsets, const VkDeviceSize *sizes,
+           const VkDeviceSize *strides) {
+          vertex_buffers = {{buffers, buffers + count},
+                            {offsets, offsets + count},
+                            {sizes, sizes + count}};
+          bind_vertex_buffers(command, first, count, buffers, offsets, sizes, strides);
+        });
+    pipeline_barrier = std::exchange(dispatcher.vkCmdPipelineBarrier, [](auto... args) {
+      ++barriers;
+      indirect_barriers += std::get<2>(std::tie(args...)) == VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+      pipeline_barrier(args...);
+    });
+    copy_buffer = std::exchange(dispatcher.vkCmdCopyBuffer, [](auto... args) {
+      ++copies;
+      copy_buffer(args...);
+    });
+  }
+  ~RecordedCommandCounter() {
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier = pipeline_barrier;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyBuffer = copy_buffer;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBindVertexBuffers2 = bind_vertex_buffers;
+  }
+};
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
@@ -274,7 +324,12 @@ struct ImageHeapTestAccess {
     return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
   }
   static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
-    return Element(heap, entry).binding.image_id;
+    return Element(heap, entry).image;
+  }
+  static size_t IndexCount(const ImageHeap &heap) { return heap.m_index.size(); }
+  static size_t HeldCount(const ImageHeap &heap) { return heap.m_held.size(); }
+  static const auto &Slots(const ImageHeap &heap, size_t memory) {
+    return heap.m_memories.at(memory)->views.at(0)->slots;
   }
   // Whether the newest table no longer watches its last page.
   static bool TailPageDirty(const ImageHeap &heap) {
@@ -6398,11 +6453,8 @@ public:
               filtered.slots[0] != 0u && filtered.slots[8] == filtered.slots[0] &&
                   filtered.slots[40] != 0u && filtered.slots[40] != filtered.slots[0] &&
                   filtered.slots[1] == 0u && filtered.slots.back() == 0u &&
-                  ImageHeapTestAccess::ElementCount(heap) == 3u &&
-                  ImageHeapTestAccess::Element(heap, 0u).binding.layout ==
-                      vk::ImageLayout::eShaderReadOnlyOptimal,
-              "probes did not share equal descriptors, left a non-null gap or wrote the null "
-              "element without a sampled layout");
+                  ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "probes did not share equal descriptors or left a non-null gap");
       Require(name, "second view",
               acquire(unfiltered) && views.size() == 2u &&
                   ImageHeapTestAccess::ElementCount(heap) == 5u,
@@ -6413,6 +6465,17 @@ public:
       Require(name, "resident images",
               resident && textures.GetImage(resident).heap_refs.load() == 2u,
               "resolved elements did not pin their image");
+      // A CPU write to a resident image reaches the next draw without rediscovering it.
+      const uint32_t texel = 0xff00ff00u;
+      Libs::LibKernel::Memory::WriteBacking(base + 0x10000u, &texel, sizeof(texel));
+      Require(name, "image write",
+              context.InvalidateMemory(base + 0x10000u, sizeof(texel)) &&
+                  textures.GetImage(resident).IsCpuDirty(),
+              "a CPU write did not dirty the resident image");
+      Require(name, "written image", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "refreshed image", !textures.GetImage(resident).IsCpuDirty(),
+              "a draw sampled a resident image without its CPU write");
 
       // Only acquired views take table changes; the idle one must not allocate.
       const auto idle_slot = idle.slots[40];
@@ -6451,21 +6514,37 @@ public:
               "a view probed descriptors past the guest table bound");
       draw();
 
-      // Only leaving the read state invalidates resident images.
+      // Only leaving the read state queues a change of a resident image.
       auto &image = textures.GetImage(resident);
-      const auto epoch = Libs::Graphics::Image::heap_epoch.load();
+      const auto queued = [&] {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        return std::ranges::count(Libs::Graphics::Image::heap_changes, image.serial,
+                                  &Libs::Graphics::Image::HeapChange::serial);
+      };
+      const auto before = queued();
       for (uint32_t pass = 0; pass < 2u; ++pass) {
         image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
                       scheduler.Current().Handle());
       }
-      Require(name, "write epoch", Libs::Graphics::Image::heap_epoch.load() == epoch + 1u,
-              "repeated writes after leaving the read state bumped the heap epoch again");
+      Require(name, "write change", queued() == before + 1,
+              "repeated writes after leaving the read state queued the image again");
       Require(name, "read again", acquire(sampled), "the view was declined");
       draw();
       Require(name, "read layout",
               image.backing.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
-                  Libs::Graphics::Image::heap_epoch.load() == epoch + 1u,
+                  queued() == 0,
               "commit did not return a resident image to its read layout");
+      // One that leaves it after discovery, as for a download, returns at commit too.
+      Require(name, "late transit", acquire(sampled), "the view was declined");
+      heap.Rebind(executor);
+      image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
+                    scheduler.Current().Handle());
+      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      Require(name, "late read layout",
+              image.backing.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal,
+              "commit missed a resident image that left the read layout after discovery");
+      scheduler.Finish();
+      heap.BeginDraw();
 
       // An image freed during a draw's discovery lives until the tick ends, and the draw's
       // slots still select it.
@@ -6480,6 +6559,26 @@ public:
                   textures.GetImage(freed).backing.state.layout ==
                       vk::ImageLayout::eShaderReadOnlyOptimal,
               "commit skipped the read transition of a freed but sampled image");
+      scheduler.Finish();
+      heap.BeginDraw();
+      // So does an earlier one that leaves the read layout and is freed after discovery.
+      write(10, descriptor(14, Format::k8_8_8_8UNorm));
+      Require(name, "earlier image", acquire(sampled), "the view was declined");
+      draw();
+      const auto earlier = ImageHeapTestAccess::ImageOf(heap, filtered.slots[80]);
+      Require(name, "freed after discovery", earlier && acquire(sampled),
+              "the view was declined or its image was not resolved");
+      heap.Rebind(executor);
+      textures.GetImage(earlier).Transit(vk::ImageLayout::eGeneral,
+                                         vk::AccessFlagBits2::eShaderWrite, {},
+                                         scheduler.Current().Handle());
+      textures.UnmapMemory(base + 0x10000u + 14u * 0x1000u, 0x1000u);
+      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      Require(name, "freed earlier image layout",
+              !textures.GetImage(earlier).registered &&
+                  textures.GetImage(earlier).backing.state.layout ==
+                      vk::ImageLayout::eShaderReadOnlyOptimal,
+              "commit skipped the read transition of an image freed after it left the read layout");
       scheduler.Finish();
       heap.BeginDraw();
 
@@ -6499,7 +6598,7 @@ public:
       draw();
       Require(name, "stale rescan",
               filtered.kinds.size() == 2u &&
-                  ImageHeapTestAccess::Element(heap, filtered.slots[40]).value.dwords ==
+                  ImageHeapTestAccess::Element(heap, filtered.slots[40]).key.value.dwords ==
                       descriptor(3, Format::k8_8_8_8UNorm),
               "a stale element's rescan took a kind its view's programs lack");
 
@@ -6550,9 +6649,14 @@ public:
       draw();
       Require(name, "dead after a skipped draw", filtered.slots[160] == 0u,
               "the rescan of a view left acquired resolved a dead descriptor");
-      // A new descriptor over unmapped memory is never resolved.
+      // A new descriptor over unmapped memory is never resolved, even one whose address breaks
+      // its tiling's alignment.
+      auto unmapped = descriptor(23, Format::k8_8_8_8UNorm);
+      unmapped[0] += 1u;
+      unmapped[2] = 255u | (255u << 14u);
+      unmapped[3] |= static_cast<uint32_t>(Prospero::TileMode::kStandard4KB) << 20u;
       context.UnmapMemory(texture(23), 0x1000u);
-      write(23, descriptor(23, Format::k8_8_8_8UNorm));
+      write(23, unmapped);
       Require(name, "unmapped texture", acquire(sampled), "the view was declined");
       draw();
       Require(name, "unmapped descriptor", !textures.IsRegionRegistered(texture(23), 0x1000u),
@@ -6619,8 +6723,10 @@ public:
       draw();
       Require(name, "retry", acquire(sampled), "the view was declined");
       draw();
-      Require(name, "reused held element", held != 0u && filtered.slots[424] == held,
-              "a reused element was retried as the held element it replaced");
+      Require(name, "reused held element",
+              held != 0u && filtered.slots[424] == held &&
+                  ImageHeapTestAccess::HeldCount(heap) == 0u,
+              "a reused element was retried or kept as the held element it replaced");
       // A 2D view of a heap-pinned volume is another image type, not another extent.
       auto plane_root = sampled;
       plane_root.heap = true;
@@ -6672,13 +6778,109 @@ public:
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "unmapping the table kept its images pinned");
-      // A smaller table enters once a second draw acquires it and leaves at the suspend point
-      // after a frame that did not acquire it. Larger tables stay.
+      // Only pinned images queue heap changes: an unpinned one never takes Image::heap_mutex,
+      // which TextureCache::m_lock holders would otherwise wait on.
+      {
+        const auto pending = [] {
+          std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+          return Libs::Graphics::Image::heap_changes.size();
+        };
+        const auto unpinned = pending();
+        textures.GetImage(resident).HeapChanged();
+        Require(name, "unpinned change", pending() == unpinned,
+                "an image no heap pins queued a heap change");
+      }
+      // A pinned depth image left in its read layout widens its tracked access with each
+      // read-only depth test (KYTY_RO_DEPTH_ELIDE); leaving that layout must still queue it. The
+      // depth-only image takes the read-only attachment use KYTY_DEPTH_LAYOUT_KEEP keeps.
+      for (const bool with_stencil : {true, false}) {
+        const uint64_t address = base + (with_stencil ? 0x80000u : 0x90000u);
+        auto desc = MakeLinearDesc(
+            address, 16u * 16u * 4u,
+            with_stencil ? vk::Format::eD32SfloatS8Uint : vk::Format::eD32Sfloat,
+            Format::k32Float, Prospero::ImageType::kColor2D, {16, 16, 1}, 1, 4, 1);
+        desc.type = TextureCache::BindingType::DepthTarget;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        if (with_stencil) {
+          desc.info.stencil = {address + 0x8000u, 16u * 16u};
+          desc.view_info.aspect |= vk::ImageAspectFlagBits::eStencil;
+        }
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        auto &depth = textures.GetImage(textures.FindImage(desc));
+        const auto depth_queued = [&] {
+          std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+          return std::ranges::count(Libs::Graphics::Image::heap_changes, depth.serial,
+                                    &Libs::Graphics::Image::HeapChange::serial);
+        };
+        constexpr auto attachment = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+        const auto commands = scheduler.Current().Handle();
+        depth.heap_refs.fetch_add(1u);
+        depth.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+                      vk::AccessFlagBits2::eShaderRead, {}, commands);
+        depth.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal, attachment, {}, commands);
+        const auto widened = depth_queued();
+        depth.Transit(vk::ImageLayout::eDepthStencilAttachmentOptimal, attachment, {}, commands);
+        Require(name, with_stencil ? "read-only depth/stencil exit" : "read-only depth exit",
+                depth_queued() == widened + 1,
+                "a pinned depth image left its read layout unqueued after a read-only depth test");
+        depth.heap_refs.fetch_sub(1u);
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        std::erase_if(Libs::Graphics::Image::heap_changes, [&](const auto &change) {
+          return change.serial == depth.serial;
+        });
+      }
+      // One element serves a descriptor in every table. A table the guest republishes at a new
+      // base takes over the copy that idled a frame, with its views and slots.
+      constexpr uint64_t copy_table = base + 0x1c0000;
+      constexpr uint64_t republished = base + 0x1e0000;
+      std::memcpy(reinterpret_cast<void *>(copy_table), reinterpret_cast<void *>(table), table_size);
+      std::memcpy(reinterpret_cast<void *>(republished), reinterpret_cast<void *>(table), table_size);
+      Require(name, "original table", acquire(sampled), "the table was declined");
+      const auto indexed = ImageHeapTestAccess::IndexCount(heap);
+      Require(name, "shared elements",
+              acquire(sampled, copy_table) && ImageHeapTestAccess::IndexCount(heap) == indexed &&
+                  ImageHeapTestAccess::MemoryCount(heap) == 2u &&
+                  ImageHeapTestAccess::Slots(heap, 1u) == ImageHeapTestAccess::Slots(heap, 0u),
+              "a second table with the same descriptors interned them again");
+      const auto copy_slots = view.slots;
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "original only", acquire(sampled), "the table was declined");
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "republished table",
+              acquire(sampled, republished) && view.slots == copy_slots &&
+                  ImageHeapTestAccess::MemoryCount(heap) == 2u &&
+                  ImageHeapTestAccess::IndexCount(heap) == indexed,
+              "a republished table did not take over its idle copy");
+      draw();
+      // A copy that buried a word is not taken over: a new table resolves the word.
+      context.UnmapMemory(texture(31), 0x1000u);
+      context.MapMemory(texture(31), 0x1000u);
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "original again", acquire(sampled), "the table was declined");
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "buried copy", acquire(sampled, copy_table), "the table was declined");
+      draw();
+      Require(name, "fresh table",
+              ImageHeapTestAccess::MemoryCount(heap) == 3u &&
+                  ImageHeapTestAccess::ImageOf(heap, ImageHeapTestAccess::Slots(heap, 2u)[248]),
+              "a table took over a copy that buried a word");
+      heap.UnmapMemory(table, table_size);
+      heap.UnmapMemory(republished, table_size);
+      heap.UnmapMemory(copy_table, table_size);
+      // A smaller table leaves at the suspend point after a frame that did not acquire it, a
+      // larger one after 32 such frames.
       const IR::ImageHeapRequest smaller{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
-      Require(name, "first small draw",
-              acquire(sampled, idle_table) && !heap.Acquire(smaller, view) &&
-                  !heap.Acquire(smaller, view),
-              "a smaller table entered on its first draw");
+      Require(name, "small table",
+              acquire(sampled, idle_table) && heap.Acquire(smaller, view),
+              "a smaller table was declined");
       draw();
       Require(name, "second small draw", heap.Acquire(smaller, view),
               "a smaller table was declined on its second draw");
@@ -6691,6 +6893,12 @@ public:
               ImageHeapTestAccess::MemoryCount(heap) == 1u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "a suspend point kept an idle smaller table pinned or dropped a larger one");
+      for (uint32_t frame = 2; frame < 32u; ++frame) heap.RunGarbageCollector();
+      Require(name, "idle larger table", ImageHeapTestAccess::MemoryCount(heap) == 1u,
+              "a larger table left before 32 idle frames");
+      heap.RunGarbageCollector();
+      Require(name, "aged larger table", ImageHeapTestAccess::MemoryCount(heap) == 0u,
+              "a larger table stayed resident after 32 idle frames");
       // The idle table stays watched; destroying the heap must unwatch it before the page
       // manager fails on live watches.
       Require(name, "idle table",
@@ -8578,10 +8786,9 @@ public:
                   native_volume.backing.state.access_mask ==
                       vk::AccessFlagBits2::eTransferRead &&
                   native_array.backing.state.layout ==
-                      vk::ImageLayout::eGeneral &&
+                      vk::ImageLayout::eTransferDstOptimal &&
                   native_array.backing.state.access_mask ==
-                      (vk::AccessFlagBits2::eShaderRead |
-                       vk::AccessFlagBits2::eTransferRead),
+                      vk::AccessFlagBits2::eTransferWrite,
               "Image::CopyImage did not retain pinned "
               "source/destination states");
 
@@ -8844,8 +9051,27 @@ public:
                                         ms_stencil_size};
       const auto switched_ms_depth_id =
           texture_cache.FindImage(switched_ms_depth);
+      // A heap may pin the ordinary image that becomes the association.
+      const auto stencil_serial = texture_cache.GetImage(stencil_storage_image).serial;
+      const auto stencil_queued = [&] {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        return std::ranges::count(Libs::Graphics::Image::heap_changes, stencil_serial,
+                                  &Libs::Graphics::Image::HeapChange::serial);
+      };
+      texture_cache.GetImage(stencil_storage_image).heap_refs.fetch_add(1u);
+      const auto before_association = stencil_queued();
       TextureCacheTestAccess::AssociateStencil(
           texture_cache, switched_ms_depth_id, switched_ms_depth.info.stencil);
+      Require(name, "pinned stencil association",
+              stencil_queued() == before_association + 1,
+              "a pinned image became a stencil association without a heap change");
+      texture_cache.GetImage(stencil_storage_image).heap_refs.fetch_sub(1u);
+      {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        std::erase_if(Libs::Graphics::Image::heap_changes, [&](const auto &change) {
+          return change.serial == stencil_serial;
+        });
+      }
       const auto second_stencil_association = texture_cache.FindImageFromRange(
           base + second_stencil_offset, ms_stencil_size, false);
       Require(name, "stencil association switch",
@@ -9402,6 +9628,10 @@ public:
       fault_b_desc.info.data.address = base + 0x8010;
       const auto fault_a_image = texture_cache.FindImage(fault_a_desc);
       const auto fault_b_image = texture_cache.FindImage(fault_b_desc);
+      Require(name, "guest edge hash",
+              texture_cache.GetImage(fault_a_image).HashGuestEdges() ==
+                  XXH3_64bits(&fault_a, sizeof(fault_a)),
+              "the edge hash covered bytes outside the image");
       (void)texture_cache.FindTexture(fault_a_image, fault_a_desc);
       (void)texture_cache.FindTexture(fault_b_image, fault_b_desc);
       texture_cache.MarkGpuWritten(fault_a_image);
@@ -14174,6 +14404,7 @@ public:
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
         set_buffer(0, output, 16u * sizeof(u32));
         const auto tick = scheduler.CurrentTick();
+        const RecordedCommandCounter counter;
         if (test.transfer) {
           const std::array<u32, 3> packet{static_cast<u32>(args),
                                          static_cast<u32>(args >> 32u), test.mode};
@@ -14188,6 +14419,9 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
         }
+        // The writers' trailing barriers already cover indirect argument reads.
+        Require(name, "no argument barrier", RecordedCommandCounter::indirect_barriers == 0,
+                "the indirect dispatch recorded its own argument barrier");
         if (test.mode == 0x41u) {
           Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
                   "workgroup-count arguments caused a host submission or readback");
@@ -14957,7 +15191,7 @@ public:
       const auto layout = fill_case.layout;
       const auto type = fill_case.type;
       const auto bytes_per_pixel = TextureGetRenderTargetFormat(
-          layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
+          m_runtime_context, layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
       const uint32_t probe_width = bytes_per_pixel == 2 ? 2 : 1;
       const uint32_t selected_layer =
           fill_case.cmask || fill_case.eliminate_fast_clear || fill_case.dcc_mips ? 1 : 0;
@@ -16821,14 +17055,14 @@ public:
                 vk::ComponentSwizzle::eZero},
             "cyclic host mapping reordered output slots or descriptor constants");
     const auto target = TextureGetRenderTargetFormat(
-        Prospero::ChannelLayout::k1_5_5_5, Prospero::ChannelType::kUNorm,
+        m_runtime_context, Prospero::ChannelLayout::k1_5_5_5, Prospero::ChannelType::kUNorm,
         Prospero::ChannelOrder::kStandard);
     Require(name, "1555 render target",
             target.format == vk::Format::eR5G5B5A1UnormPack16 &&
                 target.export_mapping == Prospero::ColorMappingAbgr,
             "shared format resolution changed the existing 1555 render target");
     for (const auto native : {target, TextureGetRenderTargetFormat(
-                                          Prospero::ChannelLayout::k8,
+                                          m_runtime_context, Prospero::ChannelLayout::k8,
                                           Prospero::ChannelType::kSNorm,
                                           Prospero::ChannelOrder::kStandard)}) {
       const auto upload =
@@ -16963,7 +17197,7 @@ public:
     for (const auto &format : transfers) {
       for (const auto tile : {Prospero::TileMode::kLinear, Prospero::TileMode::kRenderTarget}) {
         const auto target = TextureGetRenderTargetFormat(
-            format.layout, format.type, Prospero::ChannelOrder::kReversed);
+            m_runtime_context, format.layout, format.type, Prospero::ChannelOrder::kReversed);
         Require(name, "reversed packed render target",
                 target.format == format.native_format && target.guest_format == format.format &&
                     target.export_mapping == Prospero::ColorMappingRgba,
@@ -24452,6 +24686,40 @@ public:
             "scratch reuse overwrote an earlier result or its live conversion input");
     DestroyBuffer(&scratch_output);
     DestroyBuffer(&scratch_input);
+    // Detile leaves row, slice and level padding unwritten; uploads read only
+    // the copy regions, so padding compares as zero.
+    const auto keep_copied_bytes = [&](std::vector<uint8_t> *linear,
+                                       const ImageInfo &info) {
+      std::vector<uint8_t> copied(linear->size(), 0);
+      const auto &tiling = info.tiling;
+      const uint64_t bpe = tiling.block.bytes_per_element;
+      for (const auto &copy : info.BufferCopies()) {
+        const uint64_t row_bytes =
+            copy.bufferRowLength / tiling.texel_width * bpe;
+        const uint64_t slice_rows =
+            copy.bufferImageHeight / tiling.texel_height;
+        const uint64_t rows =
+            (copy.imageExtent.height + tiling.texel_height - 1u) /
+            tiling.texel_height;
+        const uint64_t bytes =
+            (copy.imageExtent.width + tiling.texel_width - 1u) /
+            tiling.texel_width * bpe;
+        const uint64_t slices =
+            std::max(copy.imageSubresource.layerCount, copy.imageExtent.depth);
+        for (uint64_t slice = 0; slice < slices; ++slice) {
+          for (uint64_t row = 0; row < rows; ++row) {
+            const uint64_t offset =
+                copy.bufferOffset + (slice * slice_rows + row) * row_bytes;
+            Require(name, "copied detile bytes",
+                    offset + bytes <= linear->size(),
+                    "an upload region lies outside the detiled output");
+            std::copy_n(linear->begin() + offset, bytes,
+                        copied.begin() + offset);
+          }
+        }
+      }
+      *linear = std::move(copied);
+    };
     const auto gpu_detile =
         [&](const std::vector<uint8_t> &tiled, std::vector<uint8_t> *linear,
             uint64_t tiled_capacity, uint64_t linear_capacity,
@@ -24467,8 +24735,16 @@ public:
               name, padded_linear, AllFlags,
               std::vector<u32>(static_cast<size_t>(padded_linear / sizeof(u32)),
                                0));
-          const auto result = (manager ? *manager : tile_manager)
-                                  .Detile(input.buffer, source_offset, info);
+          auto &tiler = manager ? *manager : tile_manager;
+          if (info.IsTiled()) {
+            // Poison the scratch Detile reuses, so an unwritten copied byte
+            // shows.
+            const auto scratch =
+                tiler.GetScratchBuffer(info.LinearSize(), input.buffer);
+            scheduler.Current().Handle().fillBuffer(
+                scratch.buffer, scratch.offset, scratch.size, 0xa5a5a5a5u);
+          }
+          const auto result = tiler.Detile(input.buffer, source_offset, info);
           Require(name, "detile capacity", result.size <= padded_linear,
                   "canonical transfer size exceeded the fixture output");
           const vk::BufferCopy copy{result.offset, 0, align_dword(result.size)};
@@ -24479,6 +24755,9 @@ public:
                        vk::AccessFlagBits::eTransferWrite);
           scheduler.Finish();
           *linear = read_bytes(output, linear_capacity);
+          if (info.IsTiled()) {
+            keep_copied_bytes(linear, info);
+          }
           DestroyBuffer(&output);
           DestroyBuffer(&input);
         };
@@ -32678,6 +32957,56 @@ TestCase VectorAlignByteUsesTwoBitByteOffset() {
       {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_ALIGNBYTE_B32,
        O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.forbidden_spirv = {"OpTypeInt 64"};
+  return test;
+}
+
+TestCase VectorPermSelectsBytesSignsAndFills() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  // Bytes 7..0 = 7f 80 c0 11 88 33 7f 44: the top bits of bytes 1, 3, 5, 7 are 0, 1, 1, 0.
+  AppendVMovLiteral(&code, 0, 0x7f80c011u);
+  AppendVMovLiteral(&code, 1, 0x88337f44u);
+  const std::vector<u32> selectors = {0x03020100u, 0x07060504u, 0x0b0a0908u,
+                                      0xff0d0c05u, 0x00070104u, 0x80402010u};
+  for (u32 i = 0; i < static_cast<u32>(std::size(selectors)); i++) {
+    AppendVMovU32(&code, 2, i * sizeof(u32));
+    AppendBufferLoadDword(&code, 2, 2);
+    AppendVop3(&code, 0x344, 10u + i, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"VectorPermSelectsBytesSignsAndFills",
+          code,
+          selectors,
+          {0x88337f44u, 0x7f80c011u, 0x00ffff00u, 0xffff00c0u, 0x447f7f11u,
+           0xffffffffu},
+          {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_PERM_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorPermLiteralSelectorFoldsSelection() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 vgpr = 0; vgpr < 2; vgpr++) {
+    AppendVMovU32(&code, 30, vgpr * sizeof(u32));
+    AppendBufferLoadDword(&code, vgpr, 30);
+  }
+  AppendVop3(&code, 0x344, 10, Vgpr(0), Vgpr(1), 255);
+  code.push_back(0x0c0c0302u);
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  TestCase test{"VectorPermLiteralSelectorFoldsSelection",
+                code,
+                {0x7f80c011u, 0x88337f44u},
+                {0x00008833u},
+                {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_PERM_B32,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.forbidden_spirv = {"OpIEqual", "OpBitFieldSExtract",
+                          "OpBitFieldInsert %uint %uint_0"};
   return test;
 }
 
@@ -48477,7 +48806,7 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
         O::S_CMP_GE_I32, O::S_CBRANCH_SCC0, O::S_BRANCH});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     Require(test.name, "bounded image candidates",
-            packed ? compiled.resources.images.size() == 32u
+            packed ? compiled.resources.images.size() == 33u // The null root and every slot.
                    : compiled.resources.images.size() == std::max(count, 1u),
             "descriptor planning escaped its selector domain");
     std::vector<VulkanHarness::Image> images;
@@ -53034,6 +53363,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorBfmDropsMaskBitsPastBit31);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
+  AddCase(VectorPermSelectsBytesSignsAndFills);
+  AddCase(VectorPermLiteralSelectorFoldsSelection);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(ScalarVector64BitFloatInlineConstants);
   AddCase(VectorMbcntUsesThreadMask);
@@ -54590,7 +54921,7 @@ void CheckEmbeddedFetchVertexOffset() {
 }
 
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
-  (void)TextureGetRenderTargetFormat(Prospero::ChannelLayout::k16_16_16_16,
+  (void)TextureGetRenderTargetFormat(GraphicContext{}, Prospero::ChannelLayout::k16_16_16_16,
                                      Prospero::ChannelType::kSrgb,
                                      Prospero::ChannelOrder::kStandard);
   std::_Exit(0x7f);
@@ -54599,7 +54930,7 @@ void CheckEmbeddedFetchVertexOffset() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckRenderTargetFormatContract() {
   const auto r8_uint = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k8, Prospero::ChannelType::kUInt,
+      GraphicContext{}, Prospero::ChannelLayout::k8, Prospero::ChannelType::kUInt,
       Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "R8 uint",
           r8_uint.format == vk::Format::eR8Uint &&
@@ -54608,7 +54939,7 @@ void CheckRenderTargetFormatContract() {
           "R8 uint render-target tuple was rejected");
 
   const auto rgb565 = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k5_6_5, Prospero::ChannelType::kUNorm,
+      GraphicContext{}, Prospero::ChannelLayout::k5_6_5, Prospero::ChannelType::kUNorm,
       Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "RGB565 UNorm",
           rgb565.format == vk::Format::eB5G6R5UnormPack16 &&
@@ -54617,7 +54948,7 @@ void CheckRenderTargetFormatContract() {
           "RGB565 UNorm render-target tuple was rejected");
 
   const auto uint_format = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUInt,
+      GraphicContext{}, Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUInt,
       Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "RGBA16 uint",
           uint_format.format == vk::Format::eR16G16B16A16Uint &&
@@ -54626,7 +54957,7 @@ void CheckRenderTargetFormatContract() {
           "RGBA16 uint render-target tuple was rejected");
 
   const auto format = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+      GraphicContext{}, Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kReversed);
   Require("ReverseRenderTarget", "exact format",
           format.format == vk::Format::eR16G16B16A16Sfloat &&
@@ -54642,7 +54973,7 @@ void CheckRenderTargetFormatContract() {
           "reverse RGBA16F component mask was not mapped exactly once");
 
   const auto rg32 = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
+      GraphicContext{}, Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kReversed);
   Require(
       "ReverseRenderTarget", "GR32 float",
@@ -54656,7 +54987,7 @@ void CheckRenderTargetFormatContract() {
       "reverse GR32F render-target export or write-mask mapping is incorrect");
 
   const auto argb = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+      GraphicContext{}, Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kAltReversed);
   Require(
       "ReverseRenderTarget", "ARGB float",
@@ -55310,11 +55641,24 @@ void CheckImageTransitionState(RenderContext &renderer) {
   source_copies[1].imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0,
                                        1};
   source_copies[1].imageExtent = {2, 2, 1};
+  // Transfers end in the transfer-write state that readers transition from.
+  const auto RequireTransferWritten = [&](const Image &target,
+                                          const char *stage) {
+    Require(name, stage,
+            target.backing.state.layout ==
+                    vk::ImageLayout::eTransferDstOptimal &&
+                target.backing.state.access_mask ==
+                    vk::AccessFlagBits2::eTransferWrite &&
+                target.backing.subresource_states.empty(),
+            "a transfer ended with an extra layout transition");
+  };
   source.Upload(source_copies, upload.Handle(), upload_offset, 128);
   // Two bytes hold one stencil row of the 2x2 image: the buffer path copies in two chunks.
   Buffer stencil_scratch(context, scheduler, MemoryUsage::DeviceLocal, 0,
                          AllFlags, 2);
+  RequireTransferWritten(source, "upload end state");
   destination.CopyMip(source, 1, 0, stencil_scratch);
+  RequireTransferWritten(destination, "mip copy end state");
   // The DB depth/stencil copy shape: stencil alone into mip 0, through the buffer path on any
   // driver.
   Image stencil_destination(context, scheduler, source_info);
@@ -55335,6 +55679,8 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                     stencil_scratch, command);
     context.stencil_copy_via_buffer = probed;
   }
+  // The stencil buffer path leaves the destination in the transfer-write state too.
+  RequireTransferWritten(stencil_destination, "stencil buffer copy end state");
 
   const auto [download_data, download_offset] = download.Map(128, 4);
   Require(name, "depth/stencil download map", download_data != nullptr,
@@ -55381,11 +55727,13 @@ void CheckImageTransitionState(RenderContext &renderer) {
   buffered_region.imageExtent = buffered_info.extent;
   buffered_source.Upload(std::span{&buffered_region, 1}, upload.Handle(),
                          buffered_upload_offset, buffered_expected.size());
+  RequireTransferWritten(buffered_source, "buffered upload end state");
   Buffer copy_scratch(context, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                       16);
   StreamBuffer copy_parameters(context, scheduler, MemoryUsage::Stream, 4096);
   TileManager copy_tiler(context, scheduler, copy_parameters);
   buffered_destination.CopyImageWithBuffer(buffered_source, copy_scratch, copy_tiler);
+  RequireTransferWritten(buffered_destination, "buffered copy end state");
   const auto [buffered_download_data, buffered_download_offset] =
       download.Map(buffered_expected.size(), 4);
   Require(name, "buffered-copy download map", buffered_download_data != nullptr,
@@ -58622,6 +58970,57 @@ void CheckPm4AcquireMemPackets(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckPm4ResetQueue(RenderContext &renderer) {
+  constexpr const char *name = "Pm4ResetQueue";
+  namespace Op = Pm4::ResetQueueOp;
+  CommandProcessor processor(renderer, 0);
+  const auto reset = [&](uint32_t op) {
+    std::array<uint32_t, 29> packets{};
+    CommandBufferLayout dcb{packets.data(), packets.data() + packets.size(),
+                            packets.data(), packets.data() + packets.size(),
+                            nullptr, nullptr, 0};
+    Gen5::AgcDcbResetQueue(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), op,
+                           0);
+    Pm4Execution execution;
+    Require(name, "processed",
+            processor.Process(execution, {packets.data(), dcb.cursor_up}) ==
+                Pm4ProcessResult::Complete,
+            "the reset packets did not complete");
+    return packets;
+  };
+  // Drains, the occlusion-query stop and the mapping mask emit nothing.
+  const std::array<uint32_t, 29> expected{
+      0xc0017904u, 0x342u, 0xce000fffu, 0xc0002f00u, 1,           0xc0017a00u,
+      0x20000243u, 0x480u, 0xc0012600u, 0,           0,           0xc0001300u,
+      0xffffffffu, 0xc0021102u, 1,      0,           0,           0xc0021100u,
+      1,           0,      0,           0xc0065800u, 0x86007fc0u, 0xfffffffeu,
+      0xffu,       1,      0,           0x19u,       0xc3e1u};
+  Require(name, "native packets", reset(0xfffu) == expected,
+          "the reset packets are not the native ones");
+
+  // Stale state, with a context pushed over primitive reset index 5.
+  auto &ctx = processor.GetCtx();
+  ctx.SetPrimitiveResetIndex(5);
+  processor.ApplyContextStateOperation(ContextStateOperation::Push);
+  ctx.SetPrimitiveResetIndex(7);
+  processor.GetShCtx().SetCsUserSgpr(0, 7);
+  processor.GetUcfg().SetPrimitiveResetControl(7);
+  processor.SetDispatchIndirectArgsBaseAddress(0x1000);
+  reset(Op::ShState | Op::UcState | Op::PopContext);
+  Require(name, "Sh, Uc and pop",
+          ctx.GetPrimitiveResetIndex() == 5 &&
+              processor.GetShCtx().GetCs().cs_user_sgpr.value[0] == 0 &&
+              processor.GetUcfg().GetPrimitiveResetControl() == 0 &&
+              processor.GetDispatchIndirectArgsBaseAddress() == 0x1000,
+          "the reset did not pop the context and reset only Sh and Uc");
+  reset(Op::CxState | Op::BaseIndirectPointers);
+  Require(name, "Cx and indirect bases",
+          ctx.GetPrimitiveResetIndex() == 0xffffffffu &&
+              processor.GetDispatchIndirectArgsBaseAddress() == 0,
+          "the reset did not clear the context and the indirect bases");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitPackets(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
   constexpr auto packet_mismatch = static_cast<int>(0x8a6c000cu);
@@ -59445,11 +59844,12 @@ void CheckWaitUntilSafeForRendering() {
   auto &gpu = renderer.GetGpu();
 
   constexpr int user_system = 255;
-  constexpr int bus_main = 0;
+  // The headset port flips buffers that are not registered; a wait for a blank or black buffer
+  // waits for nothing, so the wait names buffer 0.
+  constexpr int bus_headset = 32;
   constexpr int flip_mode_vsync = 1;
-  // Special buffer indices flip without a registered surface.
-  constexpr int index_black = -2;
-  const int handle = VideoOut::VideoOutOpen(user_system, bus_main, 0, nullptr);
+  constexpr int index_shown = 0;
+  const int handle = VideoOut::VideoOutOpen(user_system, bus_headset, 0, nullptr);
   Require(name, "open", handle > 0, "video-out open failed");
   const auto wait_until = [](const auto &done) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -59460,7 +59860,7 @@ void CheckWaitUntilSafeForRendering() {
   };
   const auto address = [](const void *value) { return reinterpret_cast<uint64_t>(value); };
 
-  // Hold the graphics queue so the CPU flip of BLACK, prepared behind it, stays pending.
+  // Hold the graphics queue so the CPU flip of buffer 0, prepared behind it, stays pending.
   std::atomic_uint32_t gate{0};
   std::array<uint32_t, 7> hold{};
   hold[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
@@ -59470,19 +59870,23 @@ void CheckWaitUntilSafeForRendering() {
   hold[4] = 1;
   hold[5] = UINT32_MAX;
   gpu.Submit(hold);
-  Require(name, "flip black",
-          VideoOut::VideoOutSubmitFlip(handle, index_black, flip_mode_vsync, 0) == 0,
+  Require(name, "flip buffer 0",
+          VideoOut::VideoOutSubmitFlip(handle, index_shown, flip_mode_vsync, 0) == 0,
           "CPU flip failed");
 
   std::atomic_uint32_t rendered{0};
-  std::array<uint32_t, 12> render{};
-  render[0] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE);
-  render[1] = static_cast<uint32_t>(handle);
-  render[2] = static_cast<uint32_t>(index_black);
-  render[7] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
-  render[9] = static_cast<uint32_t>(address(&rendered));
-  render[10] = static_cast<uint32_t>(address(&rendered) >> 32u);
-  render[11] = 1;
+  std::array<uint32_t, Pm4::WAIT_FLIP_DONE_PACKET_DW + 5> render{};
+  CommandBufferLayout dcb{render.data(), render.data() + render.size(), render.data(),
+                          render.data() + render.size(), nullptr, nullptr, 0};
+  Require(name, "wait packet",
+          Gen5::AgcDcbWaitUntilSafeForRendering(reinterpret_cast<Gen5::CommandBuffer *>(&dcb),
+                                                handle, index_shown) == render.data(),
+          "the wait packet was not emitted");
+  auto *write = render.data() + Pm4::WAIT_FLIP_DONE_PACKET_DW;
+  write[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  write[2] = static_cast<uint32_t>(address(&rendered));
+  write[3] = static_cast<uint32_t>(address(&rendered) >> 32u);
+  write[4] = 1;
   gpu.SubmitCompute(0x20, render);
 
   std::binary_semaphore lane{0};
@@ -59497,7 +59901,7 @@ void CheckWaitUntilSafeForRendering() {
 
   gate.store(1);
   Require(name, "flip shown", wait_until([handle] { return VideoOut::VideoOutIsFlipPending(handle) == 0; }),
-          "the BLACK flip was not presented");
+          "the flip of buffer 0 was not presented");
   // The buffer stays on screen (no later flip), yet it is safe once its flip is presented.
   Require(name, "resume", wait_until([&] { return rendered.load() == 1; }),
           "rendering did not resume once its display buffer's flip was presented");
@@ -59509,7 +59913,10 @@ void CheckWaitUntilSafeForRendering() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// R_FLIP itself publishes the dumped occlusion counters, then flips.
+// A flip block copies GPU-written storage images back, publishes the dumped
+// occlusion counters, then flips; a wait for a shown buffer names it by its
+// label and returns once its flip is presented, and a blank one waits for
+// nothing.
 void CheckPm4Flip() {
   namespace EventQueue = LibKernel::EventQueue;
   constexpr const char *name = "Pm4Flip";
@@ -59540,9 +59947,24 @@ void CheckPm4Flip() {
               VideoOut::VideoOutAddFlipEvent(flips, handle, &udata) == 0,
           "video-out or flip event registration failed");
 
+  // A GPU-written storage image the flip's GL2 writeback copies back.
+  constexpr uint64_t image_size = 0x10000;
+  int64_t image_offset = -1;
+  void *image_memory = nullptr;
+  Require(name, "image memory",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), image_size,
+              image_size, 0, &image_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(
+                  &image_memory, image_size, 0x3, 0, image_offset,
+                  image_size) == 0,
+          "the storage image mapping failed");
+  const auto image_base = reinterpret_cast<uint64_t>(image_memory);
+  renderer.MapMemory(image_base, image_size);
+
   alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results{};
-  constexpr int64_t flip_arg = 0x777;
-  std::array<uint32_t, 14> commands{};
+  constexpr int64_t flip_arg = 0x123456789ll;
+  std::array<uint32_t, 8 + 64 + 32 + 32> commands{};
   const auto dump = [&](size_t at, const uint64_t *counter) {
     const auto address = reinterpret_cast<uint64_t>(counter);
     commands[at] = KYTY_PM4(4, Pm4::IT_EVENT_WRITE, Pm4::R_ZERO);
@@ -59550,17 +59972,76 @@ void CheckPm4Flip() {
     commands[at + 2] = static_cast<uint32_t>(address);
     commands[at + 3] = static_cast<uint32_t>(address >> 32u);
   };
-  // Begin and end z-pass dumps, then a vsync flip of the blank buffer.
+  // Begin and end z-pass dumps, a vsync flip of the blank buffer, then waits
+  // for buffer 0 and for the blank buffer.
   dump(0, &results[0]);
   dump(4, &results[1]);
-  commands[8] = KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP);
-  commands[9] = static_cast<uint32_t>(handle);
-  commands[10] = static_cast<uint32_t>(-1);
-  commands[11] = 1;
-  commands[12] = flip_arg;
+  auto *begin = commands.data() + 8;
+  auto *end = commands.data() + commands.size();
+  CommandBufferLayout dcb{begin, end, begin, end, nullptr, nullptr, 0};
+  auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&dcb);
+  int bus = -1;
+  const auto label = reinterpret_cast<uint64_t>(
+      VideoOut::VideoOutGetBufferLabels(handle, &bus));
+  const bool emitted =
+      Gen5::AgcDcbSetFlip(buffer, handle, 16, 1, 0) == nullptr &&
+      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, -3) == nullptr &&
+      Gen5::AgcDcbSetFlip(buffer, handle, -1, 1, flip_arg) == begin &&
+      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, 0) == begin + 64 &&
+      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, -1) ==
+          begin + 96 &&
+      dcb.cursor_up == end;
+  const std::array<uint32_t, 19> flip{
+      0xc0027904u, 0x342u,      0xc70101ffu, 0,           0xc0043704u,
+      0x06010000u, 0xc343u,     0,           0x23456789u, 0x1u,
+      0xc0064900u, 0x06200504u, 0x02010000u, 0,           0,
+      0,           0,           static_cast<uint32_t>(handle), 0xc02c1000u};
+  const std::array<uint32_t, 16> wait{0xc0017904u,
+                                      0x342u,
+                                      0xcb000000u,
+                                      0xc0079300u,
+                                      0x06000113u,
+                                      static_cast<uint32_t>(label),
+                                      static_cast<uint32_t>(label >> 32u),
+                                      0,
+                                      0,
+                                      0xffffffffu,
+                                      0xffffffffu,
+                                      0x40u,
+                                      0xc0017904u,
+                                      0x342u,
+                                      0xcb000020u,
+                                      0xc00f1000u};
+  const auto *blank = begin + 96;
+  Require(name, "native packets",
+          emitted && std::equal(flip.begin(), flip.end(), begin) &&
+              std::equal(wait.begin(), wait.end(), begin + 64) &&
+              blank[2] == 0xcb00001fu && blank[3] == 0xc0071000u &&
+              blank[14] == 0xcb00003fu,
+          "the flip or wait packets are not the native ones");
   bool complete = false;
   bool published = true;
+  bool queued = false;
+  bool copied = false;
   gpu.SendCommandSync([&] {
+    auto &texture_cache = renderer.GetTextureCache();
+    TextureCacheTestAccess::SetStorageReadback(texture_cache, true);
+    auto desc = VulkanHarness::MakeLinearDesc(
+        image_base, 0, vk::Format::eR32G32B32A32Sfloat,
+        Prospero::BufferFormat::k32_32_32_32Float,
+        Prospero::ImageType::kColor2D, {8, 8, 1}, 1, 16, 1);
+    desc.type = TextureCache::BindingType::Storage;
+    desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+    desc.info.pitch = 0;
+    desc.info.UpdateSize();
+    desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+    const auto image = texture_cache.FindImage(desc);
+    (void)texture_cache.FindTexture(image, desc);
+    TextureCacheTestAccess::ClearImage(
+        texture_cache, renderer.GetCommandScheduler().Current(), image,
+        {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        vk::ClearValue{vk::ClearColorValue{std::array<float, 4>{1.0f}}});
+    queued = TextureCacheTestAccess::PendingDownload(texture_cache, image);
     CommandProcessor processor(renderer, 0);
     processor.BufferInit();
     Pm4Execution execution;
@@ -59569,8 +60050,11 @@ void CheckPm4Flip() {
     for (const auto counter : results) {
       published &= (counter & OCCLUSION_QUERY_READY) != 0;
     }
+    copied = !TextureCacheTestAccess::PendingDownload(texture_cache, image);
     processor.BufferFlush();
   });
+  Require(name, "GL2 writeback", queued && copied,
+          "the flip did not copy a GPU-written storage image back");
 
   // A present stalled on the graphics queue leaves the port readable.
   std::binary_semaphore queried{0};
@@ -59598,7 +60082,7 @@ void CheckPm4Flip() {
               count == 1 &&
               VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
               flipped_arg == flip_arg,
-          "R_FLIP did not publish the occlusion counters or flip");
+          "the flip block did not publish the occlusion counters or flip");
   // The flip status reports the completed flip and nothing pending.
   std::array<uint64_t, 16> flip_status{};
   Require(name, "flip status",
@@ -59620,6 +60104,132 @@ void CheckPm4Flip() {
           EventQueue::KernelWaitEqueue(flips, &event, 1, &count, &timeout) == 0 &&
               VideoOut::VideoOutGetEventCount(&event) >= 2,
           "undelivered vblanks were queued as separate events");
+
+  // A shown buffer's flip and wait, on the headset port, which flips buffers
+  // that are not registered.
+  const int headset = VideoOut::VideoOutOpen(255, 32, 0, nullptr);
+  std::array<uint32_t, 64 + 32> shown{};
+  CommandBufferLayout shown_dcb{shown.data(), shown.data() + shown.size(),
+                                shown.data(), shown.data() + shown.size(),
+                                nullptr,      nullptr,
+                                0};
+  auto *shown_buffer = reinterpret_cast<Gen5::CommandBuffer *>(&shown_dcb);
+  const auto headset_label = reinterpret_cast<uint64_t>(
+      VideoOut::VideoOutGetBufferLabels(headset, &bus));
+  Require(name, "shown flip packet",
+          Gen5::AgcDcbSetFlip(shown_buffer, headset, 0, 1, 0) ==
+                  shown.data() &&
+              Gen5::AgcDcbWaitUntilSafeForRendering(shown_buffer, headset, 0) ==
+                  shown.data() + 64 &&
+              shown[2] == 0xc7010107u && shown[3] == 32u &&
+              shown[12] == 0x42010000u &&
+              shown[13] == static_cast<uint32_t>(headset_label) &&
+              shown[14] == static_cast<uint32_t>(headset_label >> 32u) &&
+              shown[15] == 1u,
+          "the flip packet of a shown buffer is not the native one");
+  // Fork: the wait suspends only this command processor (Blocked) while the
+  // buffer's flip is pending, and the resumed stream completes once it is
+  // presented.
+  std::optional<CommandProcessor> shown_processor;
+  Pm4Execution shown_execution;
+  auto shown_result = Pm4ProcessResult::Blocked;
+  int shown_pending = -1;
+  gpu.SendCommandSync([&] {
+    shown_processor.emplace(renderer, 0);
+    shown_processor->BufferInit();
+    shown_result = shown_processor->Process(shown_execution, shown);
+    shown_pending = VideoOut::VideoOutIsFlipPending(headset);
+    shown_processor->BufferFlush();
+  });
+  const bool shown_ordered =
+      shown_result != Pm4ProcessResult::Complete || shown_pending == 0;
+  const auto shown_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (VideoOut::VideoOutIsFlipPending(headset) != 0 &&
+         std::chrono::steady_clock::now() < shown_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  gpu.SendCommandSync([&] {
+    if (shown_result != Pm4ProcessResult::Complete) {
+      shown_result = shown_processor->Process(shown_execution, shown);
+    }
+    shown_processor->BufferFlush();
+    shown_processor.reset();
+  });
+  Require(name, "wait for a shown buffer",
+          shown_ordered && shown_result == Pm4ProcessResult::Complete,
+          "the wait returned before its buffer's flip was presented");
+
+  // Fork (KYTY_CP_PIPELINE=1): a flip block drains the draws queued before it.
+  // A record the back thread runs for 100 ms sees no flip of the port
+  // reserved (pending or done) until it finishes. Nothing else on the flip
+  // path drains here: no occlusion dump, storage readback off.
+  Require(name, "CP pipeline mode", CpPipeline::Mode() == 1,
+          "the flip drain check needs KYTY_CP_PIPELINE unset or 1");
+  Require(name, "CP pipeline unused", CpPipeline::Published() == 0,
+          "a draw registered the renderer's CP pipeline callbacks first");
+  struct DrainWitness {
+    int port = 0;
+    int64_t before = -1;
+    std::atomic<int64_t> at_draw_end{-1};
+    [[nodiscard]] int64_t Reserved() const {
+      std::array<uint64_t, 16> status{};
+      const int pending = VideoOut::VideoOutIsFlipPending(port);
+      VideoOut::VideoOutGetFlipStatus(
+          port, reinterpret_cast<VideoOut::VideoOutFlipStatus *>(status.data()));
+      return static_cast<int64_t>(status[0]) + pending;
+    }
+  };
+  // The back thread keeps the callbacks and their context for the process.
+  static DrainWitness witness;
+  witness.port = headset;
+  std::array<uint32_t, Pm4::FLIP_PACKET_DW> drain_flip{};
+  CommandBufferLayout drain_dcb{drain_flip.data(),
+                                drain_flip.data() + drain_flip.size(),
+                                drain_flip.data(),
+                                drain_flip.data() + drain_flip.size(),
+                                nullptr,
+                                nullptr,
+                                0};
+  Require(name, "drain flip packet",
+          Gen5::AgcDcbSetFlip(
+              reinterpret_cast<Gen5::CommandBuffer *>(&drain_dcb), headset, 0,
+              1, 0) == drain_flip.data(),
+          "the flip packet was not emitted");
+  bool drain_complete = false;
+  gpu.SendCommandSync([&] {
+    TextureCacheTestAccess::SetStorageReadback(renderer.GetTextureCache(),
+                                               false);
+    CpPipeline::Init(
+        &witness,
+        [](void *context, CpPipeline::DrawRecord &) {
+          auto &w = *static_cast<DrainWitness *>(context);
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          w.at_draw_end.store(w.Reserved());
+        },
+        [](void *, CpPipeline::DrawRecord &) {},
+        [](void *, const CpPipeline::DrawRecord &) {});
+    witness.before = witness.Reserved();
+    (void)CpPipeline::Acquire();
+    CpPipeline::Publish();
+    CommandProcessor processor(renderer, 0);
+    processor.BufferInit();
+    Pm4Execution execution;
+    drain_complete = processor.Process(execution, drain_flip) ==
+                     Pm4ProcessResult::Complete;
+    CpPipeline::Drain();
+    processor.BufferFlush();
+  });
+  Require(name, "flip after queued draws",
+          drain_complete && witness.before >= 0 &&
+              witness.at_draw_end.load() == witness.before,
+          "the flip was reserved while a draw queued before it still ran");
+  const auto drain_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (VideoOut::VideoOutIsFlipPending(headset) != 0 &&
+         std::chrono::steady_clock::now() < drain_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 
   gpu.WaitForIdle();
   // Each pre-vblank event carries the port's pre-vblank count.
@@ -59659,7 +60269,9 @@ void CheckPm4Flip() {
               VideoOut::VideoOutAllowOutputResolutionWqhdDetection(5) ==
                   invalid,
           "open-port handle checks failed");
-  Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
+  Require(name, "close",
+          VideoOut::VideoOutClose(headset) == 0 &&
+              VideoOut::VideoOutClose(handle) == 0,
           "video-out close failed");
   Require(name, "closed port",
           VideoOut::VideoOutClose(handle) == invalid &&
@@ -60258,13 +60870,6 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
     Require(name, "TES vertex gates", full_wave_gates == 2,
             "GS_TG_INFO or the merged wave info did not count one full TES wave");
   }
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  context.SetShaderStages(0x0260212du);
-  ExpectFatal("TessellationGsAmplification", [&] {
-    std::array<ShaderVertexInputInfo, 3> info;
-    (void)PrepareTessellationPrograms(regs, context, info);
-  });
-#endif
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -61146,6 +61751,11 @@ int main(int argc, char **argv) {
     vulkan.CheckHostImageAllocation();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--reset-queue-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4ResetQueue(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
@@ -61306,6 +61916,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorMadU64U32CarryMasksInactiveLanes());
     RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
     RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--perm-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorPermSelectsBytesSignsAndFills());
+    RunCase(&vulkan, VectorPermLiteralSelectorFoldsSelection());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
@@ -61815,6 +62431,7 @@ int main(int argc, char **argv) {
   CheckSigninDialogLifecycle();
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
+  CheckPm4ResetQueue(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());

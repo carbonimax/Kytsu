@@ -1706,6 +1706,15 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
+		// Guest geometry shaders run as host mesh shaders, which cannot follow tessellation.
+		if ((context.GetShaderStages() & 0x20u) != 0) {
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(
+				    "Warning: dropping tessellation draws with a geometry shader.\n");
+			}
+			return;
+		}
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
@@ -1764,7 +1773,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			const auto& rt = context.GetRenderTarget(slot);
 			if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
 				target_export_mapping[slot] =
-				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+				    TextureGetRenderTargetFormat(m_graphics, rt.info.format, rt.info.channel_type,
 				                                 rt.info.channel_order)
 				        .export_mapping;
 			}
@@ -1994,7 +2003,7 @@ bool PipelineCache::MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig
 	if (aliased_targets != 0) {
 		// A prediction skips aliased targets (merged when the pixel shader was selected).
 		if (predict) return false;
-		const auto reason = PlanAliasedColorTargets(ctx, aliased_targets, aliased);
+		const auto reason = PlanAliasedColorTargets(m_graphics, ctx, aliased_targets, aliased);
 		if (!reason.empty() ||
 		    !std::equal(std::begin(aliased.component_mask), std::end(aliased.component_mask),
 		                component_mask.begin()) ||

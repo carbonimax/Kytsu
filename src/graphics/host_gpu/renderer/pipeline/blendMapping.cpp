@@ -118,7 +118,7 @@ uint8_t TargetOutputMode(const HW::Context& ctx, uint32_t slot) {
 	return 0;
 }
 
-std::string DescribeGroup(const HW::Context& ctx, uint32_t group) {
+std::string DescribeGroup(const GraphicContext& graphics, const HW::Context& ctx, uint32_t group) {
 	std::string text;
 	for (uint32_t slot = 0; slot < 8u; slot++) {
 		if ((group & (1u << slot)) == 0) {
@@ -126,7 +126,7 @@ std::string DescribeGroup(const HW::Context& ctx, uint32_t group) {
 		}
 		const auto& rt      = ctx.GetRenderTarget(slot);
 		const auto& blend   = ctx.GetBlendControl(slot);
-		const auto  mapping = TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+		const auto  mapping = TextureGetRenderTargetFormat(graphics, rt.info.format, rt.info.channel_type,
 		                                                   rt.info.channel_order)
 		                          .export_mapping;
 		const auto  logical = render_target_mask_slot(ctx.GetRenderTargetMask(), slot);
@@ -147,7 +147,7 @@ std::string DescribeGroup(const HW::Context& ctx, uint32_t group) {
 } // namespace
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-std::string PlanAliasedColorTargets(const HW::Context& ctx, uint32_t active_mask,
+std::string PlanAliasedColorTargets(const GraphicContext& graphics, const HW::Context& ctx, uint32_t active_mask,
                                     AliasedColorTargets& plan) {
 	using F          = Prospero::BlendFactor;
 	plan             = {};
@@ -169,10 +169,10 @@ std::string PlanAliasedColorTargets(const HW::Context& ctx, uint32_t active_mask
 		}
 		const auto fail = [&](const char* rule, const char* reason) {
 			return fmt::format("{} {} (attachment slot {}):{}", rule, reason, first,
-			                   DescribeGroup(ctx, group));
+			                   DescribeGroup(graphics, ctx, group));
 		};
 		const auto mapping =
-		    TextureGetRenderTargetFormat(target.info.format, target.info.channel_type,
+		    TextureGetRenderTargetFormat(graphics, target.info.format, target.info.channel_type,
 		                                 target.info.channel_order)
 		        .export_mapping;
 		const auto& first_blend  = ctx.GetBlendControl(first);
@@ -264,7 +264,7 @@ std::string PlanAliasedColorTargets(const HW::Context& ctx, uint32_t active_mask
 	return {};
 }
 
-std::string PlanAliasedColorPasses(const HW::Context& ctx, uint32_t active_mask, uint32_t& group) {
+std::string PlanAliasedColorPasses(const GraphicContext& graphics, const HW::Context& ctx, uint32_t active_mask, uint32_t& group) {
 	using F = Prospero::BlendFactor;
 	group   = 0;
 	for (uint32_t first = 0; first < 8u && group == 0; first++) {
@@ -276,7 +276,7 @@ std::string PlanAliasedColorPasses(const HW::Context& ctx, uint32_t active_mask,
 		}
 	}
 	const auto fail = [&](const char* rule, const char* reason) {
-		return fmt::format("{} {}:{}", rule, reason, DescribeGroup(ctx, active_mask));
+		return fmt::format("{} {}:{}", rule, reason, DescribeGroup(graphics, ctx, active_mask));
 	};
 	if (group == 0 || group != active_mask) {
 		return fail("P1", "every color target must belong to the one aliased group");

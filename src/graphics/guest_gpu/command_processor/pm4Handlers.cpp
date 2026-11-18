@@ -892,17 +892,6 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	return packet_size_dw - 1u;
 }
 
-KYTY_CP_OP_PARSER(CpOpFlip) {
-	KYTY_PROFILER_FUNCTION();
-	NoteGuestSync();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
-
-	cp.Flip(static_cast<int>(buffer[0]), static_cast<int>(buffer[1]), static_cast<int>(buffer[2]),
-	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
-	return 5;
-}
-
 KYTY_CP_OP_PARSER(CpOpPssr) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1300,11 +1289,75 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	return s + 1;
 }
 
+// A flip block: the tag (flip mode, signed 5-bit buffer index) and bus, the flip argument
+// written to USERDATA_3, then an end-of-pipe RELEASE_MEM with a GL2 writeback whose interrupt
+// carries the port.
+static uint32_t CpFlip(CommandProcessor& cp, const uint32_t* block, uint32_t remaining_dw) {
+	NoteGuestSync();
+
+	EXIT_NOT_IMPLEMENTED(remaining_dw < Pm4::FLIP_PACKET_DW ||
+	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u) ||
+	                     block[9] != KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u));
+
+	const auto tag = block[1];
+	cp.WriteBackImages();
+	cp.Flip(static_cast<int>(block[16]), static_cast<int32_t>(tag << 24u) >> 27,
+	        static_cast<int>((tag >> 8u) & 0xfu),
+	        static_cast<int64_t>(block[7] | (static_cast<uint64_t>(block[8]) << 32u)));
+	return Pm4::FLIP_PACKET_DW - 1u;
+}
+
+// A wait for a displayed buffer polls its label; a blank or black buffer has a NOP instead.
+static uint32_t CpWaitFlipDone(CommandProcessor& cp, const uint32_t* block, uint32_t remaining_dw) {
+	NoteGuestSync();
+
+	EXIT_NOT_IMPLEMENTED(remaining_dw < Pm4::WAIT_FLIP_DONE_PACKET_DW);
+
+	if (block[2] == KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0u)) {
+		cp.WaitFlipDone(
+		    reinterpret_cast<const uint64_t*>(block[4] | (static_cast<uint64_t>(block[5]) << 32u)));
+	}
+	return Pm4::WAIT_FLIP_DONE_PACKET_DW - 1u;
+}
+
+// Fork: GPU captures taken before the native flip blocks hold the old IT_NOP flips. Only replays
+// run them, and a replay has no video out: the flip publishes the occlusion counters and the wait
+// waits for nothing.
+KYTY_CP_OP_PARSER(CpOpLegacyFlip) {
+	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
+
+	cp.Flip(static_cast<int>(buffer[0]), static_cast<int>(buffer[1]), static_cast<int>(buffer[2]),
+	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
+	return 5;
+}
+
+KYTY_CP_OP_PARSER(CpOpLegacyWaitFlipDone) {
+	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0051018);
+	return 6;
+}
+
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
-	if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
-		return KYTY_PM4_LEN(cmd_id) - 1u;
+	// Fork: ProcessPm4 drains the CP pipeline before every block Pm4::IsFlipBlock names.
+	if (Pm4::IsFlipBlock(cmd_id, buffer)) {
+		return (buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_FLIP ? CpFlip(cp, buffer, dw)
+		                                                          : CpWaitFlipDone(cp, buffer, dw);
+	}
+	if (KYTY_PM4_R(cmd_id) == 1u && buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+		if ((buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_RESET_QUEUE) {
+			cp.ResetQueue(buffer[1]);
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
+		if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+			return KYTY_PM4_LEN(cmd_id) - 1u;
+		}
 	}
 
 	auto raw_cmd_offset = buffer[0];
@@ -1319,20 +1372,6 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	}
 
 	return SetRegisters(cp, g_hw_uc_indirect_func, cmd_id, cmd_offset, buffer + 1, num_dw - dw);
-}
-
-KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
-	KYTY_PROFILER_FUNCTION();
-	NoteGuestSync();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0051018);
-
-	auto video_out_handle     = buffer[0];
-	auto display_buffer_index = buffer[1];
-
-	cp.WaitFlipDone(video_out_handle, display_buffer_index);
-
-	return 6;
 }
 
 template <typename T>

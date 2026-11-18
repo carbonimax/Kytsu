@@ -8,6 +8,8 @@
 
 namespace Libs::Graphics {
 
+struct GraphicContext;
+
 enum class BlendMappingSupport {
 	Direct,
 	SourceAlpha, // Requires logical alpha in the second blend source.
@@ -36,13 +38,13 @@ struct AliasedColorTargets {
 
 // Plans the merge for active_mask slots. Returns an empty string, or why the per-target blending
 // of an aliased group has no exact single-attachment form (EQUIVALENCE.md E1-E10).
-std::string PlanAliasedColorTargets(const HW::Context& ctx, uint32_t active_mask,
+std::string PlanAliasedColorTargets(const GraphicContext& graphics, const HW::Context& ctx, uint32_t active_mask,
                                     AliasedColorTargets& plan);
 
 // When aliased targets cannot share an attachment, each can still draw in its own pass, in slot
 // order, on the same attachment. Returns an empty string and the group of slots, or why the
 // separate passes would change the result (P1-P4).
-std::string PlanAliasedColorPasses(const HW::Context& ctx, uint32_t active_mask, uint32_t& group);
+std::string PlanAliasedColorPasses(const GraphicContext& graphics, const HW::Context& ctx, uint32_t active_mask, uint32_t& group);
 
 } // namespace Libs::Graphics
 

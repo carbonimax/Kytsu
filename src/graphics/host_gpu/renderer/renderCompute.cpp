@@ -221,18 +221,31 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
-// Global loads read pages without a buffer as zero. Back the 32 KiB after each base the shader
-// loads from scalar data before the dispatch reads it.
-static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& stage) {
-	constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
-	const auto&        flat = stage.resources->flattened_srt;
-	for (const auto [low, high]: stage.program->info.address_bases) {
-		const auto base = flat[low] | uint64_t {flat[high]} << 32u;
+// Global loads read pages without a buffer as zero. Cache the 32 KiB after each base the shader
+// takes from user data or scalar loads before the dispatch reads it.
+static void CacheDmaBases(RenderContext& context, const ShaderStageRuntime& stage) {
+	const auto back = [&context](uint32_t low, uint32_t high) {
+		const auto base = low | uint64_t {high} << 32u;
 		for (uint64_t index = 0; index <= 2; ++index) {
-			const auto page = base + index * Page;
+			const auto page = base + index * BufferCache::CACHING_PAGESIZE;
 			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
 		}
-	}
+	};
+	const auto& info = stage.program->info;
+	const auto& flat = stage.resources->flattened_srt;
+	const auto& user = stage.resources->user_data;
+	for (const auto [low, high]: info.address_bases) back(flat[low], flat[high]);
+	// KYTY_USER_ADDRESS_BASES: off by default on Apple, a suspect in a macOS slowdown (PR #143).
+	static const bool user_bases = [] {
+		const char* value = std::getenv("KYTY_USER_ADDRESS_BASES");
+#if defined(__APPLE__)
+		return value != nullptr && value[0] != '0';
+#else
+		return value == nullptr || value[0] != '0';
+#endif
+	}();
+	if (!user_bases) return;
+	for (const auto [low, high]: info.user_address_bases) back(user[low], user[high]);
 }
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
@@ -624,7 +637,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
 	PreparedBindings* descriptor_stage = &bindings;
-	BackAddressBases(m_context, input_info.stage);
+	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		static std::atomic<uint32_t> bda_logs {0};
@@ -803,7 +816,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
-	BackAddressBases(m_context, input_info.stage);
+	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
@@ -849,14 +862,6 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	if (DispatchChainMode() == 2) {
 		DispatchChain::Add(DispatchChain::Counter::Indirect);
 	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
