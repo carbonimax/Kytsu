@@ -5814,6 +5814,7 @@ void TestSmallFiberStacksAndMigration() {
 
 } // namespace
 
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void TestGuestTlsReadsUseThreadTcb() {
 	const char*        test      = "GuestTlsReadsUseThreadTcb";
 	constexpr uint64_t CODE_SIZE = 0x1000;
@@ -5852,6 +5853,7 @@ void TestGuestTlsReadsUseThreadTcb() {
 	      "patched fs:[0] reads did not return the thread TCB");
 	std::printf("[host]    %-48s ok\n", test);
 }
+#endif
 
 void TestGuestTlsGetAddrUsesPerThreadBlocks() {
 	const char* test = "GuestTlsGetAddrUsesPerThreadBlocks";
@@ -6076,7 +6078,9 @@ int main(int argc, char** argv) {
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 	RunTest(TestModuleSegmentsUseFlexibleMemory);
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestGuestTlsReadsUseThreadTcb);
+#endif
 	RunTest(TestGuestTlsGetAddrUsesPerThreadBlocks);
 	// Memory callbacks remain registered for the rest of the process.
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
