@@ -197,6 +197,10 @@ bool AbOff(const char* flag) noexcept {
 	       std::strcmp(driven, flag) == 0;
 }
 
+bool AbArmOff() noexcept {
+	return g_ab_period != 0 && g_ab_arm.load(std::memory_order_relaxed) == 0;
+}
+
 void NotePresentedFrame() noexcept {
 	{
 		// Smoothed presentation interval (1/8 of each new interval), always kept: the GPU thread reads
