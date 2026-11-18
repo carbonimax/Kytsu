@@ -135,17 +135,25 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->close_terminal->setVisible(false); // The emulator runs without a terminal.
 #endif
 
-	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowMinMaxButtonsHint |
-	                            Qt::WindowCloseButtonHint);
+	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowTitleHint | Qt::WindowSystemMenuHint |
+	                            Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint);
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
-	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
-		Update();
+	const auto update_title_sound = [this]() {
 		const auto* item = m_ui->widget->GetSelectedItem();
 		m_title_sound.SetTitle(m_running_games == 0 && item != nullptr ? item->GetInfo().basedir
 		                                                               : QString());
+	};
+	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this, update_title_sound]() {
+		Update();
+		update_title_sound();
+		if (m_ui->widget->GetSelectedItem() != nullptr) {
+			m_title_sound.PlayNavigation();
+		}
 	});
+	// The first game is selected while the widget is built, before this connection exists.
+	update_title_sound();
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_running_games == 0) {
@@ -174,6 +182,19 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(main_dialog, &MainDialog::Resize, [this]() {
 		g_last_geometry = m_main_dialog->saveGeometry();
 		m_ui->widget->WriteSettings();
+	});
+
+	m_controller_preview.SetBatteryMonitor(true);
+	connect(&m_controller_preview, &ControllerPreview::NavigationInput, this,
+	        [this](int action) { m_ui->widget->GamepadNavigate(action); }, Qt::QueuedConnection);
+	connect(&m_controller_preview, &ControllerPreview::StateChanged, this, [this]() {
+		const bool wired = m_controller_preview.ControllerWired();
+		const bool charging = m_controller_preview.BatteryCharging();
+		// Wired and not charging: only the controller + cable glyph is shown.
+		const int percent = !m_controller_preview.ControllerConnected() ? -1
+		                    : (wired && !charging)                    ? 101
+		                                                              : m_controller_preview.BatteryPercent();
+		m_ui->widget->SetControllerBattery(percent, charging);
 	});
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
