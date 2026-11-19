@@ -176,7 +176,8 @@ struct DrawRenderState {
 [[nodiscard]] int DrawStateInPlaceMode() noexcept;
 void              ResetDrawStateForLookup(DrawRenderState& state, vk::PrimitiveTopology topology, int mode);
 // The first field built by the lookup where `state` and `reference` differ, or nullptr. A draw without a
-// vertex program in both compares only that. `offset`: the first differing byte inside that field.
+// vertex program in both compares only that. `offset`: the first differing byte (padding left out),
+// from the start of the state.
 [[nodiscard]] const char* DrawStateLookupDiff(const DrawRenderState& state,
                                               const DrawRenderState& reference, size_t& offset);
 

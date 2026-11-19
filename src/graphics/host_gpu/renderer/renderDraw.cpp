@@ -46,6 +46,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -2440,12 +2441,46 @@ int DrawStateInPlaceMode() noexcept {
 	state.tess_deferred    = false;
 }
 
-template <typename T>
-static bool BytesDiffer(const T& a, const T& b, size_t& offset) {
-	const auto* x = reinterpret_cast<const unsigned char*>(&a);
-	const auto* y = reinterpret_cast<const unsigned char*>(&b);
-	for (size_t i = 0; i < sizeof(T); i++) {
-		if (x[i] != y[i]) {
+// Bytes of a DrawRenderState that value-initialization leaves as they were: padding, which nothing reads
+// and copies may or may not carry.
+static const std::vector<bool>& DrawStatePadding() {
+	static const std::vector<bool> mask = [] {
+		static DrawRenderState zeros, ones;
+		std::memset(static_cast<void*>(&zeros), 0x00, sizeof(zeros));
+		std::memset(static_cast<void*>(&ones), 0xff, sizeof(ones));
+		std::construct_at(&zeros);
+		std::construct_at(&ones);
+		const auto*       x = reinterpret_cast<const unsigned char*>(&zeros);
+		const auto*       y = reinterpret_cast<const unsigned char*>(&ones);
+		std::vector<bool> m(sizeof(DrawRenderState));
+		for (size_t i = 0; i < m.size(); i++) m[i] = x[i] != y[i];
+		// Also what the stage resets of the lookup (`info = {}`, a copy) leave as they were.
+		std::memset(static_cast<void*>(&zeros), 0x00, sizeof(zeros));
+		std::memset(static_cast<void*>(&ones), 0xff, sizeof(ones));
+		for (auto* s: {&zeros, &ones}) {
+			for (auto& stage: s->vertex_info) stage = {};
+			s->ps_input_info = {};
+		}
+		const auto mark = [&](const auto& field) {
+			const auto base = static_cast<size_t>(reinterpret_cast<const unsigned char*>(&field) - x);
+			for (size_t i = base; i < base + sizeof(field); i++) m[i] = m[i] || x[i] != y[i];
+		};
+		for (const auto& stage: zeros.vertex_info) mark(stage);
+		mark(zeros.ps_input_info);
+		return m;
+	}();
+	return mask;
+}
+
+// `field` (of `a`, `size` bytes) against the same bytes of `b`, padding left out; `offset` from the state start.
+static bool BytesDiffer(const DrawRenderState& a, const DrawRenderState& b, const void* field, size_t size,
+                        size_t& offset) {
+	const auto* x    = reinterpret_cast<const unsigned char*>(&a);
+	const auto* y    = reinterpret_cast<const unsigned char*>(&b);
+	const auto  base = static_cast<size_t>(static_cast<const unsigned char*>(field) - x);
+	const auto& pad  = DrawStatePadding();
+	for (size_t i = base; i < base + size; i++) {
+		if (!pad[i] && x[i] != y[i]) {
 			offset = i;
 			return true;
 		}
@@ -2473,19 +2508,22 @@ const char* DrawStateLookupDiff(const DrawRenderState& state, const DrawRenderSt
 	KYTY_DRAW_STATE_FIELD(indirect_count);
 	KYTY_DRAW_STATE_FIELD(VertexStages().size());
 #undef KYTY_DRAW_STATE_FIELD
-	if (BytesDiffer(state.depth_info, reference.depth_info, offset)) return "depth_info";
-	if (BytesDiffer(state.color_info[0], reference.color_info[0], offset)) return "color_info[0]";
-	if (BytesDiffer(state.ps_input_info, reference.ps_input_info, offset)) return "ps_input_info";
+	const auto differs = [&](const auto& field) {
+		return BytesDiffer(state, reference, &field, sizeof(field), offset);
+	};
+	if (differs(state.depth_info)) return "depth_info";
+	if (differs(state.color_info[0])) return "color_info[0]";
+	if (differs(state.ps_input_info)) return "ps_input_info";
 	static constexpr const char* Names[] = {"vertex_info[0]", "vertex_info[1]", "vertex_info[2]"};
+	static_assert(offsetof(ShaderVertexInputInfo, pixel_input) == 0);
 	for (size_t i = 0; i < reference.VertexStages().size(); i++) {
 		// pixel_input points into its own state.
-		auto a = state.vertex_info[i];
-		auto b = reference.vertex_info[i];
-		if ((a.pixel_input == &state.ps_input_info) != (b.pixel_input == &reference.ps_input_info)) {
+		const auto& a = state.vertex_info[i];
+		const auto& b = reference.vertex_info[i];
+		if ((a.pixel_input == &state.ps_input_info) != (b.pixel_input == &reference.ps_input_info) ||
+		    BytesDiffer(state, reference, &a.pixel_input + 1, sizeof(a) - sizeof(a.pixel_input), offset)) {
 			return Names[i];
 		}
-		a.pixel_input = b.pixel_input = nullptr;
-		if (BytesDiffer(a, b, offset)) return Names[i];
 	}
 	return nullptr;
 }
@@ -2524,7 +2562,10 @@ static void VerifyDrawStateLookup(CommandBuffer& buffer, const DrawRenderState& 
 	if (state.tess_deferred) {
 		skipped++; // its stages are still translating: a second lookup would wait for them
 	} else {
-		ResetDrawStateForLookup(reference, topology, 0);
+		// The values of `= {}` (mode 0), with its padding set: the comparison leaves padding out anyway.
+		std::memset(static_cast<void*>(&reference), 0, sizeof(reference));
+		std::construct_at(&reference);
+		reference.topology  = topology;
 		g_pipeline_relookup = true;
 		CpPipeline::SetInLookup(true);
 		RefreshShaders(buffer, reference, single_sample);
@@ -2535,7 +2576,9 @@ static void VerifyDrawStateLookup(CommandBuffer& buffer, const DrawRenderState& 
 		size_t      offset = 0;
 		const char* field  = DrawStateLookupDiff(state, reference, offset);
 		if (field != nullptr && ++diffs <= 16) {
-			std::printf("KYTY_DRAW_STATE_IN_PLACE=2: %s differs at byte %zu\n", field, offset);
+			std::printf("KYTY_DRAW_STATE_IN_PLACE=2: %s differs at state byte %zu (0x%02x, reset 0x%02x)\n", field,
+			            offset, reinterpret_cast<const unsigned char*>(&state)[offset],
+			            reinterpret_cast<const unsigned char*>(&reference)[offset]);
 		}
 	}
 	if ((compared + skipped) % 20000 == 0) {
