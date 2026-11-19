@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <utility>
 
@@ -987,11 +991,47 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	}
 }
 
+// shortcut: measurement only (KYTY_PERF_STATS=1); remove with the S3/S4 counters. Logs the
+// SAVEEXEC forms that were refused before they were decoded.
+void CountNewSaveexecForms(const Decoder::Program& decoded, uint64_t shader_hash) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_STATS");
+		return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	using O = Decoder::Opcode;
+	for (const auto& inst: decoded.instructions) {
+		switch (inst.opcode) {
+			case O::S_OR_SAVEEXEC_B32:
+			case O::S_XOR_SAVEEXEC_B32:
+			case O::S_ANDN2_SAVEEXEC_B32:
+			case O::S_NAND_SAVEEXEC_B32:
+			case O::S_NOR_SAVEEXEC_B32:
+			case O::S_XNOR_SAVEEXEC_B32:
+			case O::S_ORN1_SAVEEXEC_B32:
+			case O::S_OR_SAVEEXEC_B64:
+			case O::S_XOR_SAVEEXEC_B64:
+			case O::S_ANDN2_SAVEEXEC_B64:
+			case O::S_NAND_SAVEEXEC_B64:
+			case O::S_NOR_SAVEEXEC_B64:
+			case O::S_XNOR_SAVEEXEC_B64:
+			case O::S_ORN1_SAVEEXEC_B64:
+				std::printf("PERF arifix-s1 shader=0x%016" PRIx64 " opcode=0x%02x pc=0x%x\n",
+				            shader_hash, inst.opcode_id, inst.pc);
+				break;
+			default: break;
+		}
+	}
+}
+
 } // namespace
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options) {
 	ValidateTranslateOptions(options);
+	CountNewSaveexecForms(decoded, options.shader_hash);
 	if (cfg.blocks.empty()) {
 		EXIT("cannot translate an empty CFG");
 	}
