@@ -48,13 +48,16 @@ struct ImportedMemory {
 class Buffer {
 public:
 	// prefer_device: host-written memory placed in device-local memory (ReBAR staging ring).
+	// host_cached: host-written memory placed in cached host memory (KYTY_STREAM_HOST_CACHED).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
-	       bool prefer_device = false);
+	       bool prefer_device = false, bool host_cached = false);
 	// A buffer whose bytes are the guest's own memory (KYTY_MEM_IMPORT).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
 	       vk::BufferUsageFlags flags, uint64_t size, const ImportedMemory& imported);
 	~Buffer();
+	// The Vulkan memory property flags of the allocation (0 for an imported buffer).
+	[[nodiscard]] uint32_t MemoryProperties() const noexcept;
 	// Requirements of an imported buffer with these flags and size (same create info as above).
 	[[nodiscard]] static vk::MemoryRequirements ImportedRequirements(GraphicContext&      graphics,
 	                                                                 vk::BufferUsageFlags flags,
@@ -99,7 +102,8 @@ protected:
 
 private:
 	void AllocateDevice(GraphicContext& graphics, MemoryUsage usage, uint64_t cpu_address,
-	                    vk::BufferUsageFlags flags, uint64_t size, bool prefer_device);
+	                    vk::BufferUsageFlags flags, uint64_t size, bool prefer_device,
+	                    bool host_cached);
 	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
@@ -130,7 +134,7 @@ public:
 	};
 
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, bool host_cached = false);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true, bool wait_priority = true);

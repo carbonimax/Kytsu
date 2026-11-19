@@ -1097,6 +1097,37 @@ static int ReprotectBatchMode() {
 	return mode;
 }
 
+// KYTY_STREAM_HOST_CACHED=1 (default 0): the per-draw stream ring (ObtainBuffer copies, flattened
+// SRTs, shader data, index data) in cached host memory instead of device-local host-visible (ReBAR)
+// memory. Write-combined stores stall the memory accesses after them; cached ones do not, and the
+// GPU reads the ring over the bus. Idea and first measure: BryanKAdams (a25a2b97b).
+static bool StreamHostCached(const GraphicContext& graphics) {
+	const char* value = std::getenv("KYTY_STREAM_HOST_CACHED");
+	if (value == nullptr || std::strtol(value, nullptr, 10) == 0) {
+		return false;
+	}
+	constexpr vk::MemoryPropertyFlags cached =
+	    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached;
+	const auto& memory = graphics.physical_device_memory_properties;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+		if ((memory.memoryTypes[i].propertyFlags & cached) == cached) {
+			return true;
+		}
+	}
+	std::printf("BufferCache: KYTY_STREAM_HOST_CACHED: no host-cached memory type, stream ring "
+	            "kept in its default memory\n");
+	std::fflush(stdout);
+	return false;
+}
+
+// KYTY_AB_FLAG=stream_host_cached: the forced-off arm copies into m_stream_default. Each ring waits
+// for its own in-flight ranges, so switching between frames is safe. The tiler keeps the ring it
+// got at startup.
+StreamBuffer& BufferCache::StreamRing() noexcept {
+	return m_stream_default != nullptr && PerfStats::AbOff("stream_host_cached") ? *m_stream_default
+	                                                                              : m_stream_buffer;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -1105,7 +1136,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+      m_stream_host_cached(StreamHostCached(graphics)),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, m_stream_host_cached),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
@@ -1126,6 +1158,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		buffer.Flush(0, buffer.Size());
 	}
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	if (const char* ab = std::getenv("KYTY_AB_FLAG");
+	    m_stream_host_cached && ab != nullptr && std::strcmp(ab, "stream_host_cached") == 0) {
+		m_stream_default =
+		    std::make_unique<StreamBuffer>(graphics, scheduler, MemoryUsage::Stream, 64 * MiB);
+		// Vulkan memory property bits: 1 device-local, 2 host-visible, 4 coherent, 8 cached.
+		std::printf("BufferCache: stream_host_cached A/B: ring memory 0x%x, default ring memory 0x%x\n",
+		            m_stream_buffer.MemoryProperties(), m_stream_default->MemoryProperties());
+		std::fflush(stdout);
+	}
 	if (graphics.readback_queue != nullptr && AsyncFaultReadbacks()) {
 		m_readback_queue = std::make_unique<ReadbackQueue>(graphics, scheduler);
 	}
@@ -2884,17 +2925,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		auto& stream          = StreamRing();
+		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
 			(void)EopAtGpu::OverlayPending(vaddr, mapped, size);
-			m_stream_buffer.Commit();
+			stream.Commit();
 			if (LateRead::Enabled() && !m_import && !LateRead::NetOnly()) [[unlikely]] {
 				LateRead::Bind(vaddr, size, LateRead::PathStream);
 			}
-			return {&m_stream_buffer, offset};
+			return {&stream, offset};
 		}
 	}
 
