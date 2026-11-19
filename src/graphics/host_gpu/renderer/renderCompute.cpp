@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
@@ -823,6 +824,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	bool found_program = false;
 	{
 		CpSplitProf::LookupScope lookup;
+		// KYTY_SRT_WALK_DIRTY_UNKNOWN: an indirect dispatch usually follows the pass that writes its inputs;
+		// GPU-written values its SRT walk reads mostly only decide reachability (the shader reads them
+		// itself), so the walk does not wait for them unless materialization needs one.
+		const ShaderRecompiler::IR::SrtWalkerUnknownGpuWrites unknown_gpu_writes(true);
 		found_program = static_cast<bool>(m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info));
 	}
 	if (!found_program) return;

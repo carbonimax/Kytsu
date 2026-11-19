@@ -667,10 +667,15 @@ static uint32_t ReadWalkerBacking(uint64_t address, uint32_t* value) {
 	if (!Libs::LibKernel::Memory::MaybeGpuModifiedPage(address)) {
 		return 0;
 	}
-	const uint32_t synced =
-	    WalkStatsEnabled() && Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(*value))
-	        ? ProtectedLoadSynced
-	        : 0u;
+	const bool unknown = SrtWalkerUnknownGpuWrites::Active();
+	const bool dirty   = (unknown || WalkStatsEnabled()) &&
+	                   Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(*value));
+	if (dirty) {
+		NoteWalkerDirtyRead(unknown);
+		// KYTY_SRT_WALK_DIRTY_UNKNOWN: the walker reads the value as unknown instead of waiting.
+		if (unknown) return ProtectedLoadKeep | ProtectedLoadUnknown;
+	}
+	const uint32_t synced = dirty ? ProtectedLoadSynced : 0u;
 	return (Libs::LibKernel::Memory::TryReadBufferBacking(address, value, sizeof(*value))
 	            ? ProtectedLoadValue | ProtectedLoadKeep
 	            : ProtectedLoadKeep) |
@@ -753,10 +758,24 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (access == GpuAccess::Read && SrtBackingReadsEnabled()) {
 			if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
 			        info->exception_address)) {
+				namespace Ir          = Libs::Graphics::ShaderRecompiler::IR;
+				const auto address    = Loader::X64InstructionEmulator::LoadBaseR10(info->native_context);
+				const bool unknown    = Ir::SrtWalkerUnknownGpuWrites::Active();
+				const bool dirty      = (unknown || Ir::WalkStatsEnabled()) &&
+				                   Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(uint32_t));
+				if (dirty) Ir::NoteWalkerDirtyRead(unknown);
+				if (dirty && unknown) {
+					// KYTY_SRT_WALK_DIRTY_UNKNOWN: unknown instead of waiting for the GPU; later loads from
+					// the page take the reader.
+					Loader::X64InstructionEmulator::CompleteUnknownLoad(info->native_context, length);
+					Ir::SrtWalkerUnknownGpuWrites::NoteUnknown();
+					Ir::SetProtectedLoadReader(&ReadWalkerBacking);
+					Ir::NoteProtectedLoad(address);
+					prof_note(Prof::Fault::WalkerRead);
+					return true;
+				}
 				uint32_t value = 0;
-				if (Libs::LibKernel::Memory::TryReadBufferBacking(
-				        Loader::X64InstructionEmulator::LoadBaseR10(info->native_context), &value,
-				        sizeof(value))) {
+				if (Libs::LibKernel::Memory::TryReadBufferBacking(address, &value, sizeof(value))) {
 					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 					Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(true);
 					Libs::Graphics::ShaderRecompiler::IR::SetProtectedLoadReader(&ReadWalkerBacking);

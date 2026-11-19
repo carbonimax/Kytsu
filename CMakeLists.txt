@@ -868,6 +868,8 @@ if(BUILD_TESTING)
 	set_tests_properties(shader_cfg resource_materialization resource_tracking PROPERTIES
 	                     ENVIRONMENT "KYTY_SRT_WALK_REUSE=0")
 	add_test(NAME srt_walk_reuse COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_WALK_REUSE=1 $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
+	add_test(NAME srt_walk_dirty_unknown COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_WALK_REUSE=1 KYTY_SRT_WALK_DIRTY_UNKNOWN=1 $<TARGET_FILE:resource_materialization_tests> --dirty-unknown 1)
+	add_test(NAME srt_walk_dirty_unknown_verify COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_WALK_REUSE=1 KYTY_SRT_WALK_DIRTY_UNKNOWN=2 $<TARGET_FILE:resource_materialization_tests> --dirty-unknown 2)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)

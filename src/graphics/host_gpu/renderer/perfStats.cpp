@@ -403,6 +403,15 @@ void MaybeReport() noexcept {
 		            walk.fault_reads, walk.protected_calls, static_cast<double>(walk.protected_ns) / 1e6,
 		            walk.protected_synced, walk.protected_evictions, walk.reuse_hits, walk.reuse_checks,
 		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs);
+		// KYTY_SRT_WALK_DIRTY_UNKNOWN: synced = dirty - unknown walker reads (both read paths); redo walk =
+		// the walk failed (a flattened read), other = a later step (a descriptor).
+		std::printf("PERF srtdirty %.1fs: mode=%u frames=%" PRIu64 " lookups=%" PRIu64 " dirty=%" PRIu64
+		            " unknown=%" PRIu64 " synced=%" PRIu64 " redo=%" PRIu64 "(walk=%" PRIu64 ",other=%" PRIu64
+		            ") verify=%" PRIu64 "(diffs=%" PRIu64 ")\n",
+		            seconds, ShaderRecompiler::IR::SrtWalkDirtyUnknownMode(), n(Counter::Frames), walk.dirty_lookups,
+		            walk.dirty_reads, walk.dirty_unknown, walk.dirty_reads - walk.dirty_unknown,
+		            walk.redo_walk + walk.redo_other, walk.redo_walk, walk.redo_other, walk.verify_checks,
+		            walk.verify_diffs);
 	}
 	if (n(Counter::AsyncSkipped) + n(Counter::AsyncBlockWrites) + n(Counter::AsyncBlockDepthOnly) +
 	        n(Counter::AsyncBlockQuery) + n(Counter::AsyncBlockPasses) + n(Counter::AsyncBlockCap) != 0) {

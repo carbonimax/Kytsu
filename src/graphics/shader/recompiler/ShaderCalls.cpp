@@ -210,6 +210,8 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
 	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
+	// Call targets must be known: their walk waits for GPU-written bytes.
+	const IR::SrtWalkerUnknownGpuWrites waiting(false);
 	auto& reads = source.reads;
 	reads.clear();
 	std::vector<uint32_t> flat;

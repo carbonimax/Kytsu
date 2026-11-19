@@ -90,7 +90,44 @@ struct WalkStats {
 	// KYTY_SRT_WALK_REUSE: walks whose inputs matched the plan's last walk (checks), of which every
 	// guest load still read the same value (hits); validation time; verify-mode mismatches.
 	uint64_t reuse_checks = 0, reuse_hits = 0, reuse_ns = 0, reuse_diffs = 0;
+	// KYTY_SRT_WALK_DIRTY_UNKNOWN: walker reads of GPU-written bytes (both read paths), of which read as
+	// unknown; materializations under the rule, redone with the waiting reads (the walk failed, or a
+	// later step); mode 2 comparisons and differences.
+	uint64_t dirty_reads = 0, dirty_unknown = 0, dirty_lookups = 0, redo_walk = 0, redo_other = 0,
+	         verify_checks = 0, verify_diffs = 0;
 };
+// KYTY_SRT_WALK_DIRTY_UNKNOWN (default 0; read once; x86-64 walker): 1 = while an
+// SrtWalkerUnknownGpuWrites scope is enabled on the thread (an indirect dispatch's program lookup),
+// walker loads of GPU-written bytes not yet read back evaluate as unknown instead of waiting for the
+// GPU. Unknown branch conditions keep every successor reachable (more bindings, never fewer); a
+// materialization that needed such a value (a descriptor, a flattened read) is redone once with the
+// waiting loads. 2 = also run the waiting materialization and use it, comparing both (counted, the
+// first differences logged). 0 emits the walker code unchanged.
+[[nodiscard]] uint32_t SrtWalkDirtyUnknownMode() noexcept;
+class SrtWalkerUnknownGpuWrites {
+public:
+	// enabled = false switches the rule off for the scope (walks whose values must be known).
+	explicit SrtWalkerUnknownGpuWrites(bool enabled);
+	~SrtWalkerUnknownGpuWrites();
+	SrtWalkerUnknownGpuWrites(const SrtWalkerUnknownGpuWrites&)            = delete;
+	SrtWalkerUnknownGpuWrites& operator=(const SrtWalkerUnknownGpuWrites&) = delete;
+
+	// Whether a walker load on this thread must read GPU-written bytes as unknown now.
+	[[nodiscard]] static bool Active() noexcept;
+	// A walker load read as unknown on this thread.
+	static void NoteUnknown() noexcept;
+	// Whether a load read as unknown since the last call; clears it.
+	static bool TakeSeen() noexcept;
+	// Turns the rule on or off for this thread; returns whether it was on.
+	static bool Exchange(bool enabled) noexcept;
+
+private:
+	bool m_previous;
+};
+void NoteWalkerDirtyRead(bool unknown) noexcept;
+void NoteDirtyLookup() noexcept;
+void NoteDirtyRedo(bool walk_failed) noexcept;
+void NoteDirtyVerify(bool same) noexcept;
 // KYTY_SRT_WALK_REUSE (default 1; x86-64 walker; 0 = off): a walk whose user data and shader base equal the
 // plan's last walk, and whose recorded guest loads all still read the recorded values (loaded the
 // way the walker loads them: protected-page list, backing reads, fault handling), is not run again:
@@ -108,6 +145,9 @@ using ProtectedLoadReader = uint32_t (*)(uint64_t address, uint32_t* value);
 constexpr uint32_t ProtectedLoadValue = 1u;
 constexpr uint32_t ProtectedLoadKeep  = 2u;
 constexpr uint32_t ProtectedLoadSynced = 4u; // measurement: GPU-written bytes were synchronized first
+// KYTY_SRT_WALK_DIRTY_UNKNOWN: GPU-written bytes left unread (SrtWalkerUnknownGpuWrites::Active);
+// the walker reads the value as unknown.
+constexpr uint32_t ProtectedLoadUnknown = 8u;
 void SetProtectedLoadReader(ProtectedLoadReader reader) noexcept;
 void NoteProtectedLoad(uint64_t address) noexcept;
 void      EnableWalkStats() noexcept;
@@ -115,7 +155,8 @@ void      EnableWalkStats() noexcept;
 void      NoteWalkerFaultRead(bool backing) noexcept;
 WalkStats TakeWalkStats() noexcept;
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
-// The exception handler completes such a load as a zero read.
+// The exception handler completes such a load as a zero read. With KYTY_SRT_WALK_DIRTY_UNKNOWN on, a
+// handler that leaves the value unknown also sets rcx to nonzero (the walker clears it before the load).
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are

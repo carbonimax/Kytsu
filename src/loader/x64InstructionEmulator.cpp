@@ -855,6 +855,13 @@ void CompleteLoad(void* native_context, size_t length, uint32_t value) {
 	context.Advance(length);
 }
 
+void CompleteUnknownLoad(void* native_context, size_t length) {
+	Context context {static_cast<decltype(Context::native)>(native_context)};
+	context.Gpr(1) = 1; // rcx: the walker's unknown flag
+	context.Gpr(0) = 0;
+	context.Advance(length);
+}
+
 uint64_t LoadBaseR10(void* native_context) {
 	Context context {static_cast<decltype(Context::native)>(native_context)};
 	return static_cast<uint64_t>(context.Gpr(10));
@@ -871,6 +878,10 @@ void SkipLoad(void* /*native_context*/, size_t /*length*/) {
 }
 
 void CompleteLoad(void* /*native_context*/, size_t /*length*/, uint32_t /*value*/) {
+	EXIT("%s: native x86 instruction emulation is unavailable on ARM64 hosts\n", __func__);
+}
+
+void CompleteUnknownLoad(void* /*native_context*/, size_t /*length*/) {
 	EXIT("%s: native x86 instruction emulation is unavailable on ARM64 hosts\n", __func__);
 }
 

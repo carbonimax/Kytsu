@@ -13,6 +13,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -2023,7 +2024,130 @@ void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 } // namespace Common
 
-int main() {
+// KYTY_SRT_WALK_DIRTY_UNKNOWN (run with =1 or =2 and KYTY_SRT_WALK_REUSE=1): a block condition and
+// a buffer descriptor read two DWORDs of one table; either can hold GPU-written bytes, served by the
+// protected-page reader or by the fault path.
+void TestDirtyReadsReadAsUnknown(uint32_t mode) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  Check(SrtWalkDirtyUnknownMode() == mode && WalkReuseMode() == 1u,
+        "dirty-unknown test needs KYTY_SRT_WALK_DIRTY_UNKNOWN and KYTY_SRT_WALK_REUSE=1");
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(0x1000u), Value(0u)});
+  const auto load = [&](uint32_t offset) -> Inst & {
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(offset), Value(0u), Value(false)});
+    read.SetFlags(MemoryFlags{.index = 0, .pc = offset});
+    return read;
+  };
+  auto &base = load(4u);
+  auto &flag = load(8u);
+  DescriptorSource source;
+  source.dwords = {Value(&base), Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  auto &condition = block.AppendNewInst(ValueOpcode::IEqual32, {Value(&flag), Value(1u)});
+  auto &store_block = AddValueBlock(program);
+  AddValueBlock(program);
+  program.blocks[0]->condition = Value(&condition);
+  program.blocks[0]->terminator.kind = TerminatorKind::ConditionalBranch;
+  program.blocks[0]->terminator.true_block = program.blocks[1];
+  program.blocks[0]->terminator.false_block = program.blocks[2];
+  program.blocks[1]->id = 1;
+  program.blocks[1]->terminator.kind = TerminatorKind::Return;
+  program.blocks[2]->id = 2;
+  program.blocks[2]->terminator.kind = TerminatorKind::Return;
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  store_block.AppendNewInst(ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 1});
+  auto plan = Extract(program);
+  Check(!plan.control_flow.empty(), "dirty-unknown plan has no block condition");
+
+  // Guest table: 0x1004 = buffer base, 0x1008 = the flag (0: the store block is not reached).
+  struct Memory { uint32_t flag = 0, waited = 0; uint64_t dirty = UINT64_MAX; };
+  static Memory memory;
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (address == 0x1004u) words[0] = 0x8000u;
+        else if (address == 0x1008u) words[0] = memory.flag;
+        else return false;
+        if (address == memory.dirty) ++memory.waited;
+        return true;
+      }, nullptr);
+  // The protected-page reader: GPU-written bytes are unknown under the rule, else read after a wait.
+  SetProtectedLoadReader(+[](uint64_t address, uint32_t *value) -> uint32_t {
+    if (address == memory.dirty && SrtWalkerUnknownGpuWrites::Active())
+      return ProtectedLoadKeep | ProtectedLoadUnknown;
+    if (address == memory.dirty) ++memory.waited;
+    if (address == 0x1004u) *value = 0x8000u;
+    else if (address == 0x1008u) *value = memory.flag;
+    else return ProtectedLoadKeep;
+    return ProtectedLoadValue | ProtectedLoadKeep;
+  });
+  const std::array<uint32_t, 1> user_data{0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&](bool rule) {
+    const SrtWalkerUnknownGpuWrites scope(rule);
+    return MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization);
+  };
+  for (const bool fault_path : {false, true}) {
+    if (fault_path) {
+      SetProtectedLoadReader(nullptr);
+    } else {
+      NoteProtectedLoad(0x1000u);
+    }
+    const auto dirty = [&](uint64_t address) {
+      memory.dirty = address;
+      memory.waited = 0;
+      FakeGuestMemory::SetGpuWritten(fault_path ? address : UINT64_MAX);
+    };
+    // A GPU-written condition: under the rule both edges are reachable, the descriptor binds and
+    // nothing waits (mode 1); mode 2 waits too, keeps the exact result and counts the difference.
+    memory.flag = 0;
+    dirty(0x1008u);
+    (void)TakeWalkStats();
+    Check(materialize(true), "a walk with an unknown condition failed");
+    const auto stats = TakeWalkStats();
+    if (mode == 1u) {
+      Check(memory.waited == 0 && snapshot.buffers[0].dwords[0] == 0x8000u,
+            "an unknown condition waited or did not keep both edges reachable");
+    } else {
+      Check(memory.waited == 1 && snapshot.buffers[0].dwords[0] == 0u && stats.verify_checks == 1 &&
+                stats.verify_diffs == 1,
+            "verify mode did not use and compare the waiting walk");
+    }
+    // Outside the rule the same walk waits and prunes the edge (no memo of the walk above).
+    dirty(0x1008u);
+    Check(materialize(false) && memory.waited == 1 && snapshot.buffers[0].dwords[0] == 0u,
+          "the walk outside the rule reused an unknown walk or did not wait");
+    // A GPU-written descriptor word is needed: the materialization is redone once, waiting.
+    memory.flag = 1;
+    dirty(0x1004u);
+    Check(materialize(true) && memory.waited == 1 && snapshot.buffers[0].dwords[0] == 0x8000u,
+          "a needed unknown descriptor was not read after waiting");
+    // The waiting redo's memo holds for the next walk with clean bytes.
+    dirty(UINT64_MAX);
+    Check(materialize(true) && snapshot.buffers[0].dwords[0] == 0x8000u, "clean walk after a redo failed");
+  }
+  SetProtectedLoadReader(nullptr);
+  FakeGuestMemory::SetGpuWritten(UINT64_MAX);
+}
+
+int main(int argc, char **argv) {
+  if (argc > 1 && std::string_view(argv[1]) == "--dirty-unknown") {
+    TestDirtyReadsReadAsUnknown(argc > 2 ? static_cast<uint32_t>(std::atoi(argv[2])) : 1u);
+    std::puts("ResourceMaterializationTests: dirty-unknown cases passed");
+    return 0;
+  }
   TestWalkerLoadsBypassSpecializationReader();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();

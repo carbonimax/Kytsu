@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderPretranslate.h"
 #include "kernel/memory.h"
@@ -63,6 +64,7 @@ namespace {
 void CaptureSrtReads(const ShaderRecompiler::IR::ResourcePlan& plan,
                      const ShaderRecompiler::IR::SrtRuntime& runtime, const auto& snapshot) {
 	if (!GpuCapture::Recording()) return;
+	const ShaderRecompiler::IR::SrtWalkerUnknownGpuWrites waiting(false); // capture every byte read
 	std::vector<uint32_t>                      flat;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 	(void)ShaderRecompiler::IR::WalkSrt(plan, runtime, flat, &reads);

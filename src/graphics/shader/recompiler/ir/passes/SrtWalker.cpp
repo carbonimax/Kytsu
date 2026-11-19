@@ -23,6 +23,7 @@
 #include <deque>
 #include <map>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -203,6 +204,17 @@ std::atomic<uint64_t> g_reuse_hits {0};
 std::atomic<uint64_t> g_reuse_ns {0};
 std::atomic<uint64_t> g_reuse_diffs {0};
 
+std::atomic<uint64_t> g_dirty_reads {0};
+std::atomic<uint64_t> g_dirty_unknown {0};
+std::atomic<uint64_t> g_dirty_lookups {0};
+std::atomic<uint64_t> g_redo_walk {0};
+std::atomic<uint64_t> g_redo_other {0};
+std::atomic<uint64_t> g_verify_checks {0};
+std::atomic<uint64_t> g_verify_diffs {0};
+
+thread_local bool t_unknown_gpu_writes      = false;
+thread_local bool t_unknown_gpu_writes_seen = false;
+
 #if KYTY_SRT_X86_WALKER
 bool ProtectedLoadsEnabled() {
 	static const bool enabled = [] {
@@ -241,6 +253,10 @@ uint64_t KYTY_SYSV_ABI ProtectedLoad(uint64_t address) {
 			g_protected_evictions.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
+	if ((result & ProtectedLoadUnknown) != 0) {
+		t_unknown_gpu_writes_seen = true;
+		return uint64_t {1} << 33u;
+	}
 	if ((result & ProtectedLoadValue) == 0) return 0;
 	return (uint64_t {1} << 32u) | value;
 }
@@ -249,7 +265,18 @@ uint64_t KYTY_SYSV_ABI ProtectedLoad(uint64_t address) {
 // With KYTY_SRT_PROTECTED_LOADS (default 1), loads from pages that faulted on a tracker protection
 // before call ProtectedLoad instead of faulting again (a Windows exception costs microseconds).
 // Free here: rax, rcx, r9, r11; live: rdi, rsi, rdx, r8 and the address in r10.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+// With KYTY_SRT_WALK_DIRTY_UNKNOWN on, an unknown value jumps to unknown: ProtectedLoad returns bit 33,
+// and the fault handler sets rcx, which the direct load clears first.
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& unknown) {
+	const bool dirty_unknown = SrtWalkDirtyUnknownMode() != 0;
+	const auto direct_load   = [&] {
+		if (dirty_unknown) code.xor_(code.ecx, code.ecx);
+		code.mov(code.eax, code.dword[code.r10]);
+		if (dirty_unknown) {
+			code.test(code.ecx, code.ecx);
+			code.jnz(unknown, Xbyak::CodeGenerator::T_NEAR);
+		}
+	};
 	code.lea(code.r10, code.ptr[address]);
 	if (ProtectedLoadsEnabled()) {
 		Xbyak::Label direct, done;
@@ -281,15 +308,19 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 		code.pop(code.rdi);
 		code.mov(code.rsp, code.rbp);
 		code.pop(code.rbp);
+		if (dirty_unknown) {
+			code.bt(code.rax, 33);
+			code.jc(unknown, Xbyak::CodeGenerator::T_NEAR);
+		}
 		code.bt(code.rax, 32);
 		code.jc(done, Xbyak::CodeGenerator::T_NEAR);
 		code.L(direct);
-		code.mov(code.eax, code.dword[code.r10]);
+		direct_load();
 		code.L(done);
 		code.mov(code.eax, code.eax);
 		return;
 	}
-	code.mov(code.eax, code.dword[code.r10]);
+	direct_load();
 }
 #endif
 
@@ -1143,7 +1174,8 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		}
 		// LoadGuest keeps the direct load mov eax, [r10] and routes known protected pages to
 		// ProtectedLoad (KYTY_SRT_PROTECTED_LOADS).
-		LoadGuest(c, c.r10);
+		// An unknown value leaves the thunk unknown and the load uncaptured.
+		LoadGuest(c, c.r10, m_ret);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		if (WalkReuseMode() != 0) {
@@ -1617,7 +1649,7 @@ const Xbyak::CodeGenerator& LoadValidatorCode() {
 		c->cmp(c->rdi, c->rsi);
 		c->jae(same, Xbyak::CodeGenerator::T_NEAR);
 		c->mov(c->r10, c->qword[c->rdi]);
-		LoadGuest(*c, c->r10); // keeps rdi, rsi, rdx and r8
+		LoadGuest(*c, c->r10, differ); // keeps rdi, rsi, rdx and r8; an unknown value does not hold
 		c->cmp(c->eax, c->dword[c->rdi + 8]);
 		c->jne(differ, Xbyak::CodeGenerator::T_NEAR);
 		c->add(c->rdi, 16);
@@ -1682,15 +1714,19 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	// Verify mode: the memo's scratch and flat result, compared with the walk below.
 	std::vector<uint64_t> memo_scratch;
 	bool                  verify = false;
+	// Unknown loads of this walk only (the memo check reads them again in the walk).
+	const bool seen_before    = std::exchange(t_unknown_gpu_writes_seen, false);
 	if (reuse != 0 && MemoInputsMatch(plan, runtime)) {
 		const auto start = std::chrono::steady_clock::now();
 		const bool hold  = MemoLoadsHold(plan);
+		t_unknown_gpu_writes_seen = false;
 		if (timed) {
 			g_reuse_checks.fetch_add(1, std::memory_order_relaxed);
 			g_reuse_hits.fetch_add(hold ? 1u : 0u, std::memory_order_relaxed);
 			g_reuse_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
 		}
 		if (hold && reuse == 1u) {
+			t_unknown_gpu_writes_seen = seen_before;
 			flat = plan.srt_memo_flat;
 			if (reads != nullptr) {
 				const auto* captures = plan.srt_scratch.data() + plan.srt_captures / 8u;
@@ -1712,6 +1748,8 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
+	const bool walk_unknown   = t_unknown_gpu_writes_seen;
+	t_unknown_gpu_writes_seen = seen_before || walk_unknown;
 	if (timed) {
 		g_walks.fetch_add(1, std::memory_order_relaxed);
 		g_walk_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1755,8 +1793,9 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 			}
 			if (!same) g_reuse_diffs.fetch_add(1, std::memory_order_relaxed);
 		}
-		// A restarted walk may have reached blocks through loads its last pass no longer recorded.
-		if (Scratch(plan)[plan.srt_restart] == 0u) {
+		// A restarted walk may have reached blocks through loads its last pass no longer recorded, and
+		// an unknown load is not recorded at all.
+		if (Scratch(plan)[plan.srt_restart] == 0u && !walk_unknown) {
 			plan.srt_memo_user_data.assign(runtime.user_data.begin(), runtime.user_data.begin() + plan.srt_user_data);
 			plan.srt_memo_flat        = flat;
 			plan.srt_memo_shader_base = runtime.shader_base;
@@ -1832,6 +1871,58 @@ void NoteWalkerFaultRead(bool backing) noexcept {
 	}
 }
 
+uint32_t SrtWalkDirtyUnknownMode() noexcept {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_SRT_WALK_DIRTY_UNKNOWN");
+		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)) : 0u;
+	}();
+	return mode;
+}
+
+SrtWalkerUnknownGpuWrites::SrtWalkerUnknownGpuWrites(bool enabled): m_previous(t_unknown_gpu_writes) {
+	t_unknown_gpu_writes = enabled && SrtWalkDirtyUnknownMode() != 0;
+}
+
+SrtWalkerUnknownGpuWrites::~SrtWalkerUnknownGpuWrites() {
+	t_unknown_gpu_writes = m_previous;
+}
+
+bool SrtWalkerUnknownGpuWrites::Active() noexcept {
+	return t_unknown_gpu_writes;
+}
+
+void SrtWalkerUnknownGpuWrites::NoteUnknown() noexcept {
+	t_unknown_gpu_writes_seen = true;
+}
+
+bool SrtWalkerUnknownGpuWrites::TakeSeen() noexcept {
+	return std::exchange(t_unknown_gpu_writes_seen, false);
+}
+
+bool SrtWalkerUnknownGpuWrites::Exchange(bool enabled) noexcept {
+	return std::exchange(t_unknown_gpu_writes, enabled && SrtWalkDirtyUnknownMode() != 0);
+}
+
+void NoteWalkerDirtyRead(bool unknown) noexcept {
+	if (!g_walk_stats.load(std::memory_order_relaxed)) return;
+	g_dirty_reads.fetch_add(1, std::memory_order_relaxed);
+	if (unknown) g_dirty_unknown.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteDirtyLookup() noexcept {
+	if (g_walk_stats.load(std::memory_order_relaxed)) g_dirty_lookups.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteDirtyRedo(bool walk_failed) noexcept {
+	if (g_walk_stats.load(std::memory_order_relaxed))
+		(walk_failed ? g_redo_walk : g_redo_other).fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteDirtyVerify(bool same) noexcept {
+	g_verify_checks.fetch_add(1, std::memory_order_relaxed);
+	if (!same) g_verify_diffs.fetch_add(1, std::memory_order_relaxed);
+}
+
 WalkStats TakeWalkStats() noexcept {
 	return {.walks         = g_walks.exchange(0, std::memory_order_relaxed),
 	        .ns            = g_walk_ns.exchange(0, std::memory_order_relaxed),
@@ -1844,7 +1935,14 @@ WalkStats TakeWalkStats() noexcept {
 	        .reuse_checks = g_reuse_checks.exchange(0, std::memory_order_relaxed),
 	        .reuse_hits   = g_reuse_hits.exchange(0, std::memory_order_relaxed),
 	        .reuse_ns     = g_reuse_ns.exchange(0, std::memory_order_relaxed),
-	        .reuse_diffs  = g_reuse_diffs.exchange(0, std::memory_order_relaxed)};
+	        .reuse_diffs  = g_reuse_diffs.exchange(0, std::memory_order_relaxed),
+	        .dirty_reads   = g_dirty_reads.exchange(0, std::memory_order_relaxed),
+	        .dirty_unknown = g_dirty_unknown.exchange(0, std::memory_order_relaxed),
+	        .dirty_lookups = g_dirty_lookups.exchange(0, std::memory_order_relaxed),
+	        .redo_walk     = g_redo_walk.exchange(0, std::memory_order_relaxed),
+	        .redo_other    = g_redo_other.exchange(0, std::memory_order_relaxed),
+	        .verify_checks = g_verify_checks.exchange(0, std::memory_order_relaxed),
+	        .verify_diffs  = g_verify_diffs.exchange(0, std::memory_order_relaxed)};
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

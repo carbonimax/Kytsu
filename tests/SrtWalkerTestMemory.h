@@ -6,6 +6,7 @@
 #include <xbyak/xbyak.h>
 
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <utility>
 #include <vector>
@@ -20,8 +21,11 @@
 
 // Serves SRT walker loads from fake guest addresses: a walker load that faults completes with
 // the test reader's DWORD, or with zero like the emulator when the reader fails or is null.
+// SetGpuWritten(address): a faulting load of that DWORD while SrtWalkerUnknownGpuWrites is active
+// completes as unknown, like the emulator's handler (KYTY_SRT_WALK_DIRTY_UNKNOWN).
 class FakeGuestMemory {
 public:
+  static void SetGpuWritten(uint64_t address) { GpuWritten() = address; }
   explicit FakeGuestMemory(Libs::Graphics::ShaderRecompiler::IR::SrtMemoryReader reader = nullptr,
                            void *userdata = nullptr) {
     Current() = {reader, userdata};
@@ -57,6 +61,17 @@ private:
     static thread_local Reader reader;
     return reader;
   }
+  static uint64_t &GpuWritten() {
+    static thread_local uint64_t address = UINT64_MAX;
+    return address;
+  }
+  // True (and the value unknown: rcx set) for a GPU-written DWORD read under the rule.
+  static bool Unknown(uint64_t address) {
+    using Libs::Graphics::ShaderRecompiler::IR::SrtWalkerUnknownGpuWrites;
+    if (address != GpuWritten() || !SrtWalkerUnknownGpuWrites::Active()) return false;
+    SrtWalkerUnknownGpuWrites::NoteUnknown();
+    return true;
+  }
   static uint32_t Read(uint64_t address) {
     uint32_t word = 0;
     const auto [reader, userdata] = Current();
@@ -68,7 +83,9 @@ private:
     const auto length =
         Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(registers[REG_RIP]);
     if (length == 0) std::abort();
-    registers[REG_RAX] = Read(registers[REG_R10]);
+    const bool unknown = Unknown(registers[REG_R10]);
+    if (unknown) registers[REG_RCX] = 1;
+    registers[REG_RAX] = unknown ? 0u : Read(registers[REG_R10]);
     registers[REG_RIP] += length;
   }
   struct sigaction m_previous {};
@@ -78,7 +95,9 @@ private:
     const auto length =
         Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(registers.__rip);
     if (length == 0) std::abort();
-    registers.__rax = Read(registers.__r10);
+    const bool unknown = Unknown(registers.__r10);
+    if (unknown) registers.__rcx = 1;
+    registers.__rax = unknown ? 0u : Read(registers.__r10);
     registers.__rip += length;
   }
   struct sigaction m_previous {};
@@ -89,7 +108,9 @@ private:
     const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(context.Rip);
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || length == 0)
       return EXCEPTION_CONTINUE_SEARCH;
-    context.Rax = Read(context.R10);
+    const bool unknown = Unknown(context.R10);
+    if (unknown) context.Rcx = 1;
+    context.Rax = unknown ? 0u : Read(context.R10);
     context.Rip += length;
     return EXCEPTION_CONTINUE_EXECUTION;
   }

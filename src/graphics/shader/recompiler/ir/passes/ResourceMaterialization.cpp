@@ -24,7 +24,11 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
+// KYTY_SRT_WALK_DIRTY_UNKNOWN: an attempt with unknown GPU-written values fails quietly before its redo.
+thread_local bool t_quiet_failures = false;
+
 bool SpecializationFail(std::string_view message) {
+	if (t_quiet_failures) return false;
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
 	return false;
@@ -1847,7 +1851,78 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool emulate_image_min_lod) {
+namespace {
+
+thread_local bool t_walk_failed = false;
+
+bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                              ResourceSpecialization& specialization, bool emulate_image_min_lod);
+
+// Everything a materialization binds; the captured reads differ by construction (unknown loads are not
+// captured) and are left out.
+bool SameMaterialization(const ResourceSnapshot& a, const ResourceSpecialization& as, const ResourceSnapshot& b,
+                         const ResourceSpecialization& bs) {
+	return as == bs && a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+	       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data && a.uniform_fill == b.uniform_fill;
+}
+
+void LogDirtyUnknown(const ResourcePlan& program, const char* what) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		std::printf("SRT walk dirty unknown: %s shader=%016llx stage=%u\n", what,
+		            static_cast<unsigned long long>(program.shader_hash), static_cast<unsigned>(program.stage));
+	}
+}
+
+} // namespace
+
+// KYTY_SRT_WALK_DIRTY_UNKNOWN (SrtWalker.h): rule from zinc-builds/KytyPS5 95639452.
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                          ResourceSpecialization& specialization, bool emulate_image_min_lod) {
+	if (!SrtWalkerUnknownGpuWrites::Active())
+		return MaterializeResourcesOnce(program, runtime, snapshot, specialization, emulate_image_min_lod);
+	NoteDirtyLookup();
+	(void)SrtWalkerUnknownGpuWrites::TakeSeen();
+	const bool verify   = SrtWalkDirtyUnknownMode() == 2u;
+	auto       tried    = verify ? snapshot : ResourceSnapshot {};
+	auto       tried_as = verify ? specialization : ResourceSpecialization {};
+	t_quiet_failures    = true;
+	const bool first    = verify ? MaterializeResourcesOnce(program, runtime, tried, tried_as, emulate_image_min_lod)
+	                             : MaterializeResourcesOnce(program, runtime, snapshot, specialization, emulate_image_min_lod);
+	t_quiet_failures    = false;
+	const bool seen     = SrtWalkerUnknownGpuWrites::TakeSeen();
+	if (!seen) {
+		if (verify) {
+			snapshot       = std::move(tried);
+			specialization = std::move(tried_as);
+		}
+		return first;
+	}
+	if (first && !verify) return true;
+	if (!first) {
+		NoteDirtyRedo(t_walk_failed);
+		LogDirtyUnknown(program, t_walk_failed ? "redo (walk: flattened read)" : "redo (descriptor or later step)");
+	}
+	// A value left unknown was needed (or mode 2): read it after the GPU writes it.
+	const bool enabled = SrtWalkerUnknownGpuWrites::Exchange(false);
+	const bool waited  = MaterializeResourcesOnce(program, runtime, snapshot, specialization, emulate_image_min_lod);
+	SrtWalkerUnknownGpuWrites::Exchange(enabled);
+	if (first && waited) {
+		const bool same = SameMaterialization(tried, tried_as, snapshot, specialization);
+		NoteDirtyVerify(same);
+		if (!same) {
+			LogDirtyUnknown(program, tried_as == specialization ? "verify difference (descriptors or flat SRT)"
+			                                                    : "verify difference (specialization)");
+		}
+	}
+	return waited;
+}
+
+namespace {
+
+bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                              ResourceSpecialization& specialization, bool emulate_image_min_lod) {
+	t_walk_failed = false;
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1871,6 +1946,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		mark = walked;
 	}
 	if (!walked_srt) {
+		t_walk_failed = true;
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
@@ -2074,6 +2150,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	times.spec_ns += elapsed_ns(evaluated, now());
 	return built;
 }
+
+} // namespace
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
 	// Mirrors BuildResourceSpecialization for sampled roots: entries it would reject, entries of
