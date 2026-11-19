@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/emulatorConfig.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -8,6 +9,7 @@
 #include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -123,6 +125,14 @@ bool IsGpuThread() noexcept {
 void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) noexcept {
 	Add(driver_cache_hit ? Counter::GfxPipelineHits : Counter::GfxPipelineMisses, 1);
 	Add(driver_cache_hit ? Counter::GfxPipelineHitNs : Counter::GfxPipelineMissNs, duration_ns);
+}
+
+void NoteTessPipeline(bool cache_miss, uint64_t duration_ns) noexcept {
+	Add(Counter::TessPipelines, 1);
+	if (cache_miss) {
+		Add(Counter::TessPipelineMisses, 1);
+		Add(Counter::TessPipelineMissNs, duration_ns);
+	}
 }
 
 uint64_t SteadyUs() noexcept {
@@ -300,6 +310,15 @@ void MaybeReport() noexcept {
 	std::printf("PERF staging %.1fs: write=%.1fms bytes=%.1fMB copies=%" PRIu64 "\n", seconds,
 	            ms(Counter::StagingWriteNs), static_cast<double>(n(Counter::StagingWriteBytes)) / 1048576.0,
 	            n(Counter::StagingWriteCount));
+	if (n(Counter::PatchDraws) + n(Counter::TessPipelines) != 0) {
+		std::printf("PERF tess %.1fs: patch_draws=%" PRIu64 " per_frame=%.1f %s pipelines=%" PRIu64
+		            " miss=%" PRIu64 "/%.0fms\n",
+		            seconds, n(Counter::PatchDraws),
+		            static_cast<double>(n(Counter::PatchDraws)) /
+		                static_cast<double>(std::max<uint64_t>(n(Counter::Frames), 1)),
+		            Config::TessellationEnabled() ? "drawn" : "skipped", n(Counter::TessPipelines),
+		            n(Counter::TessPipelineMisses), ms(Counter::TessPipelineMissNs));
+	}
 	if (BindProfMode() != 0) {
 		std::printf("PERF bindback %.1fs: resolve=%.0fms targets=%.0fms pipeline=%.0fms vertex=%.0fms"
 		            " dynamic=%.0fms record=%.0fms flush=%.0fms(%" PRIu64 ")\n",

@@ -1073,7 +1073,8 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 						return pool.stop || !pool.skipped.empty() || !pool.queue.empty();
 					});
 					if (pool.stop) return;
-					auto job = AsyncPipelinePop(pool.skipped, pool.queue);
+					auto job = AsyncPipelinePop(pool.skipped, pool.queue,
+					                            [this](const auto& queued) { return AsyncUncapped(*queued); });
 					uint32_t queued = 0;
 					if (!job->state.compare_exchange_strong(queued, 1)) continue; // taken inline
 					pool.running++;
@@ -1090,6 +1091,9 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		const char* async = std::getenv("KYTY_ASYNC_PIPELINE");
 		m_async           = async == nullptr || std::strcmp(async, "0") != 0;
 		if (m_async) PipelineCacheLog("Pipeline async: draws skipped while their pipeline is created (KYTY_ASYNC_PIPELINE)");
+		const char* async_tess = std::getenv("KYTY_ASYNC_TESS");
+		m_async_tess           = m_async && (async_tess == nullptr || std::strcmp(async_tess, "0") != 0);
+		if (m_async_tess) PipelineCacheLog("Pipeline async: tessellation draws skipped until created, no cap, depth-only too (KYTY_ASYNC_TESS)");
 	}
 	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
 		// The verify shaders embed this launch's counter address.
@@ -2359,7 +2363,8 @@ bool PipelineCache::SkipMissing(const CommandBuffer& command, const DrawRenderSt
 	// Past the cap the draw waits; a job still queued is then created inline (TakePending). One a
 	// worker is creating stays skipped: waiting would block the CP for the rest of its creation,
 	// and the hole lasts at most one creation longer.
-	const bool may_skip = AsyncPipelineMaySkip(job->first_skip, Frame());
+	const bool may_skip =
+	    AsyncPipelineMaySkip(job->first_skip, Frame(), AsyncUncapped(*job));
 	if (PerfStats::CompileLogEnabled()) [[unlikely]] {
 		LogSkip(*job, may_skip);
 	}
@@ -2409,13 +2414,20 @@ void PipelineCache::LogSkip(PendingPipeline& job, bool may_skip) {
 	size_t  len   = 0;
 	{
 		std::scoped_lock lock(m_pool->mutex);
-		// Position in the workers' order: the skipped queue, then the predicted one.
+		// Position in the workers' order (AsyncPipelinePop): the capped skipped keys, the uncapped
+		// ones, then the predicted queue.
 		const auto& skipped = m_pool->skipped;
 		const auto& queue   = m_pool->queue;
 		len                 = skipped.size() + queue.size();
-		for (size_t i = 0; i < len && pos < 0; i++) {
-			if ((i < skipped.size() ? skipped[i] : queue[i - skipped.size()]).get() == &job) {
-				pos = static_cast<int64_t>(i);
+		int64_t ahead       = 0;
+		for (int pass = 0; pass < 3 && pos < 0; pass++) {
+			for (const auto& queued: pass < 2 ? skipped : queue) {
+				if (pass < 2 && AsyncUncapped(*queued) != (pass == 1)) continue;
+				if (queued.get() == &job) {
+					pos = ahead;
+					break;
+				}
+				ahead++;
 			}
 		}
 	}
@@ -2425,6 +2437,10 @@ void PipelineCache::LogSkip(PendingPipeline& job, bool may_skip) {
 	                          !may_skip ? 'X' : first ? 'A' : 'Q', PerfStats::SteadyUs(),
 	                          GraphicsPipelineKeyHash {}(job.key), age, pos, len,
 	                          job.state.load(std::memory_order_acquire), job.skip_miss ? 1 : 0);
+}
+
+bool PipelineCache::AsyncUncapped(const PendingPipeline& job) const {
+	return m_async_tess && job.stage_count == 3;
 }
 
 void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {
