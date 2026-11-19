@@ -42,6 +42,7 @@ uint32_t              EmitCompositeExtractU32x2(EmitterState& state, uint32_t ar
 inline constexpr auto EmitCompositeExtractU32x3 = EmitCompositeExtractU32x2;
 inline constexpr auto EmitCompositeExtractU32x4 = EmitCompositeExtractU32x2;
 // Format conversions (stores, D16 samples) keep the GLSL pack; ALU results use EmitPackHalf2x16.
+// KYTY_F16_STORE_RTZ=1 replaces it in formatted stores (EncodeFormattedStoreComponent).
 inline constexpr auto EmitGlslPackHalf2x16 =
     EmitGlsl<GLSLstd450PackHalf2x16, IR::Type::U32, uint32_t>;
 uint32_t              EmitPackHalf2x16(EmitterState& state, uint32_t pair);

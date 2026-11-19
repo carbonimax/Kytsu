@@ -409,6 +409,73 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+// KYTY_MEM_IMPORT_WATCH: the CPU-dirty hook sees each run of pages that turns CPU-modified, while the
+// pages are still write-protected, and nothing for pages already CPU-modified.
+struct CpuDirtyCall {
+  uint64_t vaddr = 0, size = 0;
+  bool protected_at_call = false;
+};
+std::vector<CpuDirtyCall> g_cpu_dirty_calls;
+
+void RecordCpuDirty(uint64_t vaddr, uint64_t size) {
+  g_cpu_dirty_calls.push_back({vaddr, size, Protection(reinterpret_cast<const void *>(vaddr)) == PAGE_READONLY});
+}
+
+void TestCpuDirtyHook() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(!tracker.IsRegionCpuModified(address, page_size * 4) && Protection(memory) == PAGE_READONLY,
+        "upload did not leave the pages clean and protected");
+  g_cpu_dirty_calls.clear();
+  Libs::Graphics::g_cpu_dirty_hook = RecordCpuDirty;
+  tracker.MarkRegionAsCpuModified(address + page_size + 16, 32);
+  const auto first = g_cpu_dirty_calls;
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  const auto second = std::vector<CpuDirtyCall>(g_cpu_dirty_calls.begin() + static_cast<ptrdiff_t>(first.size()),
+                                                g_cpu_dirty_calls.end());
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  const auto calls = g_cpu_dirty_calls.size();
+  Libs::Graphics::g_cpu_dirty_hook = nullptr;
+  // Only the first call is checked for protection: with host pages larger than tracker pages, a later
+  // run can share a host page made writable by the first.
+  Check(first.size() == 1 && first[0].vaddr == address + page_size && first[0].size == page_size &&
+            first[0].protected_at_call,
+        "the hook did not see the dirtied page before its protection was lifted");
+  Check(second.size() == 2 && second[0].vaddr == address && second[0].size == page_size &&
+            second[1].vaddr == address + page_size * 2 && second[1].size == page_size * 2,
+        "the hook did not see exactly the runs of pages that changed");
+  Check(calls == first.size() + second.size(), "the hook saw pages that were already CPU-modified");
+  Release(memory);
+}
+
+// KYTY_PROTECT_COALESCE defers the re-protection of read-only uploads to the flush; the write-watch
+// arming at bind (may_defer = false) protects at once, or a guest write before the flush goes unseen.
+// Runs of 4 tracker pages, so a 16 KiB host page never mixes the two cases.
+void TestUploadWithoutDeferral() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto run = Libs::Graphics::TRACKER_PAGE_SIZE * 4;
+  auto *memory = Allocate(8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  PageManager::BeginDeferredProtect();
+  tracker.ForEachUploadRange(address, run, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  const bool deferred = IsWritable(memory);
+  tracker.ForEachUploadRange(
+      address + run, run, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {}, false);
+  const bool immediate = Protection(memory + run) == PAGE_READONLY;
+  PageManager::EndDeferredProtect();
+  Check(deferred, "a deferrable read-only upload protected its pages before the flush");
+  Check(immediate, "an upload that may not defer left its pages writable until the flush");
+  Check(Protection(memory) == PAGE_READONLY, "ending the deferral did not protect the deferred pages");
+  tracker.MarkRegionAsCpuModified(address, run * 2);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1407,6 +1474,8 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuDirtyHook();
+  TestUploadWithoutDeferral();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

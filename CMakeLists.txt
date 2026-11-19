@@ -902,6 +902,10 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_negative_offset COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only negative-offset)
 	add_test(NAME shader_recompiler_div_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only div-f32)
 	add_test(NAME shader_recompiler_ds_minmax COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only ds-minmax)
+	add_test(NAME shader_recompiler_hw_rcp COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only rcp)
+	add_test(NAME shader_recompiler_f16_store_rtz COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-float16-store-only)
+	set_tests_properties(shader_recompiler_f16_store_rtz PROPERTIES ENVIRONMENT KYTY_F16_STORE_RTZ=1)
+	add_test(NAME shader_recompiler_hw_sincos COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only sincos)
 	add_test(NAME shader_recompiler_helper_quad
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-append-helper-quad-only)
 	add_test(NAME shader_recompiler_tessellation
@@ -928,6 +932,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
+	add_test(NAME graphics_depth_attachment_feedback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-depth-resource-only)
 	add_test(NAME shader_store
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-store-only)
 	add_test(NAME shader_store_key
@@ -978,7 +984,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME gpu_capture_replay
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-only)
-	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); skipped where it is unset.
+	add_test(NAME gpu_capture_replay_loop
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-loop-only)
+	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); where it is unset, generated synthetic
+	# captures (a replayable one and one with an unmappable range) take the same file path.
 	add_test(NAME gpu_capture_replay_local
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-replay-dir-only)
 	set_tests_properties(gpu_capture_replay_local PROPERTIES SKIP_REGULAR_EXPRESSION "GpuReplayDir skipped")

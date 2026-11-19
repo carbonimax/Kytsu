@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -517,6 +518,8 @@ void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind);
 // the wrong program points: LDS reads see stale data and spin loops never end. Such barriers are
 // only emitted where the workgroup is a single wave, which no other wave can wait for.
 bool WorkgroupIsSingleWave(const EmitterState& state);
+// The IR block being emitted lies on a cycle of the guest control flow.
+bool EmittingInGuestLoop(const EmitterState& state);
 
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                     bool max_value);
@@ -559,7 +562,7 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
 
-uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
+uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src);
 
 inline constexpr auto EmitFNegateValue = EmitNative<spv::OpFNegate, IR::Type::F32, uint32_t>;
 

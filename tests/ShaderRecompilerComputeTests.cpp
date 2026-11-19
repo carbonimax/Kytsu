@@ -1558,6 +1558,8 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  // An OpAtomicLoad through a PhysicalStorageBuffer pointer, Device scope, relaxed.
+  bool requires_device_bda_atomic_load = false;
   const ShaderProfile *profile = &Maintenance8Profile;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
@@ -1590,6 +1592,8 @@ struct TestCase {
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
   size_t max_spirv_words = 0;
+  // Words equal to .first may all read back as .second instead (a host-chosen rounding); logged.
+  std::optional<std::pair<u32, u32>> expected_or;
 };
 
 struct GraphicsCase {
@@ -2208,18 +2212,36 @@ size_t SpirvCodeWords(const std::vector<u32> &spirv) {
 
 void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   std::vector<u32> result_types(spirv[3]);
+  std::unordered_map<u32, u32> constants, pointer_classes;
+  const auto constant_is = [&](u32 id, u32 value) {
+    const auto found = constants.find(id);
+    return found != constants.end() && found->second == value;
+  };
+  bool device_bda_atomic_load = false;
   for (size_t offset = 5; offset < spirv.size();) {
     const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
     const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
     bool has_result = false, has_type = false;
     spv::HasResultAndType(opcode, &has_result, &has_type);
     if (has_result && has_type) result_types[words[2]] = words[1];
+    if (opcode == spv::OpConstant && words.size() == 4) constants[words[2]] = words[3];
+    if (opcode == spv::OpTypePointer) pointer_classes[words[1]] = words[2];
+    if (opcode == spv::OpAtomicLoad &&
+        pointer_classes[result_types[words[3]]] == spv::StorageClassPhysicalStorageBuffer &&
+        constant_is(words[4], spv::ScopeDevice) &&
+        constant_is(words[5], spv::MemorySemanticsMaskNone)) {
+      device_bda_atomic_load = true;
+    }
     if (opcode == spv::OpBitcast) {
       Require(test.name, "bitcast changes representation",
               words[1] != result_types[words[3]],
               "emitted a redundant bitcast between identical SPIR-V types");
     }
     offset += words.size();
+  }
+  if (test.requires_device_bda_atomic_load && !device_bda_atomic_load) {
+    Fail(test.name, "SPIR-V emission",
+         "no Device-scope relaxed OpAtomicLoad through a PhysicalStorageBuffer pointer");
   }
   if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
     return;
@@ -2486,6 +2508,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_system_input_base = 2;
   pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
+  // As the renderer sets it from the AA config: single-sample centroid reuses center barycentrics.
+  pixel_info.ps_single_sample = test.samples == vk::SampleCountFlagBits::e1;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   pixel_info.object_primitive_id = !test.object_ids.empty();
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
@@ -15989,9 +16013,31 @@ public:
     std::vector<GpuCapture::Thumb> *thumbs = nullptr; // ... and its color target thumbnails
   };
 
+  // ReplayGpuCapture result when a captured range cannot be mapped at its recorded address on this
+  // host (the replay did not run: neither a match nor a mismatch). Details in m_replay_unmappable.
+  static constexpr uint32_t kReplayUnmappable = UINT32_MAX;
+  struct ReplayUnmappable {
+    uint64_t address = 0;
+    uint64_t size = 0;
+    int allocate = 0;
+    int map = 0;
+  };
+  ReplayUnmappable m_replay_unmappable;
+  // Replays of each capture in one context (--gpu-replay-loop N, R5G-7); 1 = a single replay.
+  uint32_t m_replay_loops = 1;
+  // Owned by no host: between the guest user range (HOST_USER_MAX) and extended memory, on every platform.
+  static constexpr uint64_t kUnmappableAddress = 0x000000fe00000000ull;
+  // The synthetic capture with one more range at kUnmappableAddress.
+  static GpuCapture::Capture WithUnmappableRange(GpuCapture::Capture capture) {
+    capture.records.insert(capture.records.begin(),
+                           GpuCapture::Memory{kUnmappableAddress, std::vector<uint8_t>(0x1000, 0xab)});
+    return capture;
+  }
+
   // Replays a GPU capture without the guest CPU or HLE: maps its memory back at the same
   // addresses, registers its shaders, submits its command lists and hashes the expected ranges.
-  // Returns the number of mismatching ranges.
+  // Returns the number of mismatching ranges, or kReplayUnmappable (nothing replayed) when a range
+  // cannot be mapped at its recorded address.
   // `nondet`: Expects two replays of this capture disagreed on (address -> true when only the order
   // of their dwords differed), from <capture>.nondet.txt. Such an Expect is not counted as a
   // mismatch when it differs the same way ("order": the game's dword multiset still matches).
@@ -16037,13 +16083,28 @@ public:
     for (const auto &[begin, end] : merged) {
       int64_t offset = -1;
       void *mapped = reinterpret_cast<void *>(begin);
-      Require(name, "map memory",
-              Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(),
-                                                 end - begin, block, 0, &offset) == 0 &&
-                  Memory::KernelMapDirectMemory(&mapped, end - begin, 0x3, 0x10, offset,
-                                                block) == 0 &&
-                  mapped == reinterpret_cast<void *>(begin),
-              "fixed mapping of capture memory failed");
+      const int allocate = Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(),
+                                                              end - begin, block, 0, &offset);
+      const int map = allocate == 0 ? Memory::KernelMapDirectMemory(&mapped, end - begin, 0x3, 0x10,
+                                                                    offset, block)
+                                    : allocate;
+      if (allocate != 0 || map != 0 || mapped != reinterpret_cast<void *>(begin)) {
+        // The host does not own this address (macOS x86_64 under Rosetta reserves
+        // [0xFC0000000, 0x7000000000) for the system, which a PC capture can use): the replay cannot
+        // run here. Give back what was mapped so far and let the caller report it as inconclusive.
+        if (allocate == 0 && map != 0) {
+          Memory::KernelReleaseDirectMemory(offset, end - begin);
+        }
+        for (size_t i = 0; i < direct_offsets.size(); i++) {
+          const auto size = merged[i].second - merged[i].first;
+          Require(name, "unmap memory",
+                  Memory::KernelMunmap(merged[i].first, size) == 0 &&
+                      Memory::KernelReleaseDirectMemory(direct_offsets[i], size) == 0,
+                  "capture memory release failed");
+        }
+        m_replay_unmappable = {begin, end - begin, allocate, map};
+        return kReplayUnmappable;
+      }
       std::memset(mapped, 0, end - begin);
       direct_offsets.push_back(offset);
     }
@@ -16051,6 +16112,14 @@ public:
       if (const auto *memory = std::get_if<GpuCapture::Memory>(&record)) {
         std::memcpy(reinterpret_cast<void *>(memory->address), memory->bytes.data(),
                     memory->bytes.size());
+      }
+    }
+    // --gpu-replay-loop: the blocks as the frame starts, restored page by page between replays.
+    std::vector<std::vector<uint8_t>> start_blocks;
+    if (m_replay_loops > 1) {
+      for (const auto &[begin, end] : merged) {
+        const auto *bytes = reinterpret_cast<const uint8_t *>(begin);
+        start_blocks.emplace_back(bytes, bytes + (end - begin));
       }
     }
     // Diagnostics: each Expect's bytes before the frame, to tell a range one side left unchanged.
@@ -16143,63 +16212,74 @@ public:
     // 1 s with every queue blocked, the Updates are written anyway.
     // shortcut: no WaitValue breaker yet, so a blocked queue may then read them too early.
     constexpr uint32_t idle_timeout_ms = 1000;
-    // The command processor state each queue had when the recording started (compute queues across
-    // frames, every queue for a scope starting after submission 0). KYTY_REPLAY_NO_CP_STATE=1
-    // (diagnostics) replays from reset processors, as before the record existed.
-    static const bool no_cp_state = std::getenv("KYTY_REPLAY_NO_CP_STATE") != nullptr;
-    uint32_t cp_states = 0;
-    for (const auto &record : capture.records) {
-      if (const auto *state = std::get_if<GpuCapture::CpState>(&record); state != nullptr && !no_cp_state) {
-        Require(name, "cp state", gpu.RestoreCpState(state->queue, state->bytes),
-                fmt::format("the CP state of queue 0x{:x} has another layout (capture from another build)", state->queue));
-        cp_states++;
-      }
-    }
-    if (cp_states != 0) std::printf("[gpu]     %s %u queue states restored\n", name, cp_states);
-    uint32_t busy = 0;
-    size_t submit_index = 0;
-    for (const auto &record : capture.records) {
-      if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
-        const auto &pending = updates[submit_index++];
-        if (!pending.empty() && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
-        for (const auto *update : pending) {
-          std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
-                      update->bytes.size());
-        }
-        const std::span commands{reinterpret_cast<const uint32_t *>(submit->address),
-                                 submit->dword_count};
-        if (submit->queue == 0) {
-          gpu.Submit(commands);
-        } else {
-          gpu.SubmitCompute(submit->queue, commands);
-        }
-        // KYTY_REPLAY_SERIAL=1 (diagnostics): no queue overlap, each submission runs alone in capture order.
-        static const bool serial = std::getenv("KYTY_REPLAY_SERIAL") != nullptr;
-        if (serial && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
-      } else if (std::holds_alternative<GpuCapture::FrameEnd>(record)) {
-        gpu.SuspendPoint();
-      }
-    }
-    const bool blocked_at_end = !gpu.WaitForIdle(10 * idle_timeout_ms, in_flight);
-    busy += blocked_at_end ? 1 : 0;
-    if (busy != 0) std::printf("[gpu]     %s %u updates or the end while a queue still waits\n", name, busy);
-    const auto queued = gpu.DescribeQueued();
-    if (!queued.empty()) std::printf("[gpu]     %s queued at the end:\n%s", name, queued.c_str());
-    if (!blocked_at_end && !in_flight.empty()) {
-      std::printf("[gpu]     %s in flight at the frame end: %zu captured, %u left blocked and dropped\n", name,
-                  in_flight.size(), gpu.DropQueued());
-    }
     auto &scheduler = context.GetCommandScheduler();
-    gpu.SendCommandSync([&] {
-      scheduler.Finish();
-      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
-    });
-    // Outputs are published as the capture published them.
     std::vector<GpuCapture::Unpublished> unpublished;
-    gpu.SendCommandSync([&] {
-      context.GetTextureCache().DownloadGpuModified(&unpublished);
-      context.GetBufferCache().ReadGpuModified();
-    });
+    // Time of the last run_frame(), from the CP state restore to the scheduler finish (the publish is not in it).
+    double frame_ms = 0;
+    // One replay of the frame from the captured CP state, then the publish; true when a queue is still
+    // blocked at the end.
+    const auto run_frame = [&] {
+      const auto frame_start = std::chrono::steady_clock::now();
+      // The command processor state each queue had when the recording started (compute queues across
+      // frames, every queue for a scope starting after submission 0). KYTY_REPLAY_NO_CP_STATE=1
+      // (diagnostics) replays from reset processors, as before the record existed.
+      static const bool no_cp_state = std::getenv("KYTY_REPLAY_NO_CP_STATE") != nullptr;
+      uint32_t cp_states = 0;
+      for (const auto &record : capture.records) {
+        if (const auto *state = std::get_if<GpuCapture::CpState>(&record); state != nullptr && !no_cp_state) {
+          Require(name, "cp state", gpu.RestoreCpState(state->queue, state->bytes),
+                  fmt::format("the CP state of queue 0x{:x} has another layout (capture from another build)", state->queue));
+          cp_states++;
+        }
+      }
+      if (cp_states != 0) std::printf("[gpu]     %s %u queue states restored\n", name, cp_states);
+      uint32_t busy = 0;
+      size_t submit_index = 0;
+      for (const auto &record : capture.records) {
+        if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
+          const auto &pending = updates[submit_index++];
+          if (!pending.empty() && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
+          for (const auto *update : pending) {
+            std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
+                        update->bytes.size());
+          }
+          const std::span commands{reinterpret_cast<const uint32_t *>(submit->address),
+                                   submit->dword_count};
+          if (submit->queue == 0) {
+            gpu.Submit(commands);
+          } else {
+            gpu.SubmitCompute(submit->queue, commands);
+          }
+          // KYTY_REPLAY_SERIAL=1 (diagnostics): no queue overlap, each submission runs alone in capture order.
+          static const bool serial = std::getenv("KYTY_REPLAY_SERIAL") != nullptr;
+          if (serial && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
+        } else if (std::holds_alternative<GpuCapture::FrameEnd>(record)) {
+          gpu.SuspendPoint();
+        }
+      }
+      const bool blocked = !gpu.WaitForIdle(10 * idle_timeout_ms, in_flight);
+      busy += blocked ? 1 : 0;
+      if (busy != 0) std::printf("[gpu]     %s %u updates or the end while a queue still waits\n", name, busy);
+      const auto queued = gpu.DescribeQueued();
+      if (!queued.empty()) std::printf("[gpu]     %s queued at the end:\n%s", name, queued.c_str());
+      if (!blocked && !in_flight.empty()) {
+        std::printf("[gpu]     %s in flight at the frame end: %zu captured, %u left blocked and dropped\n", name,
+                    in_flight.size(), gpu.DropQueued());
+      }
+      gpu.SendCommandSync([&] {
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      });
+      frame_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frame_start).count();
+      // Outputs are published as the capture published them.
+      unpublished.clear();
+      gpu.SendCommandSync([&] {
+        context.GetTextureCache().DownloadGpuModified(&unpublished);
+        context.GetBufferCache().ReadGpuModified();
+      });
+      return blocked;
+    };
+    const bool blocked_at_end = run_frame();
     const auto platform = CurrentPlatform();
     const GpuCapture::Platform *own = nullptr;
     bool other_platforms = false;
@@ -16222,6 +16302,7 @@ public:
                   own != nullptr ? "own hashes" : by_thumbnail ? "no hashes of its own, color Expects by thumbnail" : "capture hashes",
                   thumbs.size());
     }
+    std::vector<uint64_t> first_hashes;
     uint32_t mismatches = 0, accepted = 0;
     size_t expect_index = 0;
     for (size_t record_index = 0; record_index < capture.records.size(); record_index++) {
@@ -16236,6 +16317,7 @@ public:
         std::vector<uint8_t> bytes(expect->size);
         const bool read = Memory::TryReadBacking(expect->address, bytes.data(), bytes.size());
         const auto hash = read ? XXH3_64bits(bytes.data(), bytes.size()) : 0;
+        first_hashes.push_back(hash);
         auto expected = expect->hash;
         if (own != nullptr) {
           const auto it = std::ranges::find_if(own->hashes, [&](const GpuCapture::Expect &e) {
@@ -16302,11 +16384,69 @@ public:
       }
     }
     if (accepted != 0) std::printf("[gpu]     %s %u known nondeterministic Expects accepted\n", name, accepted);
+    if (m_replay_loops > 1) std::printf("[gpu]     %s loop 0 ms=%.3f (first replay: cold pipelines)\n", name, frame_ms);
     if (blocked_at_end) {
       // The blocked queue keeps polling guest memory, so it cannot be unmapped: leave the process.
       std::printf("[gpu]     %s mismatches=%u, a queue is still blocked: exit without unmapping\n", name, mismatches);
       std::fflush(stdout);
       std::_Exit(2);
+    }
+    // --gpu-replay-loop N (R5G-7): N - 1 more replays of the frame in this context (warm pipelines and
+    // caches), each from the captured memory again, as a screen for GPU-side changes; never a final gate
+    // (no front, no guest). Every replay must give the first one's hashes, else the loop is not faithful.
+    // shortcut: wall time only (back and GPU overlap), no GPU timestamps; add them if the screen needs the split.
+    if (m_replay_loops > 1) {
+      std::vector<double> warm;
+      for (uint32_t iteration = 1; iteration < m_replay_loops; iteration++) {
+        // Only pages that differ from the frame start are written: a CPU write fault refreshes the whole image
+        // it falls in, so rewriting every page would re-upload every texture in each timed replay.
+        // Pages are read from the backing, as the Expects are, so a protected page does not fault here.
+        uint64_t restored = 0;
+        std::array<uint8_t, 0x1000> current{};
+        for (size_t b = 0; b < merged.size(); b++) {
+          auto *guest = reinterpret_cast<uint8_t *>(merged[b].first);
+          const auto &start = start_blocks[b];
+          for (size_t page = 0; page < start.size(); page += 0x1000) {
+            const auto bytes = std::min<size_t>(0x1000, start.size() - page);
+            if (!Memory::TryReadBacking(merged[b].first + page, current.data(), bytes) ||
+                std::memcmp(current.data(), start.data() + page, bytes) != 0) {
+              std::memcpy(guest + page, start.data() + page, bytes);
+              restored++;
+            }
+          }
+        }
+        std::printf("[gpu]     %s loop %u: %" PRIu64 " pages restored\n", name, iteration, restored);
+        if (run_frame()) {
+          std::printf("[gpu]     %s loop %u INVALID: a queue is still blocked at the end\n", name, iteration);
+          std::fflush(stdout);
+          std::_Exit(2);
+        }
+        uint32_t differ = 0;
+        size_t index = 0;
+        for (const auto &record : capture.records) {
+          const auto *expect = std::get_if<GpuCapture::Expect>(&record);
+          if (expect == nullptr) continue;
+          const auto first = first_hashes[index++];
+          if (nondet.contains(expect->address)) continue;
+          context.GetBufferCache().ReadMemory(expect->address, expect->size);
+          std::vector<uint8_t> bytes(expect->size);
+          const bool read = Memory::TryReadBacking(expect->address, bytes.data(), bytes.size());
+          differ += (read ? XXH3_64bits(bytes.data(), bytes.size()) : 0) == first ? 0 : 1;
+        }
+        std::printf("[gpu]     %s loop %u ms=%.3f%s\n", name, iteration, frame_ms, differ == 0 ? "" : " INVALID");
+        Require(name, "loop", differ == 0,
+                fmt::format("replay {} gave other hashes than the first one on {} Expects: the loop does not "
+                            "restore the frame", iteration, differ));
+        warm.push_back(frame_ms);
+      }
+      const auto n = static_cast<double>(warm.size());
+      double mean = 0, sd = 0;
+      for (const auto ms : warm) mean += ms / n;
+      for (const auto ms : warm) sd += (ms - mean) * (ms - mean);
+      sd = warm.size() > 1 ? std::sqrt(sd / (n - 1)) : 0;
+      std::ranges::sort(warm);
+      std::printf("[gpu]     %s loop warm n=%zu mean=%.3f sd=%.3f (%.2f %%) min=%.3f median=%.3f\n", name,
+                  warm.size(), mean, sd, mean > 0 ? 100 * sd / mean : 0, warm.front(), warm[warm.size() / 2]);
     }
     gpu.SendCommandSync([&] {
       // Cache buffers are rounded and grown past the captured blocks (unmapped here, mapped in the
@@ -16329,7 +16469,8 @@ public:
 
   // A synthetic capture (no game content): graphics and compute command lists with an indirect
   // buffer, CP writes, a DMA copy, an end-of-pipe label and a compute dispatch set up by PM4.
-  void CheckGpuCaptureReplay() {
+  // `synthetic`: receives the synthetic capture instead of running the checks (gpu_capture_replay_local).
+  void CheckGpuCaptureReplay(GpuCapture::Capture *synthetic = nullptr) {
     constexpr const char *name = "GpuCaptureReplay";
     constexpr uint64_t base = 0x0000000206000000ull;
     constexpr uint64_t dcb = base, ib = base + 0x1000, acb = base + 0x2000;
@@ -16426,6 +16567,10 @@ public:
     const std::vector<uint8_t> zeros(0x1000);
     records.emplace_back(GpuCapture::Expect{zero_page, zeros.size(), XXH3_64bits(zeros.data(), zeros.size())});
     records.emplace_back(GpuCapture::Expect{output, sizeof(stored), XXH3_64bits(&stored, sizeof(stored))});
+    if (synthetic != nullptr) {
+      *synthetic = std::move(capture);
+      return;
+    }
 
     // The file format round-trips and rejects damaged or unknown files.
     const auto file = GpuCapture::Serialize(capture);
@@ -16442,6 +16587,11 @@ public:
     Require(name, "version", !GpuCapture::Parse(future, &error), "an unknown version was accepted");
 
     Require(name, "replay", ReplayGpuCapture(name, *parsed) == 0, "replayed output differs");
+    // A range this host cannot map is inconclusive (nothing replayed, the range reported), not a mismatch.
+    Require(name, "unmappable",
+            ReplayGpuCapture(name, WithUnmappableRange(*parsed)) == kReplayUnmappable &&
+                m_replay_unmappable.address == kUnmappableAddress && m_replay_unmappable.map != 0,
+            "an unmappable capture range was not reported as inconclusive");
     // A wrong expectation must be reported, so the comparison above is live.
     auto wrong = *parsed;
     std::get<GpuCapture::Expect>(wrong.records.back()).hash ^= 1u;
@@ -16769,6 +16919,9 @@ public:
   // --gpu-replay-record <file> (`record`): the same, then, when it passes (or KYTY_REPLAY_RECORD_FORCE=1),
   // stores this platform's hashes in <capture>.platform.kygpucap, with the color thumbnails when the
   // sidecar has none yet and this replay matched the game's own hashes on every Expect.
+  // Exit status of ReplayGpuCaptureFile when a range cannot be mapped (nothing replayed): neither 0
+  // (all Expects match) nor 1 (they differ). A recording is never made from such a replay.
+  static constexpr int kReplayFileInconclusive = 2;
   int ReplayGpuCaptureFile(const char *path, bool record = false) {
     const auto start = std::chrono::steady_clock::now();
     const auto read_file = [](const std::string &file_path) {
@@ -16819,6 +16972,15 @@ public:
       sidecar.thumbs = &thumbs;
     }
     const auto mismatches = ReplayGpuCapture("GpuReplay", *capture, nondet, sidecar);
+    if (mismatches == kReplayUnmappable) {
+      std::printf("[gpu]     GpuReplay %s NON_CONCLUSIVE: capture memory [0x%" PRIx64 ", +0x%" PRIx64
+                  ") cannot be mapped at its recorded address on this host (allocate=0x%x map=0x%x); "
+                  "nothing was replayed\n",
+                  path, m_replay_unmappable.address, m_replay_unmappable.size,
+                  static_cast<unsigned>(m_replay_unmappable.allocate),
+                  static_cast<unsigned>(m_replay_unmappable.map));
+      return kReplayFileInconclusive;
+    }
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     std::printf("[gpu]     GpuReplay %s records=%zu memory=%" PRIu64 " submits=%" PRIu64
                 " expects=%" PRIu64 " mismatches=%u ms=%.0f\n",
@@ -22827,12 +22989,18 @@ public:
         }
       }
       depth.depth_test_enable = false;
+      // Without the dynamic loop state `filled` bakes the feedback loop of the writing draws, and
+      // these read-only draws select the pipeline without it: compare against that one.
+      const auto bounds_reference = pipeline(true, 2, 2).pipeline;
+      Require(name, "read-only pipeline",
+              (bounds_reference == filled.pipeline) == m_feedback_loop_dynamic,
+              "the baked feedback loop did not follow the depth writes");
       for (uint32_t pass = 0; pass < 3; pass++) {
         depth.depth_bounds_test_enable = pass != 2;
         registers.SetDepthBoundsMin(pass == 0 ? 0.5f : 0.625f);
         registers.SetDepthBoundsMax(pass == 0 ? 0.5625f : 0.6875f);
         Require(name, "dynamic depth bounds pipeline reuse",
-                pipeline(true, 2, 2).pipeline == filled.pipeline,
+                pipeline(true, 2, 2).pipeline == bounds_reference,
                 "changing depth bounds or their enable state created another pipeline");
         draw(filled);
         const auto bounded_pixels = read_color();
@@ -23844,6 +24012,19 @@ public:
         };
         check("indexed embedded fetch", fetch_vs, true, 0);
         check("auto embedded fetch", fetch_vs, false, 4);
+        // Programs are selected again on an already filled state (aliased color targets, single-sample
+        // retry): the embedded fetch inputs are rebuilt, not appended (the vertex input info reset).
+        {
+          DrawRenderState reused{};
+          context.GetPipelineCache().GetGraphicsPrograms(scheduler.Current(), reused);
+          const auto first_resources = reused.vertex_info[0].resources_num;
+          const auto *first_module = reused.vertex_info[0].stage.module;
+          context.GetPipelineCache().GetGraphicsPrograms(scheduler.Current(), reused);
+          Require("GpuIndirectDraw", "programs selected twice",
+                  first_resources >= 1 && reused.vertex_info[0].resources_num == first_resources &&
+                      first_module != nullptr && reused.vertex_info[0].stage.module == first_module,
+                  "a second program selection on the same state appended the vertex inputs again");
+        }
         check("indexed native fetch", vertex_address, true, 2);
         check("auto native fetch", vertex_address, false, 6);
       }
@@ -27448,6 +27629,17 @@ private:
 void CompareWords(const TestCase &test, const char *stage,
                   const std::vector<u32> &expected,
                   const std::vector<u32> &actual) {
+  if (test.expected_or) {
+    // One rounding for every such word: a host either gives .first everywhere or .second everywhere.
+    const auto [word, other] = *test.expected_or;
+    for (const u32 host : {word, other}) {
+      if (std::equal(expected.begin(), expected.end(), actual.begin(), actual.end(),
+                     [&](u32 e, u32 a) { return a == (e == word ? host : e); })) {
+        std::printf("[compute] %s: host stores %#010x where RDNA 2 stores %#010x\n", test.name, host, word);
+        return;
+      }
+    }
+  }
   if (actual == expected) {
     return;
   }
@@ -32597,13 +32789,16 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
+  // Runtime inputs: constant ones fold the V_MIN_U32 away before SPIR-V emission.
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 7);
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 12, 30);
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 0);
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 64);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 12, 30);
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 1);
@@ -32612,9 +32807,10 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   TestCase test;
   test.name = "Vop2SdwaMinU32PreservesWordDestination";
   test.code = code;
+  test.initial = {7u, 64u};
   test.expected = {0xa1b20007u, 0xa1b2001fu};
-  test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {" UMin ", "OpSelect"};
   return test;
 }
@@ -33184,7 +33380,9 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
                   O::S_ENDPGM};
   test.decoded_counts = {
       {"V_ADDC_U32 v2, vcc_lo, 0, v26.sdwa(sel=4,sext=1), vcc_lo", 1}};
-  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 3}};
+  // No ULessThan32 count: whether 0 + x folds differs by host (2 compares on Windows, 3 on macOS);
+  // the stored carry results check the behaviour.
+  test.ir_counts = {{" = BitFieldSExtract ", 1}};
   test.required_spirv = {"OpBitFieldSExtract"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -34305,7 +34503,7 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
-  test.required_spirv = {" Fract ", " Cos "};
+  test.required_spirv = {" RoundEven ", " Sin "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -34351,7 +34549,7 @@ TestCase VectorSinF16SdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
-  test.required_spirv = {" Fract ", " Sin "};
+  test.required_spirv = {" RoundEven ", " Sin "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -38966,7 +39164,10 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
                   upper_nonzero ? O::S_CBRANCH_EXECNZ : O::S_CBRANCH_EXECZ,
                   O::V_READLANE_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpGroupNonUniformAny"};
+  // A whole subgroup votes (OpGroupNonUniformAny %bool) unless wave32 is packed into a 64-lane
+  // host subgroup, where each half votes on its own ballot (OpAny %bool). Wave64 is never packed.
+  test.required_spirv = {wave_size == 64 ? "OpGroupNonUniformAny %bool" : "Any %bool"};
+  if (wave_size == 64) test.forbidden_spirv = {"OpAny"};
   test.compute_info.wave_size = wave_size;
   test.compute_info.threads_num[0] = threads;
   test.compute_info.thread_ids_num = 1;
@@ -40955,6 +41156,22 @@ TestCase BufferStoreFormatXZeroFillsPackedRecord() {
   return test;
 }
 
+// KYTY_F16_STORE_RTZ=1: formatted f16 stores round toward zero like native stores on RDNA2 and
+// RDNA4 (upstream KytyPS5 #1588); unset, the host PackHalf2x16 decides (AMD truncates too).
+bool F16StoreRoundTowardZero() {
+  const char *value = std::getenv("KYTY_F16_STORE_RTZ");
+  return value != nullptr && value[0] == '1';
+}
+
+// 0x3f807e63 is 3.95 f16 ulps above 1.0. The hardware stores it toward zero as 0x3c03 (#1588). With
+// KYTY_F16_STORE_RTZ=1 the emulator must too; unset, the host PackHalf2x16 may also round to nearest
+// (0x3c04, MSL half conversions do), so either word passes and the log says which one the host gave.
+u32 Float16StoreOneWord() { return 0xc0003c03u; }
+std::optional<std::pair<u32, u32>> Float16StoreHostWord() {
+  if (F16StoreRoundTowardZero()) return std::nullopt;
+  return std::pair{Float16StoreOneWord(), 0xc0003c04u};
+}
+
 TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   using O = ShaderOpcode;
 
@@ -40978,12 +41195,56 @@ TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   test.name = "BufferStoreFormatXyzwFloat16ConvertsComponents";
   test.code = std::move(code);
   test.initial = std::vector<u32>(4, 0xdeadbeefu);
-  test.expected = {0xc0003c04u, 0x34003800u, 0x4200c400u, 0x40000000u};
+  test.expected = {Float16StoreOneWord(), 0x34003800u, 0x4200c400u, 0x40000000u};
+  test.expected_or = Float16StoreHostWord();
   test.user_data = MakeStructuredStorageBufferData(
       8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
-  test.required_spirv = {"PackHalf2x16"};
+  (F16StoreRoundTowardZero() ? test.forbidden_spirv : test.required_spirv) = {"PackHalf2x16"};
+  return test;
+}
+
+// Upstream KytyPS5 #1588: inputs and results of native 16-bit float stores on RDNA2 and RDNA4:
+// round toward zero, finite values clamp to the largest finite one, NaN keeps its payload (at
+// least 1). Only KYTY_F16_STORE_RTZ=1 encodes this; the host pack differs on NaNs at least.
+TestCase BufferStoreFormatXyzwFloat16RoundsTowardZero() {
+  using O = ShaderOpcode;
+  constexpr u32 inputs[32] = {
+      0x00000000u, 0x80000000u, 0x3f800000u, 0xbf800000u,
+      0x3f807e63u, 0x3f801001u, 0x3f803000u, 0x3f801000u,
+      0xbf807e63u, 0xbf803000u, 0x477fe000u, 0x477ff000u,
+      0x47800000u, 0x7f7fffffu, 0xc77ff000u, 0x7f800000u,
+      0xff800000u, 0x7fc00000u, 0x7fc12000u, 0x7f8dc000u,
+      0x7f800100u, 0xff800001u, 0x387fe000u, 0x38800000u,
+      0x33800000u, 0x33c00000u, 0x337fffffu, 0x00000001u,
+      0x80000001u, 0xb3800000u, 0x40490fd0u, 0x3dcccccdu};
+  constexpr u32 expected[16] = {
+      0x80000000u, 0xbc003c00u, 0x3c003c03u, 0x3c003c01u,
+      0xbc01bc03u, 0x7bff7bffu, 0x7bff7bffu, 0x7c00fbffu,
+      0x7e00fc00u, 0x7c6e7e09u, 0xfc017c01u, 0x040003ffu,
+      0x00010001u, 0x00000000u, 0x80018000u, 0x2e664248u};
+  std::vector<u32> code;
+  for (u32 record = 0; record < std::size(inputs) / 4; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component, inputs[record * 4 + component]);
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwFloat16RoundsTowardZero";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(std::size(expected), 0xdeadbeefu);
+  test.expected.assign(std::begin(expected), std::end(expected));
+  test.user_data = MakeStructuredStorageBufferData(
+      8, std::size(inputs) / 4, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  test.forbidden_spirv = {"PackHalf2x16"};
   return test;
 }
 
@@ -44774,12 +45035,16 @@ TestCase Wave64AppendIndexFromExecRank() {
 }
 
 TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
-                                  bool store_completion = false) {
+                                  bool store_completion = false, bool flat = false,
+                                  bool body_poll = false) {
   using O = ShaderOpcode;
   constexpr u32 groups = 31;
   TestCase test;
-  test.name = store_completion ? (wave_size == 64 ? "Wave64StoreCompletionPublication"
+  test.name = flat ? (wave_size == 64 ? "FlatWorkgroupPublicationWave64"
+                                      : "FlatWorkgroupPublicationWave32")
+             : store_completion ? (wave_size == 64 ? "Wave64StoreCompletionPublication"
                                                  : "Wave32StoreCompletionPublication")
+             : body_poll ? "BufferWorkgroupPublicationBodyPoll"
              : dlc_only ? "BufferWorkgroupPublicationDlc"
              : wave_size == 64 ? "BufferWorkgroupPublicationWave64"
                                : "BufferWorkgroupPublicationWave32";
@@ -44793,6 +45058,7 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
   code.push_back(EncodeVop1(0x02, 20, Vgpr(1)));
   code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 1));
   AppendVMovU32(&code, 2, 0);
+  if (flat) AppendVMovU32(&code, 21, 31); // v[20:21] = 0x1f00000000 + ticket * 4.
   code.push_back(EncodeSMovB32(21, InlineU32(0)));
   AppendSMovLiteral(&code, 22, 1000000);
   if (store_completion) AppendSMovLiteral(&code, 26, groups * 4);
@@ -44806,9 +45072,25 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
     AppendVMovU32(&code, 3, 0);
     AppendBufferStoreOpcode(&code, 0x32, 3, 4, true);
   }
-  code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
-  code.push_back(EncodeMubuf1(2, 12, 20));
-  code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
+  const auto append_poll_load = [&] {
+    if (flat) {
+      // FLAT_LOAD_DWORD v2, v[20:21] DLC, the loop form of FlatLoadDlcCaptured. DLC is the
+      // only coherent FLAT modifier the decoder takes (FLAT GLC is unsupported).
+      code.insert(code.end(), {EncodeFlat0(0x0c, 0) | (1u << 12u), EncodeFlat1(2, 0x7d, 0, 20)});
+    } else {
+      code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
+      code.push_back(EncodeMubuf1(2, 12, 20));
+    }
+    code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
+  };
+  if (body_poll) {
+    // s21 < s22 always holds here, so the S_ADD is never run, but it is live: the poll lands in a
+    // loop body block after a join, not in the loop header.
+    code.push_back(EncodeSopc(0x0a, 21, 22));
+    code.push_back(EncodeSopp(0x05, 1)); // S_CBRANCH_SCC1 over the next instruction.
+    code.push_back(EncodeSop2(0x00, 21, 21, InlineU32(1)));
+  }
+  append_poll_load();
   code.push_back(EncodeVop1(0x02, 23, Vgpr(store_completion ? 3 : 2)));
   code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
   const auto ready = code.size();
@@ -44818,9 +45100,18 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
   code.push_back(EncodeSopp(0x05, static_cast<u32>(poll - code.size() - 1)));
   // A broken poll reports an incorrect result instead of hanging the test GPU.
   AppendVMovLiteral(&code, 2, 0x80000000u);
+  auto reload = code.size();
+  if (!store_completion) {
+    // The same coherent load once more after the loop: off any guest cycle, it stays Volatile.
+    const auto skip = code.size();
+    code.push_back(0);
+    reload = code.size();
+    append_poll_load();
+    code[skip] = EncodeSopp(0x02, code.size() - skip - 1);
+  }
   const auto publish = code.size();
   code[first_ticket] = EncodeSopp(0x05, publish - first_ticket - 1);
-  code[ready] = EncodeSopp(0x05, publish - ready - 1);
+  code[ready] = EncodeSopp(0x05, reload - ready - 1);
   code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));
   code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));
   code.push_back(EncodeVop2(0x25, 20, InlineU32(4), 20));
@@ -44857,11 +45148,22 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                   O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
                   O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  // The poll is in a guest loop, so its GLC load is atomic: AMD hoists a Volatile one.
+  test.required_spirv = {"Coherent", "OpAtomicLoad", "OpAtomicIAdd", "OpLoopMerge"};
   if (store_completion) {
     test.opcodes.push_back(O::S_WAITCNT_VSCNT);
     test.opcodes.push_back(O::S_LSHL_B64);
     test.required_spirv.push_back("OpControlBarrier %uint_3 %uint_1 %uint_2116");
+  }
+  if (!store_completion) {
+    test.opcodes.push_back(O::S_BRANCH);
+    test.required_spirv.push_back(flat ? "Volatile|Aligned 4" : "Volatile");
+  }
+  if (flat) {
+    test.opcodes.push_back(O::FLAT_LOAD_DWORD);
+    test.decoded_counts = {{"dlc=1", 2}};
+    test.requires_device_bda_atomic_load = true;
+    test.bda_mappings = {{0x1f00000000ull, 0}};
   }
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
@@ -47279,6 +47581,9 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto materialize = [&] {
+    // Count one walk: KYTY_SRT_WALK_REUSE would first re-read the count to validate the last walk
+    // (srt_walk_reuse covers that path).
+    plan.srt_memo_loads = UINT32_MAX;
     FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<u32> words) {
       auto &memory = *static_cast<CountMemory *>(data);
       ++memory.reads;
@@ -47879,7 +48184,8 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     test.decoded_counts = {{direct_gt ? "V_CMPX_GT_U32" : "V_CMP_LE_U32", 1u}};
     if (outer_loop) test.decoded_counts.insert(test.decoded_counts.end(),
         {{"V_CMPX_EQ_U32", 2u}, {"S_CBRANCH_SCC1", 2u}});
-    test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "Volatile"};
+    // The GLC loads sit in the guest waterfall loop, so they are atomic.
+    test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "OpAtomicLoad"};
     test.forbidden_spirv = {"load_indirect_buffer_", "indirect_buffer_format_geometry"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     for (const auto &descriptor : compiled.resources.buffers) {
@@ -48068,6 +48374,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     AppendEnd(&producer.code);
     const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
     test.expected = test.initial;
+    if (wide) test.expected_or = Float16StoreHostWord();
     auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
     for (u32 group = 0; group < keys.size(); ++group) {
       const auto row = keys[group];
@@ -48078,7 +48385,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
             valid && lane < 20u ? (wide ? 0x3f800000u : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
         if (valid && lane < (wide && row == 3u ? 18u : 20u) && (lane & 1u) == 0u) {
           if (wide) {
-            test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
+            test.expected[slot * (row + 1u) / 4u + lane * 2u] = Float16StoreOneWord();
             test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] = 0x34003800u;
           } else expected_bytes[slot * (row + 1u) + lane] =
               std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
@@ -53255,6 +53562,9 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferWorkgroupPublication(32, true));
   cases.push_back(BufferWorkgroupPublication(32, false, true));
   cases.push_back(BufferWorkgroupPublication(64, false, true));
+  cases.push_back(BufferWorkgroupPublication(32, false, false, true));
+  cases.push_back(BufferWorkgroupPublication(64, false, false, true));
+  cases.push_back(BufferWorkgroupPublication(32, false, false, false, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
@@ -60893,6 +61203,8 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+#include "HardwareTableTests.inc"
+
 } // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
@@ -60932,6 +61244,16 @@ int main(int argc, char **argv) {
 #else
   if (setenv("KYTY_ASYNC_PIPELINE", "0", 1) != 0) return 1;
 #endif
+  // BufferCacheDirtyGarbageCollection checks page-granular fault publication; the default
+  // readback window (read once) publishes whole 256 KiB windows. Same setting as the
+  // buffer_cache_dirty_gc ctest, for the full suite only; an explicit value is kept.
+  if (argc == 1 && std::getenv("KYTY_READBACK_WINDOW_KIB") == nullptr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    if (_putenv_s("KYTY_READBACK_WINDOW_KIB", "0") != 0) return 1;
+#else
+    if (setenv("KYTY_READBACK_WINDOW_KIB", "0", 1) != 0) return 1;
+#endif
+  }
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
@@ -61004,6 +61326,15 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, DsFloatMinMaxClasses(false));
       RunCase(&vulkan, DsFloatMinMaxClasses(true));
     } else return 2;
+    return 0;
+  }
+  // FO-11 hardware-measured tables, one per run (HardwareTableTests.inc).
+  if (argc == 3 && std::strcmp(argv[1], "--hw-table-only") == 0) {
+    const std::string_view name = argv[2];
+    VulkanHarness vulkan;
+    if (name == "rcp") HardwareTables::CheckRcp(vulkan);
+    else if (name == "sincos") HardwareTables::CheckSinCos(vulkan);
+    else return 2;
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-u16-only") == 0) {
@@ -61275,6 +61606,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-float16-store-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
+    if (F16StoreRoundTowardZero()) RunCase(&vulkan, BufferStoreFormatXyzwFloat16RoundsTowardZero());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-ashr-i64-only") == 0) {
@@ -61381,6 +61713,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorSpecialF16Ops());
     RunCase(&vulkan, VectorCosF16CapturedSdwaAndEdges());
     RunCase(&vulkan, VectorSinF16SdwaAndEdges());
+    RunCase(&vulkan, VectorSinCosMaxFiniteSpecialCases());
     RunCase(&vulkan, VectorFloatConversionOps());
     return 0;
   }
@@ -61404,32 +61737,106 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuCaptureReplay();
     return 0;
   }
+  // The synthetic capture replayed 3 times in one context: every replay restores the frame (R5G-7).
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-capture-replay-loop-only") == 0) {
+    VulkanHarness vulkan;
+    GpuCapture::Capture capture;
+    vulkan.CheckGpuCaptureReplay(&capture);
+    vulkan.m_replay_loops = 3;
+    Require("GpuReplayLoop", "replay", vulkan.ReplayGpuCapture("GpuReplayLoop", capture) == 0,
+            "replayed output differs");
+    std::printf("[gpu]     %-32s ok\n", "GpuReplayLoop");
+    return 0;
+  }
+  // --gpu-replay-loop <N> <file>: the capture replayed N times in one context, one time line per replay
+  // and the warm mean and spread (replays 2..N); a screen for GPU-side changes, never a final gate.
+  if (argc == 4 && std::strcmp(argv[1], "--gpu-replay-loop") == 0) {
+    const auto loops = std::strtoul(argv[2], nullptr, 10);
+    if (loops < 2 || loops > 1000) {
+      std::fprintf(stderr, "--gpu-replay-loop: N must be 2..1000\n");
+      return 2;
+    }
+    VulkanHarness vulkan;
+    vulkan.m_replay_loops = static_cast<uint32_t>(loops);
+    return vulkan.ReplayGpuCaptureFile(argv[3]);
+  }
   if (argc == 3 && (std::strcmp(argv[1], "--gpu-replay") == 0 || std::strcmp(argv[1], "--gpu-replay-record") == 0)) {
     VulkanHarness vulkan;
     return vulkan.ReplayGpuCaptureFile(argv[2], std::strcmp(argv[1], "--gpu-replay-record") == 0);
   }
-  // Local game captures (never in the repo): every *.kygpucap of KYTY_GPU_REPLAY_DIR must replay exactly.
+  // Local game captures (never in the repo): every *.kygpucap of KYTY_GPU_REPLAY_DIR must replay exactly;
+  // unset, generated synthetic captures (no game data) take the same path.
   if (argc == 2 && std::strcmp(argv[1], "--gpu-replay-dir-only") == 0) {
     const char *dir = std::getenv("KYTY_GPU_REPLAY_DIR");
     std::vector<std::string> files;
     std::error_code error;
-    if (dir != nullptr) {
-      for (const auto &entry : std::filesystem::directory_iterator(dir, error)) {
-        // Sidecars (<capture>.platform.kygpucap) are read with their capture.
-        if (entry.path().extension() == ".kygpucap" && entry.path().stem().extension() != ".platform") {
-          files.push_back(entry.path().string());
-        }
+    std::optional<VulkanHarness> vulkan;
+    std::filesystem::path generated;
+    if (dir == nullptr) {
+      // No local captures: the synthetic capture of gpu_capture_replay and a copy with a range no host can
+      // map take the file path (parse, sidecars, report); exactly 0 differ and 1 is inconclusive.
+      vulkan.emplace();
+      GpuCapture::Capture capture;
+      vulkan->CheckGpuCaptureReplay(&capture);
+      // One folder per run: ctest runs from other build trees may replay at the same time.
+      generated = std::filesystem::temp_directory_path() /
+                  fmt::format("kyty_gpu_replay_generated_{}",
+                              std::chrono::steady_clock::now().time_since_epoch().count());
+      std::filesystem::remove_all(generated, error);
+      std::filesystem::create_directories(generated, error);
+      const auto write = [&](const char *file, const GpuCapture::Capture &c) {
+        const auto bytes = GpuCapture::Serialize(c);
+        FILE *f = std::fopen((generated / file).string().c_str(), "wb");
+        const bool ok = f != nullptr && std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+        if (f != nullptr) std::fclose(f);
+        return ok;
+      };
+      if (!write("synthetic.kygpucap", capture) ||
+          !write("unmappable.kygpucap", VulkanHarness::WithUnmappableRange(capture))) {
+        std::printf("GpuReplayDir generated: cannot write %s\n", generated.string().c_str());
+        return 1;
       }
     }
+    const auto replay_dir = dir != nullptr ? std::filesystem::path(dir) : generated;
+    for (const auto &entry : std::filesystem::directory_iterator(replay_dir, error)) {
+      // Sidecars (<capture>.platform.kygpucap) are read with their capture.
+      if (entry.path().extension() == ".kygpucap" && entry.path().stem().extension() != ".platform") {
+        files.push_back(entry.path().string());
+      }
+    }
+    if (files.empty() && dir == nullptr) {
+      std::printf("GpuReplayDir generated: no capture found in %s\n", generated.string().c_str());
+      return 1;
+    }
     if (files.empty()) {
-      std::printf("GpuReplayDir skipped: no .kygpucap in KYTY_GPU_REPLAY_DIR (%s)\n", dir != nullptr ? dir : "unset");
+      std::printf("GpuReplayDir skipped: no .kygpucap in KYTY_GPU_REPLAY_DIR (%s)\n", dir);
       return 0;
     }
     std::ranges::sort(files);
-    VulkanHarness vulkan;
+    if (!vulkan) vulkan.emplace();
     int failed = 0;
-    for (const auto &file : files) failed += vulkan.ReplayGpuCaptureFile(file.c_str()) != 0 ? 1 : 0;
-    std::printf("GpuReplayDir %zu captures, %d differ\n", files.size(), failed);
+    size_t inconclusive = 0;
+    for (const auto &file : files) {
+      const int status = vulkan->ReplayGpuCaptureFile(file.c_str());
+      if (status == VulkanHarness::kReplayFileInconclusive) {
+        inconclusive++;
+      } else if (status != 0) {
+        failed++;
+      }
+    }
+    // A capture that cannot be mapped here is inconclusive, not a difference; the others still count.
+    std::printf("GpuReplayDir %zu captures, %d differ, %zu inconclusive on this host\n", files.size(), failed,
+                inconclusive);
+    if (dir == nullptr) {
+      // Never "skipped" here: the generated pair must give exactly this result.
+      const bool expected = files.size() == 2 && failed == 0 && inconclusive == 1;
+      std::filesystem::remove_all(generated, error);
+      std::printf("GpuReplayDir generated captures: %s\n", expected ? "ok" : "unexpected result");
+      return expected ? 0 : 1;
+    }
+    if (failed == 0 && inconclusive == files.size()) {
+      std::printf("GpuReplayDir skipped: no capture could be mapped on this host\n");
+    }
     return failed == 0 ? 0 : 1;
   }
   if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
@@ -61821,6 +62228,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferWorkgroupPublication(32, true));
     RunCase(&vulkan, BufferWorkgroupPublication(32, false, true));
     RunCase(&vulkan, BufferWorkgroupPublication(64, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, false, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(64, false, false, true));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, false, false, false, true));
     RunCase(&vulkan, BufferAtomicVariants());
     return 0;
   }

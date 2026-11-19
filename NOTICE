@@ -1,0 +1,6 @@
+Third-party material in this repository
+
+AnyPS5 (https://github.com/boykopovar/AnyPS5), GPL-2.0-only
+- tests/HardwareTableTests.inc: the RDNA 2 measured result tables of v_rcp_f32 and of v_sin_f32 /
+  v_cos_f32, from core/libs/prx/libSceAgcDriver/tests/execution/RcpHardware.cpp and
+  SinCosReduction.cpp at 342b06eb3a. The test drivers are our own.
