@@ -167,6 +167,19 @@ struct DrawRenderState {
 	}
 };
 
+// KYTY_DRAW_STATE_IN_PLACE (after zinc-builds/KytyPS5 #25, GPL-2.0): how a queued draw's state starts
+// before its program lookup. 0 (default) = value-initialized, as before. 1 = only the parts that the
+// lookup and the target resolution do not rebuild are reset (depth, first color entry, counts, stage
+// handles), and a prepared draw skips its unused local state. 2 = 1 on a state filled with 0xa5 first,
+// with a second lookup on a value-initialized state compared to it ("KYTY_DRAW_STATE_IN_PLACE=2" lines).
+// Mode 1 can switch between frames (KYTY_AB_FLAG=draw_state_in_place).
+[[nodiscard]] int DrawStateInPlaceMode() noexcept;
+void              ResetDrawStateForLookup(DrawRenderState& state, vk::PrimitiveTopology topology, int mode);
+// The first field built by the lookup where `state` and `reference` differ, or nullptr. A draw without a
+// vertex program in both compares only that. `offset`: the first differing byte inside that field.
+[[nodiscard]] const char* DrawStateLookupDiff(const DrawRenderState& state,
+                                              const DrawRenderState& reference, size_t& offset);
+
 struct PipelineCacheFeedback {
 	bool valid = false;
 	bool hit   = false;

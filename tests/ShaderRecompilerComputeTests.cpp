@@ -1527,6 +1527,53 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
+// KYTY_DRAW_STATE_IN_PLACE: a used draw state reset in place matches a value-initialized one on what
+// the lookup reads, and the lookup comparison names a changed field.
+void CheckDrawStateInPlaceReset() {
+  using Libs::Graphics::DrawRenderState;
+  using Libs::Graphics::DrawStateLookupDiff;
+  using Libs::Graphics::ResetDrawStateForLookup;
+  const auto topology = vk::PrimitiveTopology::eTriangleList;
+  static DrawRenderState used, fresh;
+  std::memset(static_cast<void *>(&used), 0x5a, sizeof(used));
+  ResetDrawStateForLookup(used, topology, 1);
+  ResetDrawStateForLookup(fresh, topology, 0);
+  size_t offset = 0;
+  Require("DrawStateInPlace", "reset fields",
+          std::memcmp(&used.depth_info, &fresh.depth_info, sizeof(fresh.depth_info)) == 0 &&
+              std::memcmp(&used.color_info[0], &fresh.color_info[0], sizeof(fresh.color_info[0])) == 0 &&
+              used.color_count == 0 && used.mrt_mask == 0 && used.aliased_passes == 0 &&
+              used.topology == topology && !used.ps_active && !used.primitive_restart_enable &&
+              !used.tess_deferred && used.indirect_count == 0 && used.indirect_offsets == fresh.indirect_offsets &&
+              used.VertexStages().size() == 1 && !used.vertex_info[0].stage && !used.vertex_info[2].stage,
+          "the in-place reset left a field the lookup reads");
+  Require("DrawStateInPlace", "skipped draw", DrawStateLookupDiff(used, fresh, offset) == nullptr,
+          "two draws without a vertex program differ");
+  // What the lookup builds (PrepareProgram, RefreshShaders), on both states.
+  static const int dummy = 0;
+  used.vertex_info[0] = fresh.vertex_info[0] = {};
+  used.ps_input_info = fresh.ps_input_info = {};
+  for (auto *s : {&used, &fresh}) {
+    auto &stage = s->vertex_info[0].stage;
+    stage.program = reinterpret_cast<decltype(stage.program)>(&dummy);
+    stage.resources = reinterpret_cast<decltype(stage.resources)>(&dummy);
+    s->vertex_info[0].pixel_input = &s->ps_input_info;
+  }
+  const char *same = DrawStateLookupDiff(used, fresh, offset);
+  used.mrt_mask = 1;
+  const char *mrt = DrawStateLookupDiff(used, fresh, offset);
+  used.mrt_mask = 0;
+  used.ps_input_info.input_num = 3;
+  const char *pixel = DrawStateLookupDiff(used, fresh, offset);
+  Require("DrawStateInPlace", "lookup comparison",
+          same == nullptr && mrt != nullptr && std::strcmp(mrt, "mrt_mask") == 0 && pixel != nullptr &&
+              std::strcmp(pixel, "ps_input_info") == 0,
+          "the comparison missed a field or flagged equal states");
+  std::printf("[host]    %-32s ok (state %zu B: depth %zu, color %zu x8, vertex %zu x3, pixel %zu)\n",
+              "DrawStateInPlace", sizeof(DrawRenderState), sizeof(fresh.depth_info), sizeof(fresh.color_info[0]),
+              sizeof(fresh.vertex_info[0]), sizeof(fresh.ps_input_info));
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -61394,6 +61441,7 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckDrawStateInPlaceReset();
   if (argc == 2 && std::strcmp(argv[1], "--aliased-mrt-control-only") == 0) {
     VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
     vulkan.CheckAliasedRenderTargets(VulkanHarness::AliasedMrtCase::Control);
