@@ -1590,6 +1590,8 @@ struct TestCase {
   std::optional<uint64_t> fault_free_address;
   // A BDA load from this unbacked address must record its page.
   std::optional<uint64_t> fault_address;
+  // The whole fault word of fault_address, when more than its own page faults.
+  std::optional<u32> expected_fault_word;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -22592,7 +22594,8 @@ public:
     EndSubmitAndFree(test.name, "dispatch", cmd);
     if (fault_address) {
       const u32 expected_fault =
-          test.fault_address
+          test.expected_fault_word ? *test.expected_fault_word
+          : test.fault_address
               ? 1u << (BufferCache::PageIndex(*test.fault_address) & 31u)
               : 0u;
       Require(test.name, "fault check",
@@ -29489,9 +29492,6 @@ TestCase ScalarOrn2SaveexecB32(u32 wave_size, u32 threads) {
   return test;
 }
 
-TestCase ScalarSubvectorLoops(u32 wave_size) {
-  using O = ShaderOpcode;
-  using namespace ShaderRecompiler::Decoder;
 // Every SOP1 SAVEEXEC form: D = old EXEC, EXEC = S0 op EXEC, SCC = (EXEC != 0), and
 // the new EXEC gates the next vector write per lane. B32 forms run in wave32 and keep EXEC_HI.
 TestCase ScalarSaveexecAllForms(bool b64) {
@@ -29585,6 +29585,9 @@ TestCase ScalarSaveexecAllForms(bool b64) {
   return test;
 }
 
+TestCase ScalarSubvectorLoops(u32 wave_size) {
+  using O = ShaderOpcode;
+  using namespace ShaderRecompiler::Decoder;
   TestCase test;
   test.name = wave_size == 64 ? "ScalarSubvectorLoopsWave64"
                               : "ScalarSubvectorLoopsWave32";
@@ -43256,6 +43259,40 @@ TestCase GlobalLoadRecordsUnbackedPage() {
   return test;
 }
 
+// 32 lanes fault on the 32 pages of one fault word at once: every page must be recorded.
+TestCase GlobalLoadFaultsKeepEveryPageOfAWord() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  static_assert((BufferCache::PageIndex(GuestBase) & 31u) == 0);
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 0, static_cast<u32>(GuestBase));
+  AppendSMovLiteral(&code, 1, static_cast<u32>(GuestBase >> 32u));
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(BufferCache::CACHING_PAGEBITS), 0));
+  code.push_back(EncodeFlat0(0x0c, 2, 0));
+  code.push_back(EncodeFlat1(1, 0, 0, 20));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "GlobalLoadFaultsKeepEveryPageOfAWord";
+  test.code = std::move(code);
+  test.initial.assign(32, 0xfeedfaceu);
+  test.expected.assign(32, 0u);
+  // Only the next word's first page is backed.
+  test.bda_mappings = {{GuestBase + 32u * BufferCache::CACHING_PAGESIZE, 0}};
+  test.fault_address = GuestBase;
+  test.expected_fault_word = UINT32_MAX;
+  test.opcodes = {O::S_MOV_B32, O::V_LSHLREV_B32, O::FLAT_LOAD_DWORD, O::V_MOV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   using O = ShaderOpcode;
 
@@ -53779,6 +53816,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
   cases.push_back(ScalarOrn2SaveexecB32(64, 64));
   cases.push_back(ScalarOrn2SaveexecB32(32, 4));
+  cases.push_back(ScalarSaveexecAllForms(false));
+  cases.push_back(ScalarSaveexecAllForms(true));
   cases.push_back(ScalarSubvectorLoops(32));
   cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
@@ -53816,8 +53855,6 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarWqmB32Masks(32));
   cases.push_back(ScalarWqmB32Masks(64));
   AddCase(ScalarMaskProvenanceOverlapAndMixedBinary);
-  cases.push_back(ScalarSaveexecAllForms(false));
-  cases.push_back(ScalarSaveexecAllForms(true));
   cases.push_back(ScalarB32MaskDataflow(32));
   cases.push_back(ScalarB32MaskDataflow(64));
   AddCase(ScalarLiteral);
@@ -54195,6 +54232,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(GlobalLoadRecordsUnbackedPage);
+  AddCase(GlobalLoadFaultsKeepEveryPageOfAWord);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
@@ -62172,6 +62210,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
     RunCase(&vulkan, GlobalLoadRecordsUnbackedPage());
+    RunCase(&vulkan, GlobalLoadFaultsKeepEveryPageOfAWord());
     RunCase(&vulkan, FlatSegmentIgnoresSaddrAndMasksOffsetMsb());
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     return 0;
@@ -62257,6 +62296,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarOrn2SaveexecB32(32, 32));
     RunCase(&vulkan, ScalarOrn2SaveexecB32(64, 64));
     RunCase(&vulkan, ScalarOrn2SaveexecB32(32, 4));
+    RunCase(&vulkan, ScalarSaveexecAllForms(false));
+    RunCase(&vulkan, ScalarSaveexecAllForms(true));
     RunCase(&vulkan, ScalarSubvectorLoops(32));
     RunCase(&vulkan, ScalarSubvectorLoops(64));
     RunCase(&vulkan, ScalarNotB64UpdatesScc());
@@ -62296,8 +62337,6 @@ int main(int argc, char **argv) {
       }
     }
     RunGraphicsCase(&vulkan, GraphicsAncillaryLayer(true));
-    RunCase(&vulkan, ScalarSaveexecAllForms(false));
-    RunCase(&vulkan, ScalarSaveexecAllForms(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-append-index-only") == 0) {
