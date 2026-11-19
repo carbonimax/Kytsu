@@ -1097,13 +1097,13 @@ static int ReprotectBatchMode() {
 	return mode;
 }
 
-// KYTY_STREAM_HOST_CACHED=1 (default 0): the per-draw stream ring (ObtainBuffer copies, flattened
-// SRTs, shader data, index data) in cached host memory instead of device-local host-visible (ReBAR)
-// memory. Write-combined stores stall the memory accesses after them; cached ones do not, and the
-// GPU reads the ring over the bus. Idea and first measure: BryanKAdams (a25a2b97b).
+// KYTY_STREAM_HOST_CACHED (default 1, 0 = old ring): the per-draw stream ring (ObtainBuffer copies,
+// flattened SRTs, shader data, index data) in cached host memory instead of device-local host-visible
+// (ReBAR) memory. Write-combined stores stall the memory accesses after them; cached ones do not, and
+// the GPU reads the ring over the bus. Idea and first measure: BryanKAdams (a25a2b97b).
 static bool StreamHostCached(const GraphicContext& graphics) {
 	const char* value = std::getenv("KYTY_STREAM_HOST_CACHED");
-	if (value == nullptr || std::strtol(value, nullptr, 10) == 0) {
+	if (value != nullptr && std::strtol(value, nullptr, 10) == 0) {
 		return false;
 	}
 	constexpr vk::MemoryPropertyFlags cached =
@@ -1122,7 +1122,8 @@ static bool StreamHostCached(const GraphicContext& graphics) {
 
 // KYTY_AB_FLAG=stream_host_cached: the forced-off arm copies into m_stream_default. Each ring waits
 // for its own in-flight ranges, so switching between frames is safe. The tiler keeps the ring it
-// got at startup.
+// got at startup. With KYTY_STREAM_HOST_CACHED=0 (or no host-cached type) no second ring is made and
+// both arms use the default ring.
 StreamBuffer& BufferCache::StreamRing() noexcept {
 	return m_stream_default != nullptr && PerfStats::AbOff("stream_host_cached") ? *m_stream_default
 	                                                                              : m_stream_buffer;
