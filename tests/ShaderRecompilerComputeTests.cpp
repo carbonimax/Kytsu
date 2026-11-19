@@ -29492,6 +29492,99 @@ TestCase ScalarOrn2SaveexecB32(u32 wave_size, u32 threads) {
 TestCase ScalarSubvectorLoops(u32 wave_size) {
   using O = ShaderOpcode;
   using namespace ShaderRecompiler::Decoder;
+// Every SOP1 SAVEEXEC form: D = old EXEC, EXEC = S0 op EXEC, SCC = (EXEC != 0), and
+// the new EXEC gates the next vector write per lane. B32 forms run in wave32 and keep EXEC_HI.
+TestCase ScalarSaveexecAllForms(bool b64) {
+  using O = ShaderOpcode;
+  struct Form {
+    u32 opcode;
+    O op;
+    uint64_t (*fn)(uint64_t s, uint64_t e);
+  };
+  static constexpr Form forms64[] = {
+      {0x24, O::S_AND_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return s & e; }},
+      {0x25, O::S_OR_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return s | e; }},
+      {0x26, O::S_XOR_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return s ^ e; }},
+      {0x27, O::S_ANDN2_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return s & ~e; }},
+      {0x28, O::S_ORN2_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return s | ~e; }},
+      {0x29, O::S_NAND_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return ~(s & e); }},
+      {0x2a, O::S_NOR_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return ~(s | e); }},
+      {0x2b, O::S_XNOR_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return ~(s ^ e); }},
+      {0x37, O::S_ANDN1_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return ~s & e; }},
+      {0x38, O::S_ORN1_SAVEEXEC_B64, [](uint64_t s, uint64_t e) { return ~s | e; }},
+  };
+  static constexpr O ops32[] = {
+      O::S_AND_SAVEEXEC_B32,  O::S_OR_SAVEEXEC_B32,   O::S_XOR_SAVEEXEC_B32,
+      O::S_ANDN2_SAVEEXEC_B32, O::S_ORN2_SAVEEXEC_B32, O::S_NAND_SAVEEXEC_B32,
+      O::S_NOR_SAVEEXEC_B32,  O::S_XNOR_SAVEEXEC_B32, O::S_ANDN1_SAVEEXEC_B32,
+      O::S_ORN1_SAVEEXEC_B32};
+  // Patterns with all four (S0, EXEC) bit pairs in each word, plus a zero result.
+  struct Input {
+    uint64_t exec, source;
+  };
+  constexpr Input inputs[] = {{0xff00ff00f0f0f0f0ull, 0x0ff00ff0ccccccccull},
+                              {0xffffffffffffffffull, 0}};
+  constexpr u32 threads_b64 = 64, threads_b32 = 32;
+  const u32 threads = b64 ? threads_b64 : threads_b32;
+  constexpr u32 dst_sentinel = 0x13579bdfu;
+
+  TestCase test;
+  test.name = b64 ? "ScalarSaveexecAllFormsB64" : "ScalarSaveexecAllFormsB32";
+  auto &code = test.code;
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::S_CMP_EQ_U32, O::V_MOV_B32,
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  for (u32 f = 0; f < std::size(forms64); ++f) {
+    const auto &form = forms64[f];
+    test.opcodes.push_back(b64 ? form.op : ops32[f]);
+    // The B32 opcode is the B64 one's index in its own block of ten (0x3c..0x45).
+    const u32 opcode = b64 ? form.opcode : 0x3cu + f;
+    for (const auto &in : inputs) {
+      const uint64_t old = b64 ? in.exec : (in.exec & 0xffffffffull) | (uint64_t{0xa5a55a5au} << 32u);
+      const uint64_t full = form.fn(in.source, old);
+      const uint64_t result = b64 ? full : (full & 0xffffffffull) | (old & ~0xffffffffull);
+      const u32 scc = (b64 ? full : full & 0xffffffffull) != 0 ? 1u : 0u;
+      AppendVMovU32(&code, 2, 0);
+      AppendSMovLiteral(&code, 126, static_cast<u32>(old));
+      AppendSMovLiteral(&code, 127, static_cast<u32>(old >> 32u));
+      AppendSMovLiteral(&code, 0, static_cast<u32>(in.source));
+      AppendSMovLiteral(&code, 1, static_cast<u32>(in.source >> 32u));
+      AppendSMovLiteral(&code, 3, dst_sentinel);
+      // Preset SCC to the opposite of the expected value.
+      code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(scc)));
+      code.push_back(EncodeSop1(opcode, 2, 0));
+      const u32 snapshots[] = {2, 3, 126, 127, 253};
+      for (u32 i = 0; i < std::size(snapshots); ++i) {
+        code.push_back(EncodeSMovB32(20 + i, snapshots[i]));
+      }
+      AppendVMovU32(&code, 2, 1);
+      code.push_back(EncodeSop1(0x04, 126, 193u)); // Restore EXEC for readback.
+      const u32 expected[] = {static_cast<u32>(old),
+                              b64 ? static_cast<u32>(old >> 32u) : dst_sentinel,
+                              static_cast<u32>(result), static_cast<u32>(result >> 32u),
+                              scc};
+      for (u32 i = 0; i < std::size(expected); ++i) {
+        AppendStoreSgprAtLaneDwordOffset(&code, 20 + i, 0,
+                                        static_cast<u32>(test.expected.size()));
+        test.expected.insert(test.expected.end(), threads, expected[i]);
+      }
+      AppendStoreVgprAtLaneDwordOffset(&code, 2, 0,
+                                      static_cast<u32>(test.expected.size()));
+      for (u32 lane = 0; lane < threads; ++lane) {
+        test.expected.push_back(static_cast<u32>((result >> lane) & 1u));
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = b64 ? 64 : 32;
+  test.has_compute_info = true;
+  return test;
+}
+
   TestCase test;
   test.name = wave_size == 64 ? "ScalarSubvectorLoopsWave64"
                               : "ScalarSubvectorLoopsWave32";
@@ -53723,6 +53816,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarWqmB32Masks(32));
   cases.push_back(ScalarWqmB32Masks(64));
   AddCase(ScalarMaskProvenanceOverlapAndMixedBinary);
+  cases.push_back(ScalarSaveexecAllForms(false));
+  cases.push_back(ScalarSaveexecAllForms(true));
   cases.push_back(ScalarB32MaskDataflow(32));
   cases.push_back(ScalarB32MaskDataflow(64));
   AddCase(ScalarLiteral);
@@ -62201,6 +62296,8 @@ int main(int argc, char **argv) {
       }
     }
     RunGraphicsCase(&vulkan, GraphicsAncillaryLayer(true));
+    RunCase(&vulkan, ScalarSaveexecAllForms(false));
+    RunCase(&vulkan, ScalarSaveexecAllForms(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-append-index-only") == 0) {

@@ -69,15 +69,29 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x20u, Opcode::S_SETPC_B64},
     {0x21u, Opcode::S_SWAPPC_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
+    {0x25u, Opcode::S_OR_SAVEEXEC_B64},
+    {0x26u, Opcode::S_XOR_SAVEEXEC_B64},
+    {0x27u, Opcode::S_ANDN2_SAVEEXEC_B64},
     {0x28u, Opcode::S_ORN2_SAVEEXEC_B64},
+    {0x29u, Opcode::S_NAND_SAVEEXEC_B64},
+    {0x2au, Opcode::S_NOR_SAVEEXEC_B64},
+    {0x2bu, Opcode::S_XNOR_SAVEEXEC_B64},
     {0x2cu, Opcode::S_QUADMASK_B32},
     {0x2du, Opcode::S_QUADMASK_B64},
     {0x34u, Opcode::S_ABS_I32},
     {0x37u, Opcode::S_ANDN1_SAVEEXEC_B64},
+    {0x38u, Opcode::S_ORN1_SAVEEXEC_B64},
     {0x3bu, Opcode::S_BITREPLICATE_B64_B32},
     {0x3cu, Opcode::S_AND_SAVEEXEC_B32},
+    {0x3du, Opcode::S_OR_SAVEEXEC_B32},
+    {0x3eu, Opcode::S_XOR_SAVEEXEC_B32},
+    {0x3fu, Opcode::S_ANDN2_SAVEEXEC_B32},
     {0x40u, Opcode::S_ORN2_SAVEEXEC_B32},
+    {0x41u, Opcode::S_NAND_SAVEEXEC_B32},
+    {0x42u, Opcode::S_NOR_SAVEEXEC_B32},
+    {0x43u, Opcode::S_XNOR_SAVEEXEC_B32},
     {0x44u, Opcode::S_ANDN1_SAVEEXEC_B32},
+    {0x45u, Opcode::S_ORN1_SAVEEXEC_B32},
 };
 
 constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
@@ -178,10 +192,17 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		case Opcode::S_BREV_B64:
 		case Opcode::S_BITSET0_B64:
 		case Opcode::S_BITSET1_B64:
-		case Opcode::S_AND_SAVEEXEC_B64:
-		case Opcode::S_ORN2_SAVEEXEC_B64:
 		case Opcode::S_QUADMASK_B64:
+		case Opcode::S_AND_SAVEEXEC_B64:
+		case Opcode::S_OR_SAVEEXEC_B64:
+		case Opcode::S_XOR_SAVEEXEC_B64:
+		case Opcode::S_ANDN2_SAVEEXEC_B64:
+		case Opcode::S_ORN2_SAVEEXEC_B64:
+		case Opcode::S_NAND_SAVEEXEC_B64:
+		case Opcode::S_NOR_SAVEEXEC_B64:
+		case Opcode::S_XNOR_SAVEEXEC_B64:
 		case Opcode::S_ANDN1_SAVEEXEC_B64:
+		case Opcode::S_ORN1_SAVEEXEC_B64:
 		case Opcode::S_BITREPLICATE_B64_B32:
 			inst.data_dwords = 2u;
 			break;
