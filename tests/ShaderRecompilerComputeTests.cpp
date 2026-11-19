@@ -52406,76 +52406,203 @@ TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   return test;
 }
 
-// Reduces v13 into v0 with V_MIN_U32/S_MIN_U32 or, for bitwise_or, V_OR_B32/S_OR_B32.
-void AppendWave64Reduction(std::vector<u32> &code, bool bitwise_or) {
-  const u32 vector_op = bitwise_or ? 0x1cu : 0x13u;
+// A whole-wave reduction: the SPIR-V reduction it becomes, its VOP2 and SOP2 opcodes and the
+// identity lanes outside EXEC contribute. Only idempotent operations have a sparse graphics case.
+struct WaveReduction {
+  const char *compute_name, *graphics_name, *spirv;
+  ShaderOpcode vector, scalar;
+  u32 vector_op, scalar_op, identity;
+};
+
+constexpr WaveReduction kWaveMinimum{"ComputeWave64Minimum", "GraphicsSparseWaveMinimum",
+    "OpGroupNonUniformUMin", ShaderOpcode::V_MIN_U32, ShaderOpcode::S_MIN_U32, 0x13u, 0x07u,
+    UINT32_MAX};
+constexpr std::array kWaveReductions{kWaveMinimum,
+    WaveReduction{"ComputeWave64Or", "GraphicsSparseWaveOr", "OpGroupNonUniformBitwiseOr",
+        ShaderOpcode::V_OR_B32, ShaderOpcode::S_OR_B32, 0x1cu, 0x10u, 0u},
+    WaveReduction{"ComputeWave64SignedMinimum", "GraphicsSparseWaveSignedMinimum",
+        "OpGroupNonUniformSMin", ShaderOpcode::V_MIN_I32, ShaderOpcode::S_MIN_I32, 0x11u, 0x06u,
+        0x7fffffffu},
+    WaveReduction{"ComputeWave64SignedMaximum", "GraphicsSparseWaveSignedMaximum",
+        "OpGroupNonUniformSMax", ShaderOpcode::V_MAX_I32, ShaderOpcode::S_MAX_I32, 0x12u, 0x08u,
+        0x80000000u},
+    WaveReduction{"ComputeWave64And", "GraphicsSparseWaveAnd", "OpGroupNonUniformBitwiseAnd",
+        ShaderOpcode::V_AND_B32, ShaderOpcode::S_AND_B32, 0x1bu, 0x0eu, UINT32_MAX},
+    WaveReduction{"ComputeWave64Add", nullptr, "OpGroupNonUniformIAdd",
+        ShaderOpcode::V_ADD_NC_U32, ShaderOpcode::S_ADD_U32, 0x25u, 0x00u, 0u},
+    WaveReduction{"ComputeWave64Xor", nullptr, "OpGroupNonUniformBitwiseXor",
+        ShaderOpcode::V_XOR_B32, ShaderOpcode::S_XOR_B32, 0x1du, 0x12u, 0u}};
+
+// Reduces v13 into v0.
+void AppendWave64Reduction(std::vector<u32> &code, const WaveReduction &op) {
   code.insert(code.end(), {EncodeSop1(0x04, 24, 126), // Save contributing lanes.
                           EncodeSop1(0x28, 106, 126)});
-  // Inactive lanes contribute the identity: 0 for OR, UINT_MAX for the minimum.
-  AppendVop3(&code, 0x101, 13, bitwise_or ? 128u : 193u, Vgpr(13), 24);
+  AppendSMovLiteral(&code, 26, op.identity);
+  AppendVop3(&code, 0x101, 13, 26, Vgpr(13), 24);
   for (u32 shift : {1u, 2u, 4u, 8u}) {
-    code.push_back(EncodeVop2(vector_op, 13, 250, 13));
+    code.push_back(EncodeVop2(op.vector_op, 13, 250, 13));
     code.push_back(EncodeVop2Dpp(13, 0x110u + shift));
   }
   // RDNA2 wave64 reduction from PS 964747887d898821, PCs 0x224..0x244.
   code.insert(code.end(), {0xd778100cu, 0x0305830du,
-      EncodeVop2(vector_op, 13, Vgpr(13), 12), EncodeSop1(0x04, 126, 106),
+      EncodeVop2(op.vector_op, 13, Vgpr(13), 12), EncodeSop1(0x04, 126, 106),
       0xd7600006u, 0x00013f0du, 0xd7600007u, 0x00017f0du,
-      EncodeSop2(bitwise_or ? 0x10u : 0x07u, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
+      EncodeSop2(op.scalar_op, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
 }
 
-std::vector<ShaderOpcode> Wave64ReductionOpcodes(bool bitwise_or) {
-  using O = ShaderOpcode;
-  return {bitwise_or ? O::V_OR_B32 : O::V_MIN_U32, O::V_PERMLANEX16_B32,
-          O::V_READLANE_B32, bitwise_or ? O::S_OR_B32 : O::S_MIN_U32};
+std::vector<ShaderOpcode> Wave64ReductionOpcodes(const WaveReduction &op) {
+  return {op.vector, ShaderOpcode::V_PERMLANEX16_B32, ShaderOpcode::V_READLANE_B32, op.scalar};
 }
 
-GraphicsCase GraphicsSparseWaveReduction(bool bitwise_or) {
+GraphicsCase GraphicsSparseWaveReduction(const WaveReduction &op) {
   GraphicsCase test;
-  test.name = bitwise_or ? "GraphicsSparseWaveOr" : "GraphicsSparseWaveMinimum";
+  test.name = op.graphics_name;
   auto &code = test.fragment_code;
   code = {EncodeVintrp(0x02, 13, 0, 0, 2)};
-  AppendWave64Reduction(code, bitwise_or);
+  AppendWave64Reduction(code, op);
   code.insert(code.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0)});
   AppendEnd(&code);
   test.pixel_interpolator_settings = {0x00000400u};
   test.expected_pixel = {0x3e800000u, 0x3e800000u, 0x3e800000u, 0x3e800000u};
-  test.opcodes = Wave64ReductionOpcodes(bitwise_or);
+  test.opcodes = Wave64ReductionOpcodes(op);
   return test;
 }
 
-TestCase ComputeWave64Reduction(bool masked, bool bitwise_or) {
+TestCase ComputeWave64Reduction(const WaveReduction &op, bool masked = false) {
+  using O = ShaderOpcode;
   TestCase test;
+  test.name = masked ? "ComputeWave64MinimumMasked" : op.compute_name;
   auto &code = test.code;
   code = {EncodeVop2(0x1a, 20, InlineU32(2), 0)};
-  if (bitwise_or) {
-    // Lane i contributes bit i / 4, so each half supplies its own byte of 0xffff.
-    test.name = "ComputeWave64Or";
-    test.expected.assign(64, 0xffffu);
-    code.push_back(EncodeVop2(0x16, 13, InlineU32(2), 0));
-    AppendVop3(&code, 0x11a, 13, Vgpr(13), InlineU32(1));
-  } else {
-    test.name = masked ? "ComputeWave64MinimumMasked" : "ComputeWave64Minimum";
-    test.expected.assign(64, masked ? 38u : 37u);
-    AppendVMovU32(&code, 13, 100);
-    code.push_back(EncodeVop2(0x26, 13, Vgpr(13), 0)); // 100 - lane: minimum is in the upper half.
+  u32 expected = 0;
+  switch (op.vector) {
+    case O::V_MIN_U32:
+      AppendVMovU32(&code, 13, 100);
+      code.push_back(EncodeVop2(0x26, 13, Vgpr(13), 0)); // 100 - lane: minimum is in the upper half.
+      expected = masked ? 38u : 37u;
+      break;
+    case O::V_OR_B32:
+    case O::V_AND_B32:
+      // Lane i sets bit i / 4 (clears it for AND), so each half covers its own byte of 0xffff.
+      code.push_back(EncodeVop2(0x16, 13, InlineU32(2), 0));
+      AppendVop3(&code, 0x11a, 13, Vgpr(13), InlineU32(1));
+      if (op.vector == O::V_AND_B32) code.push_back(EncodeVop1(0x37, 13, Vgpr(13)));
+      expected = op.vector == O::V_OR_B32 ? 0xffffu : 0xffff0000u;
+      break;
+    case O::V_ADD_NC_U32:
+    case O::V_XOR_B32:
+      // lane + 1: the halves sum to 528 and 1552 and XOR to 32 and 96.
+      code.push_back(EncodeVop2(0x25, 13, InlineU32(1), 0));
+      expected = op.vector == O::V_ADD_NC_U32 ? 2080u : 64u;
+      break;
+    default:
+      // lane - 32: the signed minimum is -32, the maximum 31.
+      code.push_back(EncodeVop2(0x27, 13, InlineU32(32), 0));
+      expected = op.vector == O::V_MAX_I32 ? 31u : 0xffffffe0u;
+      break;
   }
   if (masked) {
     AppendSMovLiteral(&code, 126, 0xfffffffeu);
     AppendSMovLiteral(&code, 127, 0x7fffffffu);
   }
-  AppendWave64Reduction(code, bitwise_or);
+  AppendWave64Reduction(code, op);
   AppendBufferStoreDword(&code, 0, 20);
   AppendEnd(&code);
   test.initial.assign(64, 0xa5a5a5a5u);
+  test.expected.assign(64, expected);
   if (masked) test.expected.front() = test.expected.back() = 0xa5a5a5a5u;
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = 64;
   test.has_compute_info = true;
-  test.opcodes = Wave64ReductionOpcodes(bitwise_or);
+  test.opcodes = Wave64ReductionOpcodes(op);
+  test.required_spirv = {op.spirv};
   return test;
+}
+
+// A wave32 whole-wave reduction and the host operation it computes.
+struct PackedWave32Reduction {
+  const char *name;
+  spv::Op spirv;
+  u32 vector_op, scalar_op; // VOP2 and SOP2 opcodes
+  u32 (*combine)(u32, u32);
+};
+
+constexpr std::array kPackedWave32Reductions{
+    PackedWave32Reduction{"PackedWave32Add", spv::OpGroupNonUniformIAdd, 0x25u, 0x00u,
+        +[](u32 a, u32 b) { return a + b; }},
+    PackedWave32Reduction{"PackedWave32SignedMinimum", spv::OpGroupNonUniformSMin, 0x11u, 0x06u,
+        +[](u32 a, u32 b) { return static_cast<int32_t>(a) < static_cast<int32_t>(b) ? a : b; }},
+    PackedWave32Reduction{"PackedWave32SignedMaximum", spv::OpGroupNonUniformSMax, 0x12u, 0x08u,
+        +[](u32 a, u32 b) { return static_cast<int32_t>(a) > static_cast<int32_t>(b) ? a : b; }},
+    PackedWave32Reduction{"PackedWave32Minimum", spv::OpGroupNonUniformUMin, 0x13u, 0x07u,
+        +[](u32 a, u32 b) { return std::min(a, b); }},
+    PackedWave32Reduction{"PackedWave32Maximum", spv::OpGroupNonUniformUMax, 0x14u, 0x09u,
+        +[](u32 a, u32 b) { return std::max(a, b); }},
+    PackedWave32Reduction{"PackedWave32And", spv::OpGroupNonUniformBitwiseAnd, 0x1bu, 0x0eu,
+        +[](u32 a, u32 b) { return a & b; }},
+    PackedWave32Reduction{"PackedWave32Or", spv::OpGroupNonUniformBitwiseOr, 0x1cu, 0x10u,
+        +[](u32 a, u32 b) { return a | b; }},
+    PackedWave32Reduction{"PackedWave32Xor", spv::OpGroupNonUniformBitwiseXor, 0x1du, 0x12u,
+        +[](u32 a, u32 b) { return a ^ b; }}};
+
+// Two wave32 guest waves of one 64-thread workgroup reduce a loaded value with a row scan and
+// lanes 15 and 31; each lane must get its own wave's result. Wave 0 loads positive values with
+// bit 28 set, wave 1 negative ones with bits 31 and 29, so a reduction over both waves (or a
+// wrong identity for the other wave's lanes in a packed 64-lane host subgroup) changes a result.
+TestCase ComputePackedWave32Reduction(const PackedWave32Reduction &op) {
+  TestCase test;
+  test.name = op.name;
+  auto &code = test.code;
+  code = {EncodeVop2(0x1a, 20, InlineU32(2), 0)};
+  AppendBufferLoadDword(&code, 13, 20);
+  code.insert(code.end(), {EncodeSop1(0x40, 106, 126)}); // s_orn2_saveexec_b32: full EXEC.
+  for (u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(EncodeVop2(op.vector_op, 13, 250, 13));
+    code.push_back(EncodeVop2Dpp(13, 0x110u + shift));
+  }
+  code.insert(code.end(), {EncodeSop1(0x03, 126, 106), // Restore EXEC.
+      0xd7600006u, 0x00011f0du, 0xd7600007u, 0x00013f0du, // v_readlane_b32 s6/s7, v13, 15/31
+      EncodeSop2(op.scalar_op, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
+  AppendBufferStoreDword(&code, 0, 20);
+  AppendEnd(&code);
+  test.initial.resize(64);
+  for (u32 lane = 0; lane < 64; lane++) {
+    const u32 bits = (lane * 0x9e3779b9u + 0x7f4a7c15u) & 0x0fffffffu;
+    test.initial[lane] = bits | (lane < 32 ? 0x10000000u : 0xa0000000u);
+  }
+  const auto reduce = [&](u32 first, u32 count) {
+    return std::accumulate(test.initial.begin() + first + 1, test.initial.begin() + first + count,
+                           test.initial[first], op.combine);
+  };
+  const u32 wave0 = reduce(0, 32), wave1 = reduce(32, 32), both = reduce(0, 64);
+  Require(test.name, "test data", wave0 != both || wave1 != both,
+          "the values do not tell a two-wave reduction from a one-wave one");
+  test.expected.assign(32, wave0);
+  test.expected.resize(64, wave1);
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.ir_counts = {{" = SubgroupReduceU32 ", 1}};
+  return test;
+}
+
+// The case on the device, after checking that a 64-lane host subgroup gets one reduction per
+// guest wave.
+void RunPackedWave32Reduction(VulkanHarness *vulkan, const PackedWave32Reduction &op) {
+  const auto test = ComputePackedWave32Reduction(op);
+  const auto packed = CompileCase(test, 64);
+  size_t reductions = 0;
+  for (size_t offset = 5; offset < packed.spirv.size(); offset += packed.spirv[offset] >> 16u) {
+    reductions += (packed.spirv[offset] & 0xffffu) == static_cast<u32>(op.spirv);
+  }
+  Require(test.name, "packed SPIR-V", reductions == 2,
+          "a packed wave32 subgroup did not reduce each guest wave apart");
+  std::printf("[compute] %-32s host subgroup %u\n", test.name, vulkan->SubgroupSize());
+  RunCase(vulkan, test);
 }
 
 GraphicsCase GraphicsInterpolationExport() {
@@ -53714,9 +53841,9 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorDppMirrorAndRotate(64));
   cases.push_back(VectorReadFirstLaneExecMasks(32));
   cases.push_back(VectorReadFirstLaneExecMasks(64));
-  cases.push_back(ComputeWave64Reduction(false, false));
-  cases.push_back(ComputeWave64Reduction(true, false));
-  cases.push_back(ComputeWave64Reduction(false, true));
+  for (const auto &op : kWaveReductions) cases.push_back(ComputeWave64Reduction(op));
+  cases.push_back(ComputeWave64Reduction(kWaveMinimum, true));
+  for (const auto &op : kPackedWave32Reductions) cases.push_back(ComputePackedWave32Reduction(op));
   AddCase(VectorDppBankMaskPreservesDestination);
   for (const bool row_shift : {false, true})
     for (const bool bound_ctrl : {false, true})
@@ -54169,9 +54296,10 @@ std::vector<TestCase> MakeCases() {
 }
 
 std::vector<GraphicsCase> MakeGraphicsCases() {
-  return {
-      GraphicsSparseWaveReduction(false),
-      GraphicsSparseWaveReduction(true),
+  std::vector<GraphicsCase> cases;
+  for (const auto &op : kWaveReductions)
+    if (op.graphics_name != nullptr) cases.push_back(GraphicsSparseWaveReduction(op));
+  cases.insert(cases.end(), {
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
       GraphicsPackedHalfCentroid(),
@@ -54204,7 +54332,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
       GraphicsObjectPrimitiveId(false),
       GraphicsObjectPrimitiveId(true),
-  };
+  });
+  return cases;
 }
 
 void CheckComputeLdsLimit(VulkanHarness &vulkan) {
@@ -60616,6 +60745,48 @@ void CheckPm4Flip() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// A compute shader that takes derivatives over 2x2 quads, as one that queries an image's LOD
+// does, passes validation on the emulator's device; a validation error exits.
+void CheckComputeDerivativesDevice() {
+  constexpr const char *name = "ComputeDerivativesDevice";
+  Config::Load({.vulkan_validation_enabled = true,
+                .printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window = SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr, "hidden Vulkan window failed");
+  window.CreateVulkan();
+  const auto &graphics = window.graphic_ctx;
+  Require(name, "validation", static_cast<bool>(graphics.debug_messenger),
+          "the validation layer is not active");
+  // OpCapability ComputeDerivativeGroupQuadsKHR, LocalSize 2 2 1, DerivativeGroupQuadsKHR.
+  static constexpr uint32_t code[] = {
+      0x07230203, 0x00010600, 0x00070000, 0x00000005, 0x00000000, 0x00020011, 0x00000001,
+      0x00020011, 0x000014a8, 0x000a000a, 0x5f565053, 0x5f52484b, 0x706d6f63, 0x5f657475,
+      0x64616873, 0x645f7265, 0x76697265, 0x76697461, 0x00007365, 0x0003000e, 0x00000000,
+      0x00000001, 0x0005000f, 0x00000005, 0x00000001, 0x6e69616d, 0x00000000, 0x00060010,
+      0x00000001, 0x00000011, 0x00000002, 0x00000002, 0x00000001, 0x00030010, 0x00000001,
+      0x000014a9, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00050036,
+      0x00000002, 0x00000001, 0x00000000, 0x00000003, 0x000200f8, 0x00000004, 0x000100fd,
+      0x00010038};
+  const auto module =
+      graphics.device.createShaderModule({.codeSize = sizeof(code), .pCode = code}).value;
+  const auto layout = graphics.device.createPipelineLayout({}).value;
+  const auto pipeline = graphics.device.createComputePipeline(
+      nullptr, {.stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                          .module = module,
+                          .pName = "main"},
+                .layout = layout});
+  Require(name, "pipeline", pipeline.result == vk::Result::eSuccess,
+          "the derivative compute pipeline was not created");
+  graphics.device.destroyPipeline(pipeline.value);
+  graphics.device.destroyPipelineLayout(layout);
+  graphics.device.destroyShaderModule(module);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // A flip rate is the shortest flip interval, counted from the last flip.
 void CheckFlipRate() {
   namespace EventQueue = LibKernel::EventQueue;
@@ -61476,11 +61647,12 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
     VulkanHarness vulkan;
-    RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(false));
-    RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(true));
-    RunCase(&vulkan, ComputeWave64Reduction(false, false));
-    RunCase(&vulkan, ComputeWave64Reduction(true, false));
-    RunCase(&vulkan, ComputeWave64Reduction(false, true));
+    for (const auto &op : kWaveReductions) {
+      if (op.graphics_name != nullptr) RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(op));
+      RunCase(&vulkan, ComputeWave64Reduction(op));
+    }
+    RunCase(&vulkan, ComputeWave64Reduction(kWaveMinimum, true));
+    for (const auto &op : kPackedWave32Reductions) RunPackedWave32Reduction(&vulkan, op);
     RunCase(&vulkan, VectorDpp8Captured(false));
     for (const u32 wave_size : {32u, 64u})
       for (const bool fi : {false, true})
@@ -62278,6 +62450,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
     CheckFlipRate();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-derivatives-only") == 0) {
+    CheckComputeDerivativesDevice();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--video-out-only") == 0) {
