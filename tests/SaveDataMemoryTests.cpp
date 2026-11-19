@@ -327,6 +327,43 @@ std::vector<std::string> Search(int32_t user, const SceSaveDataTitleId* title = 
 	return found;
 }
 
+void TestDirNamePatterns() {
+	CHECK(dir_name_match("save-list-0-4slot", "save-list-0-%slot%"));
+	CHECK(dir_name_match("save-list-0-14slot", "save-list-0-%slot%"));
+	CHECK(!dir_name_match("save-list-0--1", "save-list-0-%slot%"));
+	CHECK(dir_name_match("save-list-0--1", "save-list-0-%"));
+	CHECK(dir_name_match("slot", "%slot%"));
+	CHECK(dir_name_match("", "%"));
+	CHECK(dir_name_match("slota", "slot_"));
+	CHECK(!dir_name_match("slot", "slot_"));
+	CHECK(!dir_name_match("slotab", "slot_"));
+
+	Reset("PATTERN");
+	for (const char* text: {"DATA-0-1Slot", "DATA-0-14Slot", "DATA-0--1"}) {
+		auto                  name = DirName(text);
+		struct SaveDataMount3 mount {};
+		mount.user_id    = 1;
+		mount.dir_name   = &name;
+		mount.mount_mode = 4;
+		mount.blocks     = 48;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK);
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	}
+	auto                      pattern = DirName("DATA-0-%Slot%");
+	SaveDataDirNameSearchCond cond {};
+	cond.user_id  = 1;
+	cond.dir_name = &pattern;
+	std::array<SceSaveDataDirName, 8> names {};
+	SaveDataDirNameSearchResult       result {};
+	result.dir_names     = names.data();
+	result.dir_names_num = names.size();
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK);
+	CHECK(result.hit_num == 2);
+	CHECK(std::string(names[0].data) == "DATA-0-14Slot");
+	CHECK(std::string(names[1].data) == "DATA-0-1Slot");
+}
+
 void TestClassicSavePaths() {
 	Reset("CLASSIC");
 	const std::vector<std::string> names {"save.1", "save1", "slot@A", "slotA"};
@@ -446,6 +483,32 @@ void TestConvert() {
 		convert.dst_blocks = blocks;
 		CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
 	}
+	// A real conversion ends at once with a CONVERT_END event; the save keeps the new size.
+	SaveDataEvent event {};
+	while (SaveDataGetEventResult(nullptr, &event) == OK) {
+	}
+	convert.dst_dir_name = nullptr;
+	convert.dst_blocks   = 128;
+	CHECK(SaveDataConvert(&convert) == OK);
+	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
+	CHECK(event.type == 5 && event.error_code == OK && std::string(event.dir_name.data) == "save");
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	// A named destination gets a copy of the save at the requested size.
+	const auto copy      = DirName("copy");
+	convert.dst_dir_name = &copy;
+	convert.dst_blocks   = 160;
+	CHECK(SaveDataConvert(&convert) == OK);
+	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
+	CHECK(event.type == 5 && event.error_code == OK && std::string(event.dir_name.data) == "copy");
+	convert.src_dir_name = &copy;
+	convert.dst_dir_name = nullptr;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	convert.src_dir_name = &source;
+	convert.dst_blocks   = 128;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	float progress = 0.0f;
+	CHECK(SaveDataGetConvertProgress(&progress) == OK && progress == 1.0f);
+	CHECK(SaveDataGetConvertProgress(nullptr) == SAVE_DATA_ERROR_PARAMETER);
 }
 
 void TestGuestSaveIsolation() {
@@ -770,6 +833,7 @@ int main(int argc, char** argv) {
 	TestValidationAndScatter();
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
+	TestDirNamePatterns();
 	TestClassicSavePaths();
 	TestBusyMountPreservesResult();
 	TestConvert();
