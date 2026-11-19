@@ -7,6 +7,7 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/singleton.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/runtimeLinker.h"
 
@@ -41,6 +42,8 @@ int main(int, char**) {
 	options.printf_direction = Config::LogDirection::Silent;
 	Config::Load(options);
 	subsystems.Initialize<Log::Lifecycle>();
+	// Guest threads allocate their TLS in guest memory.
+	subsystems.Initialize<Memory::Lifecycle>();
 	Initialize();
 	(void)Common::Singleton<Loader::RuntimeLinker>::Instance(); // main thread only; guest thread exit uses it
 	// The host default on Windows; set it here too so a thread that inherits it (POSIX hosts) still fails without the fix.
