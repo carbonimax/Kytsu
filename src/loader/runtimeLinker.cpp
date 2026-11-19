@@ -46,7 +46,9 @@
 #include <mach/mach_vm.h>
 #include <pthread.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(__x86_64__)
 #include <asm/prctl.h>
+#endif
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -1054,6 +1056,8 @@ static void ForEachRelocation(Program* program, auto&& func) {
 // Guest code reads its TCB from fs:[0], which the host owns, so PatchGuestCode rewrites those reads
 // to gs:[TcbGsOffset()]. On Linux the gs base is the TCB, whose first qword points to itself;
 // Windows (TEB TLS slots) and macOS (TSD slots) hold the TCB in a host slot at that offset.
+// x86-64 hosts only: elsewhere guest code runs through FEX, which keeps the guest's fs:[0] reads
+// and points each guest thread's FS at its own TCB, so the host just remembers that TCB.
 struct TlsBlock {
 	uint8_t* ptr  = nullptr;
 	uint64_t size = 0;
@@ -1064,6 +1068,7 @@ struct Tcb {
 	std::vector<TlsBlock>* dtv; // indexed by ThreadLocalStorage::index
 };
 
+#if defined(__x86_64__) || defined(_M_X64)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // Allocated before main: host libraries loaded later can use up the slots at a fixed TEB offset.
 static const DWORD g_tcb_slot = TlsAlloc();
@@ -1108,6 +1113,17 @@ void* RuntimeLinker::GetThreadTcb() {
 	asm volatile("movq %%gs:(%1), %0" : "=r"(tcb) : "r"(static_cast<uint64_t>(TcbGsOffset())));
 	return tcb;
 }
+#else
+static thread_local void* g_thread_tcb = nullptr;
+
+void RuntimeLinker::SetThreadTcb(void* tcb) {
+	g_thread_tcb = tcb;
+}
+
+void* RuntimeLinker::GetThreadTcb() {
+	return g_thread_tcb;
+}
+#endif
 
 static TlsBlock AllocateTlsBlock(const ThreadLocalStorage& tls, uint64_t size) {
 	auto* ptr = reinterpret_cast<uint8_t*>(Libs::LibKernel::Memory::AllocateRuntimeMemory(
@@ -1176,6 +1192,7 @@ void RuntimeLinker::PatchGuestCode(uint64_t address, uint64_t size) {
 		}
 	}
 
+#if defined(__x86_64__) || defined(_M_X64)
 	// mov r64, qword ptr fs:[0] -> mov r64, qword ptr gs:[TcbGsOffset()]
 	const uint32_t offset  = TcbGsOffset();
 	auto*          end_ptr = reinterpret_cast<uint8_t*>(address + size);
@@ -1188,6 +1205,7 @@ void RuntimeLinker::PatchGuestCode(uint64_t address, uint64_t size) {
 			ptr += 8;
 		}
 	}
+#endif
 }
 
 uint64_t RuntimeLinker::GetEntry() {
