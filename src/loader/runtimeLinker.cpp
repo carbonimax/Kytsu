@@ -1695,13 +1695,9 @@ Program* RuntimeLinker::FindProgramById(int32_t id) {
 }
 
 std::vector<int32_t> RuntimeLinker::GetProgramIds() {
-	Common::LockGuard lock(m_mutex);
-
-	std::vector<int32_t> ids;
-	ids.reserve(m_programs.size());
-	for (const auto* p: m_programs) {
-		ids.push_back(p->unique_id);
-	}
+	Common::LockGuard    lock(m_mutex);
+	std::vector<int32_t> ids(m_programs.size());
+	std::ranges::transform(m_programs, ids.begin(), &Program::unique_id);
 	return ids;
 }
 
