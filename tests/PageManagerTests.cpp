@@ -802,6 +802,22 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 } // namespace Libs::LibKernel::Memory
 
+void TestLockBackoffSteps() {
+  using Libs::Graphics::PageLockBackoffStep;
+  using Libs::Graphics::PageLockWait;
+  Check(PageLockBackoffStep(1) == PageLockWait::Pause &&
+            PageLockBackoffStep(2047) == PageLockWait::Pause,
+        "backoff does not pause first");
+  Check(PageLockBackoffStep(2048) == PageLockWait::Yield &&
+            PageLockBackoffStep(2049) == PageLockWait::Pause &&
+            PageLockBackoffStep(39 * 2048) == PageLockWait::Yield,
+        "backoff does not yield once per 2048 rounds");
+  Check(PageLockBackoffStep(40 * 2048) == PageLockWait::Sleep &&
+            PageLockBackoffStep(40 * 2048 + 1) == PageLockWait::Pause &&
+            PageLockBackoffStep(1000 * 2048) == PageLockWait::Sleep,
+        "backoff does not sleep after 40 yields");
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);

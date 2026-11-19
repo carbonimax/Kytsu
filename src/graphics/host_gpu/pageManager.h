@@ -10,6 +10,13 @@ namespace Libs::Graphics {
 
 enum class PageFaultAccess { Read, Write, Execute };
 
+// KYTY_PAGE_LOCK_BACKOFF=1 (default 0: spin on pause): what a waiter of a region lock does at its
+// n-th wait round (n >= 1): pause, then once per 2048 rounds yield, then sleep 1 ms after 40 yields.
+enum class PageLockWait { Pause, Yield, Sleep };
+[[nodiscard]] PageLockWait PageLockBackoffStep(uint64_t n) noexcept;
+// KYTY_PERF_STATS=1: prints the "PERF pagelock" line (region-lock waits) for the last `seconds`.
+void PageLockReport(double seconds) noexcept;
+
 class PageManager final {
 public:
 	PageManager();

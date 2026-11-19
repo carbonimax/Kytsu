@@ -14,7 +14,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <chrono>
+#include <cinttypes>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -50,23 +53,84 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 	std::_Exit(322);
 }
 
+void CpuPause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+	_mm_pause();
+#elif defined(_M_ARM64)
+	__yield();
+#elif defined(__aarch64__)
+	asm volatile("yield");
+#endif
+}
+
+bool EnvFlag(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && std::atoi(value) != 0;
+}
+
+// Read at static initialization (false before it). A region-lock holder may be inside a host
+// protection change; with KYTY_PAGE_LOCK_BACKOFF=1 its waiters give their cores back instead of
+// spinning on pause until it gets one (after Erlou93/KytyPS5-Erlou cc05e4c2).
+const bool g_lock_backoff = EnvFlag("KYTY_PAGE_LOCK_BACKOFF");
+const bool g_lock_stats   = EnvFlag("KYTY_PERF_STATS");
+
+std::atomic<uint64_t> g_lock_acquired {0};
+std::atomic<uint64_t> g_lock_contended {0};
+std::atomic<uint64_t> g_lock_yields {0};
+std::atomic<uint64_t> g_lock_sleeps {0};
+std::atomic<uint64_t> g_lock_max_wait_ns {0};
+
+uint64_t LockNowNs() noexcept {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-#if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
-#elif defined(_M_ARM64)
-			__yield();
-#elif defined(__aarch64__)
-			asm volatile("yield");
-#endif
+		if (g_lock_stats) [[unlikely]] {
+			g_lock_acquired.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (m_lock.test_and_set(std::memory_order_acquire)) [[unlikely]] {
+			Wait();
 		}
 	}
 	~SpinGuard() { m_lock.clear(std::memory_order_release); }
 	KYTY_CLASS_NO_COPY(SpinGuard);
 
 private:
+	void Wait() noexcept {
+		const uint64_t start  = g_lock_stats ? LockNowNs() : 0;
+		uint64_t       rounds = 0;
+		do {
+			if (!g_lock_backoff) {
+				CpuPause();
+				continue;
+			}
+			while (m_lock.test(std::memory_order_relaxed)) {
+				switch (PageLockBackoffStep(++rounds)) {
+					case PageLockWait::Pause: CpuPause(); break;
+					case PageLockWait::Yield:
+						std::this_thread::yield();
+						if (g_lock_stats) g_lock_yields.fetch_add(1, std::memory_order_relaxed);
+						break;
+					case PageLockWait::Sleep:
+						std::this_thread::sleep_for(std::chrono::milliseconds(1));
+						if (g_lock_stats) g_lock_sleeps.fetch_add(1, std::memory_order_relaxed);
+						break;
+				}
+			}
+		} while (m_lock.test_and_set(std::memory_order_acquire));
+		if (g_lock_stats) {
+			g_lock_contended.fetch_add(1, std::memory_order_relaxed);
+			const uint64_t waited = LockNowNs() - start;
+			uint64_t       max    = g_lock_max_wait_ns.load(std::memory_order_relaxed);
+			while (waited > max && !g_lock_max_wait_ns.compare_exchange_weak(max, waited, std::memory_order_relaxed)) {
+			}
+		}
+	}
+
 	std::atomic_flag& m_lock;
 };
 
@@ -559,5 +623,30 @@ template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, Reg
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+
+PageLockWait PageLockBackoffStep(uint64_t n) noexcept {
+	constexpr uint64_t spins_per_step = 2048; // ~25 us of pause on a desktop x86-64 core
+	constexpr uint64_t yield_steps    = 40;   // ~1 ms of spinning and yielding before sleeping
+	if (n % spins_per_step != 0) {
+		return PageLockWait::Pause;
+	}
+	return n / spins_per_step < yield_steps ? PageLockWait::Yield : PageLockWait::Sleep;
+}
+
+void PageLockReport(double seconds) noexcept {
+	if (!g_lock_stats) {
+		return;
+	}
+	const auto take = [](std::atomic<uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+	const auto acquired  = take(g_lock_acquired);
+	const auto contended = take(g_lock_contended);
+	const auto yields    = take(g_lock_yields);
+	const auto sleeps    = take(g_lock_sleeps);
+	const auto max_ns    = take(g_lock_max_wait_ns);
+	std::printf("PERF pagelock %.1fs: acquired=%" PRIu64 " contended=%" PRIu64 " yields=%" PRIu64 " sleeps=%" PRIu64
+	            " max_wait=%.3fms backoff=%d\n",
+	            seconds, acquired, contended, yields, sleeps, static_cast<double>(max_ns) / 1e6,
+	            g_lock_backoff ? 1 : 0);
+}
 
 } // namespace Libs::Graphics
