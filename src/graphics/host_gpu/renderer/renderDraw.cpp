@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -454,20 +455,22 @@ struct DrawCallInfo {
 };
 
 static bool KeepDepthAttachmentLayout() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_DEPTH_LAYOUT_KEEP");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	return enabled;
 }
 
 // KYTY_MESH_INDIRECT_GPU=1: indirect mesh-emulated draws read their records on the GPU, from a
 // task shader (upstream abc509d3), instead of the CPU reading each record (default).
 bool MeshIndirectGpuEnabled() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_MESH_INDIRECT_GPU");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	}));
 	return enabled;
 }
 
@@ -2480,7 +2483,10 @@ void RenderExecutor::PipelineExecute(void* context, CpPipeline::DrawRecord& reco
 		                   DrawPrepared::LookedUp);
 	}
 	// KYTY_IDLE_SUBMIT: the GPU thread only checks it between packets with an idle back thread.
-	static const bool idle_submit = CommandScheduler::IdleSubmitEnabled();
+	static std::atomic<int64_t> idle_submit_once {Common::OnceUnset};
+	const auto idle_submit = static_cast<bool>(Common::Once(idle_submit_once, [] {
+		return CommandScheduler::IdleSubmitEnabled();
+	}));
 	if (idle_submit && CpPipeline::IsBackThread() && scheduler.Active() &&
 	    scheduler.IdleSubmitDue()) {
 		PerfStats::Add(PerfStats::Counter::IdleSubmits, 1);
