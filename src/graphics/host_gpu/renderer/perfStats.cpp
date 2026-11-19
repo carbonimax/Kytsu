@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "common/emulatorConfig.h"
+#include "common/onceValue.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -72,18 +73,20 @@ std::tm LocalNow() noexcept {
 } // namespace
 
 bool Enabled() noexcept {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && std::atoi(value) != 0;
-	}();
+	}));
 	return enabled;
 }
 
 static int BindProfMode() noexcept {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_BIND_PROF");
 		return Enabled() && value != nullptr ? std::atoi(value) : 0;
-	}();
+	}));
 	return mode;
 }
 
@@ -97,10 +100,11 @@ bool BackProfEnabled() noexcept {
 }
 
 bool SrtProfEnabled() noexcept {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_SRT_PROF");
 		return Enabled() && value != nullptr && std::atoi(value) != 0;
-	}();
+	}));
 	return enabled;
 }
 

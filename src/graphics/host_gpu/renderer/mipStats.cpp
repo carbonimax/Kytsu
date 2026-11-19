@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/mipStats.h"
+#include "common/onceValue.h"
 
 #include <algorithm>
 #include <array>
@@ -49,10 +50,11 @@ int64_t NowTicks() {
 } // namespace
 
 bool ReliefEnabled() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_MIP_STATS_RELIEF");
 		return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	return enabled;
 }
 

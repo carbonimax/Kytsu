@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 
 #include "common/assert.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
@@ -154,19 +155,21 @@ void BackThread() {
 } // namespace
 
 int Mode() noexcept {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_CP_PIPELINE");
 		const int   m     = value != nullptr ? std::atoi(value) : 1;
 		return m == 1 || m == 2 ? m : 0;
-	}();
+	}));
 	return mode;
 }
 
 bool Engaged() noexcept {
-	static const uint64_t min_frame_us = [] {
+	static std::atomic<int64_t> min_frame_us_once {Common::OnceUnset};
+	const auto min_frame_us = static_cast<uint64_t>(Common::Once(min_frame_us_once, [] {
 		const char* value = std::getenv("KYTY_CP_PIPELINE_MIN_FRAME_MS");
 		return value != nullptr ? std::strtoull(value, nullptr, 10) * 1000ull : 25000ull;
-	}();
+	}));
 	return Mode() == 2 || PerfStats::RecentFrameUs() >= min_frame_us;
 }
 

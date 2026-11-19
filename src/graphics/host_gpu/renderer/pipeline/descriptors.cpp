@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -534,10 +535,11 @@ struct ResolvedTextureDesc {
 // bind. Image heap resources (which also depend on the guest mapping) are not kept. 2 = derive
 // anyway and exit on any difference with the kept description.
 uint32_t TextureDescMemoMode() noexcept {
-	static const uint32_t mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<uint32_t>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_TEXTURE_DESC_MEMO");
 		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
-	}();
+	}));
 	return mode;
 }
 

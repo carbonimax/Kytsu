@@ -560,10 +560,11 @@ private:
 	// (seqlock: the generation is read before and after the copy). The backing view itself stays
 	// mapped for the store's lifetime, so a copy racing a remap is harmless and is retried locked.
 	static bool BackingReadCacheEnabled() {
-		static const bool enabled = [] {
+		static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+		const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 			const char* value = std::getenv("KYTY_BACKING_READ_CACHE");
 			return value == nullptr || std::strcmp(value, "0") != 0;
-		}();
+		}));
 		return enabled;
 	}
 
