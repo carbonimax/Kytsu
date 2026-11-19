@@ -80,6 +80,19 @@ add_custom_command(TARGET launcher POST_BUILD
 	VERBATIM)
 install(FILES presets.json DESTINATION "${launcher_presets_install}")
 
+# Registered in the root CMakeLists.txt (launcher_settings).
+add_executable(launcher_settings_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherSettingsTests.cpp"
+	include/configuration.h
+	src/configuration.cpp
+)
+target_link_libraries(launcher_settings_tests Qt6::Gui common)
+target_include_directories(launcher_settings_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_settings_tests PROPERTIES AUTOMOC ON)
+if (CLANG AND NOT KYTY_CLANG_CL)
+	target_compile_options(launcher_settings_tests PRIVATE -frtti)
+endif()
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)

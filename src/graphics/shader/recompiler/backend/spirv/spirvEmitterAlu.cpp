@@ -436,16 +436,35 @@ uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Ldexp, {arg0, exponent});
 }
 
+// V_SIN/V_COS take turns. Both fold them exactly to [-0.25, 0.25] before the host Sin, so the zeros
+// of whole and half turns (sin) and quarter turns (cos) are exact +0 as on RDNA, not sin(pi_f32).
 uint32_t EmitFPSin(EmitterState& state, uint32_t arg0) {
-	auto source = EmitTrigCycleF32(state, arg0, !state.profile.relaxed_float);
+	const auto turns = EmitTrigCycleF32(state, arg0);
+	// 2c - t (exact) is t inside the clamp and +-0.5 - t outside it: sin(2pi t) = sin(2pi (+-0.5 - t)).
+	const auto clamped =
+	    EmitExt(state, TypeF32(state), GLSLstd450FClamp,
+	            {turns, ConstantF32(state, 0xbe800000u), ConstantF32(state, 0x3e800000u)});
+	auto source = EmitExt(state, TypeF32(state), GLSLstd450Fma,
+	                      {clamped, ConstantF32(state, 0x40000000u), EmitFNegateValue(state, turns)});
+	if (!state.profile.relaxed_float) {
+		// The folds turn -0 into +0; select -0 by bits so no host arithmetic can drop its sign.
+		const auto abs_bits = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		                             Unary(state, spv::OpBitcast, TypeU32(state), arg0),
+		                             ConstantU32(state, 0x7fffffffu));
+		source = Select(state, TypeF32(state),
+		                Binary(state, spv::OpIEqual, TypeBool(state), abs_bits, ConstantU32(state, 0)),
+		                arg0, source);
+	}
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
 }
 
 uint32_t EmitFPCos(EmitterState& state, uint32_t arg0) {
-	auto source = EmitTrigCycleF32(state, arg0, false);
+	// cos(2pi t) = sin(2pi (0.25 - |t|)).
+	auto source = Binary(state, spv::OpFSub, TypeF32(state), ConstantF32(state, 0x3e800000u),
+	                     EmitFAbsValue(state, EmitTrigCycleF32(state, arg0)));
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
-	return EmitExt(state, TypeF32(state), GLSLstd450Cos, {source});
+	return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
