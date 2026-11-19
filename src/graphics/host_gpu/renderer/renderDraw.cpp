@@ -929,13 +929,16 @@ bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderD
 // Selects the draw's shader programs (PipelineCache::GetGraphicsPrograms). Slots bound to
 // identical CB registers that the PS really exports share one attachment: the pixel program is
 // then selected again with the merge.
-static void RefreshShaders(CommandBuffer& buffer, DrawRenderState& state, bool single_sample) {
+// `first`: the draw's first lookup, whose caller skips the draw without a vertex program
+// (KYTY_TESS_PRETRANSLATE may then leave new tessellation stages to workers); re-lookups find them.
+static void RefreshShaders(CommandBuffer& buffer, DrawRenderState& state, bool single_sample,
+                           bool first = false) {
 	auto& ctx            = buffer.GetRegisters();
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
 	state.ps_input_info  = {};
 	state.mrt_mask       = 0;
 	state.aliased_passes = 0;
-	pipeline_cache.GetGraphicsPrograms(buffer, state, single_sample);
+	pipeline_cache.GetGraphicsPrograms(buffer, state, single_sample, nullptr, first);
 	// A skipped vertex program (host mesh limits) leaves the pixel program unselected.
 	if (!state.ps_active || !state.vertex_info[0].stage) {
 		return;
@@ -1299,7 +1302,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	const auto ps_address = buffer.GetShaders().GetPs().ps_regs.data_addr;
 	if (prepared == DrawPrepared::No) {
 		CpSplitProf::LookupScope lookup;
-		RefreshShaders(buffer, state, GuessSingleSample(ps_address));
+		RefreshShaders(buffer, state, GuessSingleSample(ps_address), true);
 	}
 	// Vertex programs the host cannot run are not compiled.
 	if (!state.vertex_info[0].stage) {
@@ -1773,15 +1776,8 @@ static void ColorAttachmentPassBarrier(vk::CommandBuffer vk_buffer) {
 
 // KYTY_ASYNC_PIPELINE: buffer, image or by-address writes, whose effects outlive this frame's colors.
 static bool DrawWritesAnything(const DrawRenderState& state) {
-	const auto writes = [](const ShaderStageRuntime& stage) {
-		// Conservative: a written buffer counts even when its descriptor is empty.
-		const auto& info    = stage.program->info;
-		const auto  written = [](const auto& resource) { return resource.written || resource.atomic; };
-		return stage.program->has_address_writes || std::ranges::any_of(info.buffers, written) ||
-		       std::ranges::any_of(info.images, written);
-	};
-	return std::ranges::any_of(state.VertexStages(), [&](const auto& vs) { return writes(vs.stage); }) ||
-	       (state.ps_active && writes(state.ps_input_info.stage));
+	return std::ranges::any_of(state.VertexStages(), [](const auto& vs) { return StageWritesAnything(vs.stage); }) ||
+	       (state.ps_active && StageWritesAnything(state.ps_input_info.stage));
 }
 
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
@@ -2435,10 +2431,14 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	CpPipeline::SetInLookup(true);
 	{
 		CpSplitProf::LookupScope lookup;
-		RefreshShaders(buffer, record.state, guessed);
+		RefreshShaders(buffer, record.state, guessed, true);
 	}
 	CpPipeline::SetInLookup(false);
 	const bool heap = CpPipeline::TakeHeapInline();
+	// KYTY_TESS_PRETRANSLATE: a skipped draw writes nothing, so queued records need not drain first.
+	if (!heap && record.state.tess_deferred) {
+		return true;
+	}
 	// A draw without a compiled vertex program is skipped inline, like the unqueued path does.
 	if (heap || !record.state.vertex_info[0].stage || DrawWritesMemory(record.state)) {
 		// Later lookups may read what this draw writes, and the image heap is per draw: run it here.

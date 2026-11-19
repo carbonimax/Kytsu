@@ -13,6 +13,8 @@ vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
 vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
+// Buffer, image or by-address writes from the program alone (async pipeline rules); `runtime.program` only.
+bool StageWritesAnything(const ShaderStageRuntime& runtime);
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages);

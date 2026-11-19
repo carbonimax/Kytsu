@@ -218,6 +218,11 @@ void NotePresentedFrame() noexcept {
 			const auto recent   = g_recent_frame_us.load(std::memory_order_relaxed);
 			g_recent_frame_us.store(recent == 0 ? interval : recent - recent / 8 + interval / 8,
 			                        std::memory_order_relaxed);
+			Add(interval < 41667   ? Counter::Frames33
+			    : interval < 58333 ? Counter::Frames50
+			    : interval < 75000 ? Counter::Frames67
+			                       : Counter::FramesLong,
+			    1);
 		}
 		last_us = now_us;
 	}
@@ -318,6 +323,19 @@ void MaybeReport() noexcept {
 		                static_cast<double>(std::max<uint64_t>(n(Counter::Frames), 1)),
 		            Config::TessellationEnabled() ? "drawn" : "skipped", n(Counter::TessPipelines),
 		            n(Counter::TessPipelineMisses), ms(Counter::TessPipelineMissNs));
+	}
+	std::printf("PERF frames %.1fs: f33=%" PRIu64 " f50=%" PRIu64 " f67=%" PRIu64 " flong=%" PRIu64 "\n",
+	            seconds, n(Counter::Frames33), n(Counter::Frames50), n(Counter::Frames67),
+	            n(Counter::FramesLong));
+	if (n(Counter::TessMissLs) + n(Counter::TessMissHs) + n(Counter::TessMissDs) +
+	        n(Counter::TessDeferredDraws) !=
+	    0) {
+		// miss/inline: draw-thread misses / of which translated there.
+		std::printf("PERF tessmiss %.1fs: ls=%" PRIu64 "/%" PRIu64 " hs=%" PRIu64 "/%" PRIu64 " ds=%" PRIu64
+		            "/%" PRIu64 " inline=%.0fms miss=%.0fms deferred_draws=%" PRIu64 "\n",
+		            seconds, n(Counter::TessMissLs), n(Counter::TessInlineLs), n(Counter::TessMissHs),
+		            n(Counter::TessInlineHs), n(Counter::TessMissDs), n(Counter::TessInlineDs),
+		            ms(Counter::TessInlineNs), ms(Counter::TessMissNs), n(Counter::TessDeferredDraws));
 	}
 	if (BindProfMode() != 0) {
 		std::printf("PERF bindback %.1fs: resolve=%.0fms targets=%.0fms pipeline=%.0fms vertex=%.0fms"
