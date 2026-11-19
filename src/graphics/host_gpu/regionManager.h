@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -28,9 +29,21 @@
 
 namespace Libs::Graphics {
 
+// KYTY_TRACKING_LOCK (default 1): owner check of TrackingSpinLock.
+//   0: OS thread id at every lock and unlock (the former path, also used before static init);
+//   1: thread id cached per thread, same check;
+//   2: no owner (a recursive lock spins forever, a non-owner unlock goes unnoticed).
+// Bit 4 (set from KYTY_MEMTRACK_PROF=1): acquisitions counted for the "PERF memtrack" line.
+// One value, so either path costs a single load and branch. Defined in memTrackProf.cpp.
+extern const uint32_t g_tracking_lock_flags;
+
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
+		if (g_tracking_lock_flags != 0) [[likely]] {
+			LockWith(g_tracking_lock_flags);
+			return;
+		}
 		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
@@ -48,12 +61,54 @@ public:
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
 	void unlock() noexcept {
-		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
-		m_owner.store(0, std::memory_order_relaxed);
+		const auto mode = g_tracking_lock_flags & 15u;
+		if (mode != 2) {
+			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) !=
+			                     (mode == 1 ? CachedThread() : CurrentThread()));
+			m_owner.store(0, std::memory_order_relaxed);
+		}
 		m_lock.clear(std::memory_order_release);
 	}
 
 private:
+	static void Pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#elif defined(_M_ARM64)
+		__yield();
+#elif defined(__aarch64__)
+		asm volatile("yield");
+#endif
+	}
+
+	void LockWith(uint32_t flags) noexcept {
+		const auto mode      = flags & 15u;
+		const auto thread    = mode == 1 ? CachedThread() : mode == 2 ? 0u : CurrentThread();
+		bool       contended = false;
+		while (m_lock.test_and_set(std::memory_order_acquire)) {
+			EXIT_NOT_IMPLEMENTED(mode != 2 && m_owner.load(std::memory_order_relaxed) == thread);
+			contended = true;
+			while (m_lock.test(std::memory_order_relaxed)) {
+				Pause();
+			}
+		}
+		if (mode != 2) {
+			m_owner.store(thread, std::memory_order_relaxed);
+		}
+		if ((flags & 16u) != 0) {
+			MemTrackProf::NoteTrackingLock(contended);
+		}
+	}
+
+	// Constant-initialized (no TLS guard); a thread id is never 0 (the "no owner" sentinel).
+	static uint32_t CachedThread() noexcept {
+		static thread_local uint32_t tid = 0;
+		if (tid == 0) [[unlikely]] {
+			tid = CurrentThread();
+		}
+		return tid;
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();

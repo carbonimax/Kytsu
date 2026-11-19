@@ -627,6 +627,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_barycentric.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &supported_barycentric;
 	}
+	const bool compute_derivatives_extension =
+	    HasExtension(device_extensions, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_derivatives {};
+	if (compute_derivatives_extension) {
+		compute_derivatives.pNext = supported_features2.pNext;
+		supported_features2.pNext = &compute_derivatives;
+	}
 	const bool device_fault_extension =
 	    HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
@@ -911,6 +918,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
+	}
+	// Compute shaders that query an image's LOD take derivatives over 2x2 quads.
+	if (compute_derivatives_extension && compute_derivatives.computeDerivativeGroupQuads) {
+		compute_derivatives.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &compute_derivatives;
 	}
 	if (graphics.device_fault_enabled) {
 		device_fault.pNext                   = const_cast<void*>(create_info.pNext);
@@ -1350,6 +1362,7 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
 		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+		                             VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
 		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);

@@ -1327,7 +1327,7 @@ void TestRebasedTextureMipViews() {
   auto view = make_view(4, 0);
   Check(view.data.address == 0x5032b23800 && view.mip_layout[0].pitch == 32 &&
             view.mip_layout[0].height == 16 &&
-            view.mip_layout[0].linear_pitch == 32 && view.LinearSize() == 0x1000,
+            view.LinearLayout().mips[0].pitch == 32 && view.LinearSize() == 0x1000,
         "captured 16x16 view changed its padded tiling or linear transfer size");
   view.data.address += 0x800;
   Check(view.MipOf(chain) == -1, "tail view accepted the following mip's address");
@@ -7767,8 +7767,13 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeBindingSizeOnly() {
   user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
   options.user_data = user_data;
   result = RecompileForTest(shader, options);
-  Check((DisassembleSpirvBinary(result.spirv).find("PackHalf2x16") !=
-         std::string::npos),
+  // KYTY_F16_STORE_RTZ=1 encodes in integers instead; 31744 = 0x7c00, the f16 infinity.
+  const char *rtz = std::getenv("KYTY_F16_STORE_RTZ");
+  const auto half_source = DisassembleSpirvBinary(result.spirv);
+  Check(rtz != nullptr && rtz[0] == '1'
+            ? half_source.find("PackHalf2x16") == std::string::npos &&
+                  half_source.find("%uint_31744") != std::string::npos
+            : half_source.find("PackHalf2x16") != std::string::npos,
         "formatted half-float store did not convert F32 to F16");
   CheckSpirvBinaryValidates(result.spirv);
 }

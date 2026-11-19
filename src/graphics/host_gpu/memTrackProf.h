@@ -53,6 +53,8 @@ enum class Counter : uint32_t {
 	InvalidateCount,  // non-fault invalidations (HLE writes, file reads, unmaps)
 	InvalidateBytes,
 	ReadAheadPages,   // KYTY_WRITE_FAULT_READAHEAD pages opened ahead of sequential writers
+	TrackingLocks,    // TrackingSpinLock acquisitions (memory tracker, texture cache)
+	TrackingLockContended, // of which found the lock taken
 	Count
 };
 
@@ -95,6 +97,8 @@ void NoteTextureHit() noexcept;
 void NoteFaultWait(uint64_t ns) noexcept;
 // A host protection change of `bytes` to `mode` that took `ns`.
 void NoteProtect(Prot mode, uint64_t bytes, uint64_t ns) noexcept;
+// One TrackingSpinLock acquisition (counted per thread, added to the totals every 1024).
+void NoteTrackingLock(bool contended) noexcept;
 
 // Called from the PerfStats report: prints the lines for the last `seconds`.
 void Report(double seconds, uint64_t frames) noexcept;
