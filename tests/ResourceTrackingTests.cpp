@@ -2086,6 +2086,232 @@ void TestGuardedDirectImageTable() {
   }
 }
 
+void TestLaneGuardedBitScanTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // s_cmp_lg_u32 -1, ff1; s_cselect_b64 exec, exec, 0: no branch tests the scan, the
+  // image's EXEC carries ff1 != -1 itself.
+  enum class Lanes { Scan, Exec, Unrelated, Unguarded };
+  const auto make_plan = [](Lanes lanes) {
+    Fixture fixture(ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *sample = fixture.AddBlock();
+    entry->AddBranch(sample);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = sample};
+    sample->terminator.kind = CFG::TerminatorKind::Return;
+    const auto mask = fixture.Emit(ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)}), Value(true)});
+    const auto exec = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(1u), Value(0u)}), Value(0u)});
+    const auto other = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(2u), Value(0u)}), Value(0u)});
+    const auto scan = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const auto valid = fixture.Emit(ValueOpcode::LogicalAnd,
+        {fixture.Emit(ValueOpcode::INotEqual32, {Value(0xffffffffu), scan}), exec});
+    const auto srt = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    std::array<Value, 2> pointer;
+    for (uint32_t word = 0; word < pointer.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      pointer[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {srt, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(memory, 0x20));
+    }
+    fixture.block = sample;
+    const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(344u)});
+    std::array<Value, 8> words;
+    const auto table = fixture.Address(pointer[0], pointer[1]);
+    for (uint32_t word = 0; word < 8u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x100));
+    }
+    const auto image = fixture.Image(words, 0x128);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto active = lanes == Lanes::Scan ? fixture.Emit(ValueOpcode::LogicalAnd, {valid, other})
+                        : lanes == Lanes::Exec ? fixture.Emit(ValueOpcode::LogicalAnd, {exec, other})
+                        : lanes == Lanes::Unrelated ? other
+                                                    : Value(true);
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), active},
+                 fixture.AddMemory(memory, 0x128));
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect && !indirect->selector.has_value() && indirect->table_offset == 344u &&
+              indirect->key_count.Resolve() == Value(32u),
+          "lane-guarded bit scan table lost its pointer or 32-key range");
+  };
+  make_plan(Lanes::Scan);
+  for (const auto lanes : {Lanes::Exec, Lanes::Unrelated, Lanes::Unguarded}) {
+    CheckFatal([&] { make_plan(lanes); }, "not a valid runtime value",
+               "bit scan table accepted lanes that do not exclude an empty mask");
+  }
+}
+
+void TestLoopSelectedSignedKey() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // for (i = 0; i < count; ++i) { key = sel[i]; if (key >= 0) sample(table[key]); }
+  enum class Guard { NonNegative, None, Unrelated, Inverted, SecondUnguarded, MinusOne };
+  const auto make_plan = [](Guard guard) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *use = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(exit);
+    header->AddBranch(body);
+    body->AddBranch(use);
+    if (guard != Guard::None) body->AddBranch(latch);
+    use->AddBranch(latch);
+    latch->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    use->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+    latch->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto index = Value(&phi);
+    const auto count = fixture.UserData(2);
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto active = fixture.Emit(ValueOpcode::INotEqual32, {local, Value(0u)}, 0, entry);
+    const auto in_range = fixture.Emit(ValueOpcode::SLessThan32, {index, count}, 0, header);
+    const auto allowed = fixture.Emit(ValueOpcode::LogicalAnd, {in_range, active}, 0, header);
+    header->condition = fixture.Emit(
+        ValueOpcode::ConditionRef,
+        {fixture.Emit(ValueOpcode::LogicalNot, {allowed}, 0, header)},
+        CFG::BranchCondition::ExecZero, header);
+    header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = exit, .false_block = body};
+    const auto step = fixture.Emit(ValueOpcode::IAdd32, {index, Value(1u)}, 0, latch);
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, step);
+
+    // s_load_dword key, s[0:1], i * 16 offset:0x40
+    fixture.block = body;
+    const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    MemoryInfo selector;
+    selector.kind = ResourceKind::ScalarAddress;
+    selector.offset = 0x40u;
+    const auto key = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {base, fixture.Emit(ValueOpcode::IMul32, {index, Value(16u)}), Value(0u), Value(true)},
+        fixture.AddMemory(selector, 0x100));
+    if (guard == Guard::None) {
+      body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = use};
+    } else {
+      // s_cmp_ge_i32 value, 0 (or -1); s_cbranch_scc0 latch
+      const auto tested = guard == Guard::Unrelated ? fixture.UserData(5) : key;
+      const auto limit = Value(guard == Guard::MinusOne ? UINT32_MAX : 0u);
+      const auto nonnegative = fixture.Emit(ValueOpcode::SGreaterThanEqual32, {tested, limit});
+      body->condition = fixture.Emit(
+          ValueOpcode::ConditionRef,
+          {guard == Guard::Inverted ? nonnegative
+                                    : fixture.Emit(ValueOpcode::LogicalNot, {nonnegative})},
+          CFG::BranchCondition::SccZero);
+      body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = latch, .false_block = use};
+    }
+
+    // s_load_dwordx8 image, s[0:1], (key << 5) + 0x400
+    const auto sample_table = [&](Block *destination, uint32_t pc) {
+      fixture.block = destination;
+      const auto offset = fixture.Emit(
+          ValueOpcode::IAdd32,
+          {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(0x400u)});
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < words.size(); ++word) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        memory.offset = word * sizeof(uint32_t);
+        words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                   {base, offset, Value(0u), Value(true)},
+                                   fixture.AddMemory(memory, pc));
+      }
+      const auto image = fixture.Image(words, pc);
+      const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+      MemoryInfo sample;
+      sample.kind = ResourceKind::Image;
+      sample.image_dimension = Decoder::ImageDimension::Dim2D;
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
+                   fixture.AddMemory(sample, pc));
+    };
+    sample_table(use, 0x110);
+    // The same table sampled again after the guarded block joins the skip edge.
+    if (guard == Guard::SecondUnguarded) sample_table(latch, 0x120);
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect && indirect->selector.has_value() && indirect->selector->stride == 16u &&
+              indirect->selector->offset == 0x40u && indirect->table_offset == 0x400u,
+          "loop-selected key was not planned as a pointer-backed selector");
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  // Selector words 1, -1, 0; records for keys -1, 0 and 1.
+  LinearTestMemory memory;
+  const auto word_at = [&](uint64_t address) { return (address - memory.base) / 4u; };
+  const uint32_t selectors[] = {1u, UINT32_MAX, 0u};
+  for (uint32_t i = 0; i < 3u; ++i) memory.words[word_at(0x1800u + 0x40u + i * 16u)] = selectors[i];
+  for (const uint32_t key : {UINT32_MAX, 0u, 1u}) {
+    const auto word = word_at(0x1800u + ((key * 32u + 0x400u) & 0xffffffffu));
+    memory.words[word] = 0x200u + (key + 1u);
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 6> user_data{0x1800u, 0u, 3u, 0u, 0u, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+  const auto materialize = [&](Guard guard, std::vector<uint32_t> &keys,
+                               std::vector<uint32_t> &descriptors) {
+    const auto plan = make_plan(guard);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "loop-selected image table did not materialize");
+    const auto mapping = specialization.images[0].indirect_mapping_offset;
+    keys.clear();
+    for (uint32_t entry = 0; entry < snapshot.flattened_srt[mapping]; ++entry)
+      keys.push_back(snapshot.flattened_srt[mapping + 1u + entry * 2u]);
+    descriptors.clear();
+    for (const auto &image : snapshot.images) descriptors.push_back(image.dwords[0]);
+  };
+  std::vector<uint32_t> keys, descriptors;
+  // The key >= 0 test keeps the record of key -1 away from the image.
+  materialize(Guard::NonNegative, keys, descriptors);
+  Check(keys == std::vector<uint32_t>{0u, 1u} &&
+            std::ranges::find(descriptors, 0x200u) == descriptors.end(),
+        "guarded negative selector produced an image candidate");
+  // Without that proof, key -1 addresses the record before the table like the SMEM read.
+  for (const auto guard : {Guard::None, Guard::Unrelated, Guard::Inverted,
+                           Guard::SecondUnguarded, Guard::MinusOne}) {
+    materialize(guard, keys, descriptors);
+    Check(keys == std::vector<uint32_t>{0u, 1u, UINT32_MAX} &&
+              std::ranges::find(descriptors, 0x200u) != descriptors.end(),
+          "negative selector did not read the record at its computed address");
+  }
+  // s_cmp_lt_i32: a negative count runs no iteration.
+  user_data[2] = UINT32_MAX;
+  materialize(Guard::NonNegative, keys, descriptors);
+  Check(keys.empty(), "signed loop count enumerated selectors past a negative bound");
+}
+
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Clamp { None, Right, Left, Dynamic };
@@ -2100,7 +2326,8 @@ void TestBoundedComputeImageLoop() {
   };
   const auto make_plan = [](Variant variant, bool material = false, uint32_t first = 0u,
                             Clamp clamp = Clamp::None, PostTest post = PostTest::None,
-                            uint32_t post_bound = 6u) {
+                            uint32_t post_bound = 6u, uint32_t proof_depth = 0u,
+                            uint32_t proof_width = 0u) {
     const bool post_test = post != PostTest::None;
     const bool diamond = variant >= Variant::GuardedDiamond;
     Fixture fixture(diamond ? ShaderType::Vertex : ShaderType::Compute);
@@ -2187,8 +2414,34 @@ void TestBoundedComputeImageLoop() {
                                        {variant == Variant::WrongGuard
                                             ? Value(0u) : key,
                                         count}, 0, compare);
-    const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
+    auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
                                              {local, Value(0u)}, 0, entry);
+    // Even-length chains preserve the lane mask but stress recursive proof
+    // evaluation. Put this operand first so excluding the bound cannot skip it.
+    for (uint32_t index = 0; index < proof_depth; ++index)
+      initial_active = fixture.Emit(ValueOpcode::LogicalNot, {initial_active}, 0, entry);
+    if (proof_width != 0u) {
+      std::vector<Value> left, right;
+      for (uint32_t index = 0; index < proof_width; ++index) {
+        left.push_back(fixture.Emit(ValueOpcode::IEqual32,
+            {fixture.UserData(3u + index), Value(0u)}, 0, entry));
+        right.push_back(fixture.Emit(ValueOpcode::IEqual32,
+            {fixture.UserData(3u + proof_width + index), Value(0u)}, 0, entry));
+      }
+      // Visit all left variables before the right variables. Equality of the
+      // two groups then has an exponential decision diagram in that order.
+      initial_active = left[0];
+      for (uint32_t index = 1; index < proof_width; ++index)
+        initial_active = fixture.Emit(ValueOpcode::LogicalOr,
+            {initial_active, left[index]}, 0, entry);
+      for (uint32_t index = 0; index < proof_width; ++index) {
+        const auto equal = fixture.Emit(ValueOpcode::SelectU1,
+            {left[index], right[index], fixture.Emit(ValueOpcode::LogicalNot,
+                {right[index]}, 0, entry)}, 0, entry);
+        initial_active = fixture.Emit(ValueOpcode::LogicalAnd,
+            {initial_active, equal}, 0, entry);
+      }
+    }
     if (forwarded && !post_test) {
       forward->AddBranch(incoming == forward ? header : incoming);
       forward->terminator = {.kind = CFG::TerminatorKind::Branch,
@@ -2298,7 +2551,10 @@ void TestBoundedComputeImageLoop() {
       const auto active = initial_active;
       const auto allowed = fixture.Emit(variant == Variant::Disjunction
                                            ? ValueOpcode::LogicalOr : ValueOpcode::LogicalAnd,
-                                        {in_range, active}, 0, header);
+                                        proof_depth == 0u && proof_width == 0u
+                                                          ? std::initializer_list<Value>{in_range, active}
+                                                          : std::initializer_list<Value>{active, in_range},
+                                        0, header);
       const bool nonzero = variant == Variant::Nonzero || variant == Variant::TrueEdge;
       auto condition = allowed;
       if (!nonzero)
@@ -2411,8 +2667,13 @@ void TestBoundedComputeImageLoop() {
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->selector.has_value() == material && indirect->table_offset == 0x6b0u,
           "bounded compute loop lost its image table");
+    // A nonzero post-tested start enumerates its keys from that start.
+    if (post_test && first != 0u)
+      Check(indirect->selector_first == Value(first) &&
+                indirect->key_count.Resolve() == Value(post_bound - first),
+            "post-tested image loop did not start its keys at the loop start");
     // A constant post-tested bound limits the key statically, so samples select heap slots.
-    if (post_test)
+    else if (post_test)
       Check(indirect->table_maximum == post_bound - 1u && indirect->table_scalar &&
                 indirect->key_count.IsEmpty(),
             "post-tested image loop did not bound its heap by the constant count");
@@ -2441,6 +2702,16 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::GuardedDiamond);
   make_plan(Variant::Forwarded);
   make_plan(Variant::ForwardedChain);
+  make_plan(Variant::Plain, false, 0u, Clamp::None, PostTest::None, 6u, 16u);
+  make_plan(Variant::Plain, false, 0u, Clamp::None, PostTest::None, 6u, 0u, 4u);
+  CheckFatal([&] { make_plan(Variant::Plain, false, 0u, Clamp::None, PostTest::None, 6u, 0u, 16u); },
+             "not a valid runtime value",
+             "oversized decision diagram was accepted as a loop proof");
+  for (const auto variant : {Variant::Plain, Variant::Nonzero, Variant::TrueEdge}) {
+    CheckFatal([&] { make_plan(variant, false, 0u, Clamp::None, PostTest::None, 6u, 512u); },
+               "not a valid runtime value",
+               "exhausted loop proof accepted a bound or failed to stop recursion");
+  }
   for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
                              Variant::ForwardedJoin, Variant::ForwardedBranch,
                              Variant::ForwardedIncrementBypass,
@@ -2484,9 +2755,11 @@ void TestBoundedComputeImageLoop() {
                "post-tested image loop accepted a nonpositive signed bound");
   CheckFatal([&] { post_test_plan(PostTest::Unsigned, 0u); }, "not a valid runtime value",
              "post-tested image loop accepted a zero unsigned bound");
-  for (const auto first : {1u, UINT32_MAX})
+  // A nonzero immediate start below the bound enumerates [first, bound).
+  post_test_plan(PostTest::Unsigned, 6u, 1u);
+  for (const auto first : {6u, UINT32_MAX})
     CheckFatal([&] { post_test_plan(PostTest::Unsigned, 6u, first); }, "not a valid runtime value",
-               "post-tested image loop accepted a nonzero or wrapping initial value");
+               "post-tested image loop accepted an initial value at or past its bound");
   CheckFatal([&] { post_test_plan(PostTest::Signed, 6u, 0u, Variant::WrongStep); },
              "not a valid runtime value", "post-tested image loop accepted a two-step induction");
 
@@ -3016,6 +3289,136 @@ void TestDescendingImageRange() {
     Check(!MaterializeResources(wide_plan, bitmap_runtime, snapshot, specialization),
           "an eight-word bitmap selector accepted a different record stride");
   }
+}
+
+void TestPostTestedImageLoop() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // A title's pixel shader: s_mov_b32 s48, 1; loop: s_load_dwordx8 from s48 << 5;
+  // two image_sample_l; s_add_i32 s48, s48, 1; s_cmp_lt_u32 s48, 16; s_cbranch_scc1 loop.
+  enum class Variant {
+    Unsigned, Signed, ZeroStart, StartAtLimit, NegativeSigned, WrongStep, FalseEdge, AnyLane
+  };
+  const auto make_plan = [](Variant variant, uint32_t start) {
+    Fixture fixture(ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *proxy = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(body);
+    body->AddBranch(latch);
+    latch->AddBranch(proxy);
+    proxy->AddBranch(header);
+    proxy->AddBranch(exit);
+    const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    for (auto *from : {entry, header, body, latch}) {
+      from->terminator = {.kind = CFG::TerminatorKind::Branch,
+                          .true_block = fixture.program.blocks[from->id + 1u]};
+    }
+    const bool false_edge = variant == Variant::FalseEdge;
+    proxy->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = false_edge ? exit : header,
+                         .false_block = false_edge ? header : exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto key = Value(&phi);
+    fixture.block = body;
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * sizeof(uint32_t);
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, offset, Value(0u), Value(true)},
+                                 fixture.AddMemory(memory, 0x588));
+    }
+    // The same descriptor is sampled twice.
+    for (const uint32_t pc : {0x604u, 0x610u}) {
+      const auto image = fixture.Image(words, pc);
+      const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+      MemoryInfo sample;
+      sample.kind = ResourceKind::Image;
+      sample.image_dimension = Decoder::ImageDimension::Dim2D;
+      fixture.Emit(ValueOpcode::ImageSampleRaw,
+                   {image, sampler, fixture.ImageAddress(), Value(true)},
+                   fixture.AddMemory(sample, pc));
+    }
+    const auto next = fixture.Emit(
+        ValueOpcode::IAdd32, {key, Value(variant == Variant::WrongStep ? 2u : 1u)}, 0, latch);
+    const auto in_range = fixture.Emit(
+        variant == Variant::Signed || variant == Variant::NegativeSigned
+            ? ValueOpcode::SLessThan32 : ValueOpcode::ULessThan32,
+        {next, Value(16u)}, 0, latch);
+    proxy->condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {in_range},
+        variant == Variant::AnyLane ? CFG::BranchCondition::VccNonZero
+                                    : CFG::BranchCondition::SccNonZero, latch);
+    phi.AddPhiOperand(entry, Value(start));
+    phi.AddPhiOperand(proxy, next);
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.images.size() == 1u,
+          "twice-sampled loop descriptor did not share one image binding");
+    for (const auto &image : fixture.program.info.images) {
+      const auto &indirect = fixture.program.descriptor_sources[image.source].indirect_descriptor;
+      Check(indirect && !indirect->selector.has_value() && indirect->table_offset == 0u &&
+                indirect->table_stride == 32u &&
+                // A zero start keeps the zero-based rule: samples select slots of a static heap.
+                (start == 0u ? indirect->selector_first.IsEmpty() &&
+                                   indirect->table_maximum == 15u && indirect->table_scalar &&
+                                   indirect->key_count.IsEmpty()
+                             : indirect->selector_first.Resolve() == Value(start) &&
+                                   indirect->key_count.Resolve() == Value(16u - start)),
+            "post-tested image loop lost its start or its bound");
+    }
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  auto plan = make_plan(Variant::Unsigned, 1u);
+  make_plan(Variant::Signed, 1u);
+  make_plan(Variant::ZeroStart, 0u);
+  make_plan(Variant::Unsigned, 15u);
+  for (const auto &[variant, start] :
+       {std::pair{Variant::StartAtLimit, 16u}, std::pair{Variant::StartAtLimit, 17u},
+        std::pair{Variant::NegativeSigned, UINT32_MAX}, std::pair{Variant::WrongStep, 1u},
+        std::pair{Variant::FalseEdge, 1u}, std::pair{Variant::AnyLane, 1u}}) {
+    CheckFatal([&] { make_plan(variant, start); }, "not a valid runtime value",
+               "post-tested image loop accepted keys outside its iteration range");
+  }
+
+  LinearTestMemory memory;
+  constexpr uint32_t table = 0x1800u;
+  for (uint32_t key = 0; key < 16u; ++key) {
+    const auto word = (table - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 2> user_data{table, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            !specialization.images.empty(),
+        "post-tested image loop did not materialize");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 15u && snapshot.flattened_srt[mapping + 1u] == 1u &&
+            snapshot.flattened_srt[mapping + 29u] == 15u &&
+            snapshot.images[0].dwords[0] == 0x101u,
+        "post-tested image loop did not enumerate keys 1 to 15");
+  Check(std::ranges::none_of(snapshot.images, [](const auto &image) {
+          return image.dwords[0] == 0x100u;
+        }),
+        "post-tested image loop read the record before its start value");
 }
 
 void TestUniformizedMaterialImageKeys() {
@@ -9340,6 +9743,158 @@ void TestConditionalIndirectImageMaterialization() {
         "taken indirect image branch did not require its descriptor table");
 }
 
+// A title's pixel shader (upstream #1004): a flat
+// interpolant selects a material record, s[0:3] holds the record table V#, and each
+// record points to its image and sampler tables (s_load_dwordx4 s[80:83], mat+160).
+std::unique_ptr<Fixture> MakeMaterialPointerChainFixture() {
+  auto fixture = std::make_unique<Fixture>(ShaderType::Pixel);
+  std::array<Value, 4> table_words;
+  for (uint32_t dword = 0; dword < 4; dword++) table_words[dword] = fixture->UserData(dword);
+  const auto table = fixture->Buffer(table_words, 0x80);
+  const auto flat = fixture->Emit(ValueOpcode::GetInterpolationParameter,
+                                  {Value(2u), Value(3u), Value(2u)});
+  const auto field = fixture->Emit(ValueOpcode::BitFieldUExtract, {flat, Value(16u), Value(16u)});
+  const auto index = fixture->Emit(ValueOpcode::ReadFirstLane, {field, Value(true)});
+  const auto record = fixture->Emit(ValueOpcode::ShiftLeftLogical32, {index, Value(3u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  std::array<Value, 2> pointer;
+  for (uint32_t dword = 0; dword < 2u; ++dword) {
+    scalar.offset = dword * 4u;
+    pointer[dword] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, record},
+                                   fixture->AddMemory(scalar, 0x80));
+  }
+  const auto load = [&](Value address, uint32_t offset, uint32_t pc) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = offset;
+    return fixture->Emit(ValueOpcode::LoadAddressU32,
+                         {address, Value(0u), Value(0u), Value(true)},
+                         fixture->AddMemory(memory, pc));
+  };
+  const auto material = fixture->Address(pointer[0], pointer[1]);
+  std::array<Value, 4> tables;
+  for (uint32_t dword = 0; dword < 4u; ++dword) tables[dword] = load(material, 160u + dword * 4u, 0x90);
+  // The record's constants V# (mat+208) stays a GPU-selected scalar buffer.
+  std::array<Value, 4> constant_words;
+  for (uint32_t dword = 0; dword < 4u; ++dword)
+    constant_words[dword] = load(material, 208u + dword * 4u, 0x98);
+  scalar.offset = 32u;
+  fixture->Emit(ValueOpcode::ReadConstBuffer, {fixture->Buffer(constant_words, 0x9c), Value(0u)},
+                fixture->AddMemory(scalar, 0x9c));
+  const auto images = fixture->Address(tables[0], tables[1]);
+  const auto samplers = fixture->Address(tables[2], tables[3]);
+  const auto sample = [&](uint32_t image_offset, uint32_t sampler_offset, uint32_t pc) {
+    std::array<Value, 8> image_words;
+    for (uint32_t dword = 0; dword < 8u; ++dword)
+      image_words[dword] = load(images, image_offset + dword * 4u, pc - 8u);
+    std::array<Value, 4> sampler_words;
+    for (uint32_t dword = 0; dword < 4u; ++dword)
+      sampler_words[dword] = load(samplers, sampler_offset + dword * 4u, pc - 4u);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture->Emit(ValueOpcode::ImageSampleRaw,
+                  {fixture->Image(image_words, pc), fixture->Sampler(sampler_words, pc),
+                   fixture->ImageAddress(), Value(true)},
+                  fixture->AddMemory(memory, pc));
+  };
+  sample(32u, 16u, 0x1d8);
+  sample(64u, 0u, 0x210);
+  return fixture;
+}
+
+void TestMaterialPointerChainImages() {
+  auto fixture = MakeMaterialPointerChainFixture();
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  Check(plan.info.images.size() == 2u && plan.info.samplers.size() == 2u,
+        "per-material image and sampler slots were not tracked");
+  std::array<uint32_t, 2> roots{};
+  for (uint32_t image = 0; image < 2u; ++image) {
+    const auto &indirect = plan.descriptor_sources[plan.info.images[image].source].indirect_descriptor;
+    Check(indirect && indirect->chain && indirect->chain->hops == std::vector<uint32_t>{160u} &&
+              indirect->selector && indirect->selector->stride == 8u &&
+              indirect->selector->offset == 0u,
+          "material image slot lost its pointer chain");
+    roots[indirect->table_offset == 32u ? 0u : 1u] = image;
+  }
+  Check(std::ranges::any_of(fixture->program.memory_info, [](const MemoryInfo &memory) {
+          return memory.kind == ResourceKind::IndirectBuffer;
+        }), "per-material constants are no longer a GPU-selected scalar buffer");
+
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  LinearTestMemory memory;
+  const auto word = [&](uint64_t address) -> uint32_t & { return memory.words[(address - 0x1000u) / 4u]; };
+  const auto put = [&](uint64_t address, uint32_t identity) {
+    auto value = descriptor;
+    value[0] += identity;
+    std::copy(value.begin(), value.end(), memory.words.begin() + (address - 0x1000u) / 4u);
+  };
+  // Records: 0 -> 0x1100, 1 -> 0x1200, 2 -> null. Both materials share one sampler table.
+  word(0x1000u) = 0x1100u;
+  word(0x1008u) = 0x1200u;
+  word(0x11a0u) = 0x1400u;
+  word(0x11a8u) = 0x1600u;
+  word(0x12a0u) = 0x1800u;
+  word(0x12a8u) = 0x1600u;
+  put(0x1420u, 0u);
+  put(0x1440u, 1u);
+  put(0x1820u, 2u);
+  put(0x1840u, 1u);
+  const std::array<uint32_t, 4> sampler0{0x11u, 0x22u, 0x33u, 0u};
+  const std::array<uint32_t, 4> sampler1{0x44u, 0x55u, 0x66u, 0u};
+  std::copy(sampler0.begin(), sampler0.end(), &word(0x1600u));
+  std::copy(sampler1.begin(), sampler1.end(), &word(0x1610u));
+  std::array<uint32_t, 4> user_data{0x1000u, 0u, 24u, 0u};
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 5u && snapshot.samplers.size() == 2u,
+        "material records did not materialize their image candidates");
+  const auto mapping = [&](uint32_t image) {
+    const auto offset = specialization.images[image].indirect_mapping_offset;
+    return std::vector<uint32_t>(snapshot.flattened_srt.begin() + offset,
+                                 snapshot.flattened_srt.begin() + offset + 7u);
+  };
+  Check(snapshot.images[roots[0]].dwords[0] == 0x20u && snapshot.images[roots[1]].dwords[0] == 0x21u &&
+            mapping(roots[0]) == std::vector<uint32_t>{3u, 0u, 0u, 1u, 1u, 2u, 2u} &&
+            mapping(roots[1]) == std::vector<uint32_t>{3u, 0u, 0u, 1u, 0u, 2u, 1u},
+        "material index did not map to its record's image");
+  Check(std::ranges::count_if(snapshot.images, [](const DescriptorValue &image) {
+          return std::ranges::all_of(image.dwords, [](uint32_t value) { return value == 0u; });
+        }) == 2u, "null material record did not select a null image");
+  for (uint32_t sampler = 0; sampler < 2u; ++sampler) {
+    const auto &words = snapshot.samplers[sampler].dwords;
+    Check(std::equal(sampler0.begin(), sampler0.end(), words.begin()) ||
+              std::equal(sampler1.begin(), sampler1.end(), words.begin()),
+          "shared material sampler was not materialized");
+  }
+  // Zeroed S#s of unused records are skipped. Records whose samplers differ, or a record
+  // table larger than the probe bound, are refused instead of guessing one material.
+  word(0x12a8u) = 0x1700u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            std::equal(sampler1.begin(), sampler1.end(), snapshot.samplers[0].dwords.begin()) !=
+                std::equal(sampler0.begin(), sampler0.end(), snapshot.samplers[0].dwords.begin()),
+        "a record with zeroed samplers replaced the shared sampler");
+  std::copy(sampler1.begin(), sampler1.end(), &word(0x1700u));
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "materials with different samplers specialized one sampler");
+  word(0x12a8u) = 0x1600u;
+  user_data[2] = 0xffffffffu;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unbounded material table was enumerated");
+}
+
 void TestShaderInfoCollection() {
   Fixture fixture;
   const auto handle = fixture.Buffer(
@@ -9682,7 +10237,10 @@ int main(int argc, char **argv) {
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("lane-guarded bit scan table", TestLaneGuardedBitScanTable);
+    Run("loop-selected signed key", TestLoopSelectedSignedKey);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
+    Run("post-tested image loop", TestPostTestedImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("indexed material image keys", TestIndexedMaterialImageKeys);
     Run("pointer-table indexed material keys", TestPointerTableIndexedMaterialKeys);
@@ -9731,6 +10289,7 @@ int main(int argc, char **argv) {
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
+    Run("material pointer chain images", TestMaterialPointerChainImages);
     Run("shader info collection", TestShaderInfoCollection);
     Run("image binding ABI", TestImageBindingAbi);
     Run("live shader data collection", TestLiveShaderDataCollection);

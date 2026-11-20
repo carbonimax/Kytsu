@@ -206,14 +206,21 @@ class LoopBoundProof {
 public:
 	LoopBoundProof(const Program& program, const Inst& induction, const Inst& bound)
 	    : m_program(program), m_induction(induction), m_bound(bound) {}
+	// An exhausted budget leaves the bound unproven; say so, a shader may now fail tracking here.
+	~LoopBoundProof() {
+		if (m_exhausted)
+			std::printf("Warning: shader 0x%016llx loop-bound proof exhausted its budget\n",
+			            static_cast<unsigned long long>(m_program.shader_hash));
+	}
 
 	bool Excludes(Value condition, bool positive) {
 		for (uint32_t incoming = 0; incoming < m_induction.NumArgs(); ++incoming) {
 			m_incoming = m_induction.PhiBlock(incoming);
 			m_current  = 1u + incoming;
-			if (Evaluate(condition, true) != (positive ? 0u : 1u)) return false;
+			const auto result = Evaluate(condition, true);
+			if (m_exhausted || result != (positive ? 0u : 1u)) return false;
 		}
-		return true;
+		return !m_exhausted;
 	}
 
 	bool SelectsRange(const Inst& selected, Value active, const Inst& candidate,
@@ -229,6 +236,8 @@ public:
 			return value;
 		};
 		const auto contains = [&](const auto& self, uint32_t node) -> uint32_t {
+			ProofStep step(*this);
+			if (!step) return 0u;
 			if (std::ranges::find(range_values, node) != range_values.end()) return 1u;
 			const auto entry = m_nodes[node];
 			if (entry.variable == UINT32_MAX) return 0u;
@@ -265,10 +274,30 @@ public:
 			allowed = Select(allowed, Evaluate(active, true), 0u);
 			if (Select(allowed, contains(contains, value), 1u) != 1u) return false;
 		}
-		return true;
+		return !m_exhausted;
 	}
 
 private:
+	// Shader expressions and decision diagrams can both be arbitrarily deep.
+	// Bound their shared recursion and total work, and reject the entire proof on
+	// exhaustion: a placeholder result must never establish a loop bound.
+	class ProofStep {
+	public:
+		explicit ProofStep(LoopBoundProof& proof): m_proof(proof) {
+			++m_proof.m_depth;
+			if (m_proof.m_depth > 128u || ++m_proof.m_steps > 65536u ||
+			    m_proof.m_nodes.size() > 16384u)
+				m_proof.m_exhausted = true;
+		}
+		~ProofStep() { --m_proof.m_depth; }
+		explicit operator bool() const { return !m_proof.m_exhausted; }
+		ProofStep(const ProofStep&)            = delete;
+		ProofStep& operator=(const ProofStep&) = delete;
+
+	private:
+		LoopBoundProof& m_proof;
+	};
+
 	struct Node {
 		uint32_t variable = UINT32_MAX;
 		uint32_t low = 0;
@@ -290,6 +319,8 @@ private:
 	}
 
 	uint32_t Select(uint32_t condition, uint32_t yes, uint32_t no) {
+		ProofStep step(*this);
+		if (!step) return 0u;
 		if (condition == 0u) return no;
 		if (condition == 1u || yes == no) return yes;
 		if (yes == 1u && no == 0u) return condition;
@@ -309,6 +340,8 @@ private:
 	}
 
 	uint32_t Compare(const Inst& inst, uint32_t left, uint32_t right) {
+		ProofStep step(*this);
+		if (!step) return 0u;
 		if (left == right) {
 			if (inst.GetOpcode() == ValueOpcode::IEqual32) return 1u;
 			if (inst.GetOpcode() == ValueOpcode::INotEqual32) return 0u;
@@ -333,6 +366,8 @@ private:
 	}
 
 	uint32_t Evaluate(Value value, bool current) {
+		ProofStep step(*this);
+		if (!step) return 0u;
 		value = value.Resolve();
 		if (value.IsImmediate()) {
 			if (value.GetType() == Type::U1) return value.U1() ? 1u : 0u;
@@ -411,6 +446,11 @@ private:
 	const Block* m_incoming = nullptr;
 	uint32_t m_current = 1;
 	uint32_t m_variables = 0;
+
+	uint32_t m_depth     = 0;
+	uint32_t m_steps     = 0;
+	bool     m_exhausted = false;
+
 	bool m_exclude_bound = true;
 	std::vector<Node> m_nodes {{}, {}};
 	std::vector<std::pair<Value, uint32_t>> m_literals;
@@ -1105,7 +1145,7 @@ private:
 				shared_image_heap = descriptor.dword_count == 8u &&
 				    (a.table_record_bytes != 0u || b.table_record_bytes != 0u);
 				if (a.selector != b.selector || a.table_maximum != b.table_maximum ||
-				    a.pointer_table != b.pointer_table ||
+				    a.pointer_table != b.pointer_table || a.chain != b.chain ||
 				    a.table_source != b.table_source ||
 				    (!shared_image_heap && (a.table_offset != b.table_offset ||
 				                           a.table_immediate != b.table_immediate ||
@@ -1134,6 +1174,8 @@ private:
 						current.indirect_descriptor->table_immediate = 0u;
 					}
 					current.indirect_descriptor->table_scalar |= descriptor.indirect_descriptor->table_scalar;
+					current.indirect_descriptor->selector_nonnegative &=
+					    descriptor.indirect_descriptor->selector_nonnegative;
 					current.indirect_descriptor->table_record_bytes = std::max(
 					    current.indirect_descriptor->table_record_bytes,
 					    descriptor.indirect_descriptor->table_record_bytes);
@@ -1908,19 +1950,24 @@ private:
 		return {};
 	}
 
-	uint32_t PostTestLoopMaximum(Value key) const {
-		const auto induction = MatchInduction(key, ZeroBased);
-		if (!induction) return UINT32_MAX;
+	// key = Phi [start, entry], [key + 1, latch] whose only way back to the header is the
+	// uniform true edge of (key + 1 < limit), with immediate start < limit. The test runs
+	// after the body, so every value of key, inside or after the loop, is in [start, limit).
+	bool PostTestLoopRange(Value key, uint32_t& first, uint32_t& limit) const {
+		const auto induction =
+		    MatchInduction(key, [](uint32_t, uint32_t step) { return step == 1u; });
+		if (!induction) return false;
 		const auto [phi, step, initial_arm] = *induction;
+		const auto start = phi->Arg(initial_arm).Resolve().U32();
 		const auto* incoming = phi->PhiBlock(initial_arm ^ 1u);
-		if (incoming == nullptr) return UINT32_MAX;
+		if (incoming == nullptr) return false;
 		for (const auto& use: step->Uses()) {
 			const auto* compare = use.user;
 			uint32_t bound = 0;
 			if (use.operand != 0u ||
 			    (compare->GetOpcode() != ValueOpcode::SLessThan32 &&
 			     compare->GetOpcode() != ValueOpcode::ULessThan32) ||
-			    !ImmediateU32(compare->Arg(1), bound) || bound == 0u ||
+			    !ImmediateU32(compare->Arg(1), bound) || start >= bound ||
 			    (compare->GetOpcode() == ValueOpcode::SLessThan32 && bound > INT32_MAX) ||
 			    !AvailableBefore(*step, *compare)) continue;
 			const auto accepts = [&](const EdgePredicate& edge) {
@@ -1932,12 +1979,20 @@ private:
 				// A guard before the increment may belong to the previous iteration.
 				return block == phi->Parent() || block == step->Parent();
 			}, accepts)) {
-				// Starting at zero, next < bound keeps the carried value in range;
+				// Starting below bound, next < bound keeps the carried value in range;
 				// incrementing bound - 1 cannot overflow either accepted comparison domain.
-				return bound - 1u;
+				first = start;
+				limit = bound;
+				return true;
 			}
 		}
-		return UINT32_MAX;
+		return false;
+	}
+
+	uint32_t PostTestLoopMaximum(Value key) const {
+		uint32_t first = 0, limit = 0;
+		if (!PostTestLoopRange(key, first, limit) || first != 0u) return UINT32_MAX;
+		return limit - 1u;
 	}
 
 	const Inst* BoundedLoop(Value key, const Block* use, const auto& accepts_bound,
@@ -2233,7 +2288,7 @@ private:
 		});
 	}
 
-	Value UnsignedResourceBound(Value key, const Inst& handle) const {
+	Value UnsignedResourceBound(Value key, const Inst& handle, bool finite_bitscan = false) const {
 		Value bound;
 		for (const auto& use: handle.Uses()) {
 			const auto& access = *use.user;
@@ -2244,8 +2299,9 @@ private:
 			// The access's own EXEC predicate proves the range for every accessing lane;
 			// an EXEC-nonzero branch alone only proves that some lane is active.
 			const auto active = access.Arg(access.NumArgs() - 1u);
-			auto candidate = UnsignedBound(active, key);
-			if (candidate.IsEmpty()) candidate = UnsignedBoundOnEntry(key, access.Parent(), false, active);
+			auto       candidate = UnsignedBound(active, key, true, finite_bitscan);
+			if (candidate.IsEmpty())
+				candidate = UnsignedBoundOnEntry(key, access.Parent(), finite_bitscan, active);
 			if (candidate.IsEmpty()) {
 				// A waterfall key inherits the local value's bound only where this same
 				// EXEC predicate proves both their equality and the local range. Otherwise
@@ -2498,6 +2554,57 @@ private:
 		return false;
 	}
 
+	// True when every path from the definition of key to block tests key >= 0.
+	bool NonnegativeOnEntry(Value key, const Block* block) const {
+		const auto* definition = key.Resolve().TryInstruction();
+		if (definition == nullptr || block == nullptr) return false;
+		return GuardedOnEntry(
+		    block, [&](const Block* at) { return at == definition->Parent(); },
+		    [&](const EdgePredicate& edge) {
+			    return edge.lanes == LaneQuantifier::All &&
+			           ConditionProvesNonnegative(edge.condition, edge.positive, key);
+		    });
+	}
+
+	// True when condition (or its negation when !positive) implies value >= 0 as a signed
+	// integer.
+	bool ConditionProvesNonnegative(Value condition, bool positive, Value value,
+	                                uint32_t depth = 0) const {
+		if (depth > 12u) return false;
+		const auto* test = SimplifyGuard(condition).TryInstruction();
+		if (test == nullptr) return false;
+		const auto op = test->GetOpcode();
+		if (op == ValueOpcode::LogicalNot && test->NumArgs() == 1u)
+			return ConditionProvesNonnegative(test->Arg(0), !positive, value, depth + 1u);
+		if (test->NumArgs() != 2u) return false;
+		if ((op == ValueOpcode::LogicalAnd && positive) ||
+		    (op == ValueOpcode::LogicalOr && !positive)) {
+			return ConditionProvesNonnegative(test->Arg(0), positive, value, depth + 1u) ||
+			       ConditionProvesNonnegative(test->Arg(1), positive, value, depth + 1u);
+		}
+		for (uint32_t arg = 0; arg < 2u; ++arg) {
+			uint32_t immediate = 0;
+			if (!ImmediateU32(test->Arg(arg ^ 1u), immediate) ||
+			    !EquivalentValue(m_program, test->Arg(arg), value))
+				continue;
+			// Lower bound the outcome implies on value; `left`: value is the left operand.
+			const bool             left = arg == 0u;
+			const auto             c    = static_cast<int64_t>(std::bit_cast<int32_t>(immediate));
+			std::optional<int64_t> bound;
+			if (op == ValueOpcode::SGreaterThanEqual32) {
+				if (left == positive) bound = left ? c : c + 1; // v >= c, or c >= v false
+			} else if (op == ValueOpcode::SGreaterThan32) {
+				if (left == positive) bound = left ? c + 1 : c; // v > c, or c > v false
+			} else if (op == ValueOpcode::SLessThan32) {
+				if (left != positive) bound = left ? c : c + 1; // v < c false, or c < v
+			} else if (op == ValueOpcode::SLessThanEqual32) {
+				if (left != positive) bound = left ? c + 1 : c; // v <= c false, or c <= v
+			}
+			if (bound && *bound >= 0) return true;
+		}
+		return false;
+	}
+
 	bool MatchScalarMaterialKey(Value key, DescriptorSource::IndirectDescriptor& indirect,
 	                            DescriptorSource& material_source, bool require_bound,
 	                            bool allow_scalar_domain = false) {
@@ -2513,6 +2620,7 @@ private:
 		DescriptorSource count_source;
 		uint32_t row_stride = 0;
 		uint32_t offset = 0, stride = 0;
+		bool             signed_count = false;
 		if (memory == nullptr || memory->offset > INT32_MAX ||
 		    !MemoryIndexBelongsTo(memory_index, *read)) return false;
 		const bool affine = MatchTableOffset(read->Arg(1), index, offset, stride) &&
@@ -2521,8 +2629,10 @@ private:
 		if (affine) {
 			workgroup_axis = WorkgroupAxis(index, &first);
 			const auto* bound = BoundedLoop(index, read->Parent());
-			if (bound != nullptr && bound->GetOpcode() == ValueOpcode::ULessThan32) {
+			if (bound != nullptr && (bound->GetOpcode() == ValueOpcode::ULessThan32 ||
+			                         bound->GetOpcode() == ValueOpcode::SLessThan32)) {
 				count = bound->Arg(1);
+				signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
 			} else if (workgroup_axis == UINT32_MAX && !require_bound) {
 				// Other bounded indices, such as bit scans, read the records up to their maximum;
 				// a bit scan of a nonzero mask load reads only the ranks its words set.
@@ -2590,6 +2700,7 @@ private:
 		indirect.selector = std::move(selector);
 		indirect.key_count = count;
 		indirect.workgroup_axis = workgroup_axis;
+		indirect.signed_count   = signed_count;
 		if (rows) indirect.selector->rows.emplace(
 		    DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows {
 		        .source = InternSource(count_source), .stride = row_stride});
@@ -3344,6 +3455,8 @@ private:
 			// Keep live descriptor payloads, but project descriptor-only SMEM onto
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
+			// A negative key that never reaches the image has no table record candidate.
+			indirect.selector_nonnegative = NonnegativeOnEntry(key, handle.Parent());
 		} else if (!sampler && !plan.table_indexed && table_source.dword_count == 4u &&
 		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true, true)) {
 			// Preserve the heap's byte-offset key so runtime geometry can choose the
@@ -3360,6 +3473,8 @@ private:
 			if (guarded_count.IsEmpty()) guarded_count = UnsignedResourceBound(key, handle);
 			// A runtime count can describe fewer rows than the mask's static bit range.
 			if (guarded_count.IsEmpty()) guarded_count = UnsignedBoundOnEntry(key, handle.Parent(), true);
+			// The accessing lanes may carry the scan's ff1 != -1 test themselves.
+			if (guarded_count.IsEmpty()) guarded_count = UnsignedResourceBound(key, handle, true);
 			if (!guarded_count.IsEmpty()) {
 				if (table_stride < plan.read_dwords * 4u || (table_stride & 3u) != 0u) return false;
 				// Materialization captures the count and descriptor reads; renderer alias
@@ -3397,6 +3512,11 @@ private:
 						indirect.selector_first = Value(first);
 						indirect.signed_count = false;
 					}
+				} else if (uint32_t limit = 0; PostTestLoopRange(key, first, limit) && first != 0u) {
+					// Enumerate the post-tested keys from their start value, so the record
+					// before it is not read.
+					indirect.selector_first = Value(first);
+					indirect.key_count = Value(limit - first);
 				}
 			}
 			if (indirect.key_count.IsEmpty() &&
@@ -3442,7 +3562,8 @@ private:
 			if (!plan.table_indexed) {
 				for (const auto& owner: m_indirect_descriptors) {
 					const auto& selected = *m_sources[owner.source].indirect_descriptor;
-					if (!selected.selector || !EquivalentValue(m_program, key, owner.key) ||
+					if (!selected.selector || selected.chain ||
+					    !EquivalentValue(m_program, key, owner.key) ||
 					    !std::ranges::all_of(handle.Uses(), [&](const Use& target) {
 						    const auto target_active = AccessPredicate(target, false);
 						    return !target_active.IsEmpty() &&
@@ -3540,6 +3661,128 @@ private:
 			selector.byte_ranges.erase(selector.byte_ranges.begin() + i);
 		}
 		indirect.selector = std::move(selector);
+		return true;
+	}
+
+	// One DWORD of a raw scalar load (s_load) at an immediate byte offset of a 64-bit address.
+	bool MatchPointerLoad(Value value, uint32_t& offset, const Inst*& address) {
+		const auto* read  = value.Resolve().TryInstruction();
+		uint32_t    index = 0, dynamic = 0;
+		const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+		if (memory == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+		    !ImmediateU32(read->Arg(1), dynamic) ||
+		    uint64_t {dynamic} + memory->offset > INT32_MAX || !MemoryIndexBelongsTo(index, *read))
+			return false;
+		offset  = dynamic + memory->offset;
+		address = read->Arg(0).Resolve().TryInstruction();
+		return address != nullptr && address->GetOpcode() == ValueOpcode::GetAddressResource &&
+		       address->NumArgs() == 2u;
+	}
+
+	// A material record selected by a GPU key holds the address of its descriptor tables:
+	// T# = *(*(V#[key * stride + offset]) + hop ...) + table_offset. The host enumerates
+	// every record of the runtime V# and maps the key to the descriptor it selects.
+	bool TryMakeMaterialChain(Inst& handle, const DescriptorSource& descriptor,
+	                          IndirectDescriptorPlan& plan) {
+		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
+		const auto width   = static_cast<uint32_t>(handle.NumArgs());
+		if ((!sampler && handle.GetOpcode() != ValueOpcode::GetImageResource) ||
+		    width != (sampler ? 4u : 8u) || descriptor.dword_count != width || m_shader_writes)
+			return false;
+		const auto equivalent = [&](const Inst* a, const Inst* b) {
+			return EquivalentValue(m_program, Value(const_cast<Inst*>(a)),
+			                       Value(const_cast<Inst*>(b)));
+		};
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.chain.emplace();
+		IndirectDescriptorPlan chain_plan;
+		chain_plan.read_dwords = width;
+		const Inst*            address = nullptr;
+		bool                   retain  = false;
+		for (uint32_t word = 0; word < width; ++word) {
+			uint32_t    offset  = 0;
+			const Inst* current = nullptr;
+			if (!MatchPointerLoad(descriptor.dwords[word], offset, current) ||
+			    (word != 0u && (!equivalent(current, address) ||
+			                    offset != indirect.table_offset + word * sizeof(uint32_t))))
+				return false;
+			if (word == 0u) indirect.table_offset = offset;
+			address                 = current;
+			const auto* read        = descriptor.dwords[word].Resolve().TryInstruction();
+			chain_plan.reads[word]  = read;
+			chain_plan.memory[word] = read->Flags<MemoryFlags>().index;
+			// Descriptor bytes that also feed shader arithmetic stay GPU loads.
+			retain |= std::ranges::any_of(read->Uses(), [&](const Use& use) {
+				return use.user->GetOpcode() != handle.GetOpcode();
+			});
+		}
+		Value            key;
+		DescriptorSource root;
+		for (uint32_t depth = 0;; ++depth) {
+			const auto  low = address->Arg(0), high = address->Arg(1);
+			uint32_t    low_offset = 0, high_offset = 0;
+			const Inst *low_address = nullptr, *high_address = nullptr;
+			if (MatchPointerLoad(low, low_offset, low_address) &&
+			    MatchPointerLoad(high, high_offset, high_address)) {
+				if (depth >= 4u || high_offset != low_offset + 4u ||
+				    !equivalent(low_address, high_address))
+					return false;
+				indirect.chain->hops.insert(indirect.chain->hops.begin(), low_offset);
+				address = low_address;
+				continue;
+			}
+			const auto* low_read  = low.Resolve().TryInstruction();
+			const auto* high_read = high.Resolve().TryInstruction();
+			uint32_t    low_index = 0, high_index = 0;
+			const auto* low_memory =
+			    low_read != nullptr ? ScalarReadMemory(*low_read, low_index) : nullptr;
+			const auto* high_memory =
+			    high_read != nullptr ? ScalarReadMemory(*high_read, high_index) : nullptr;
+			Value    high_key;
+			uint32_t stride = 0, high_stride = 0;
+			if (low_memory == nullptr || high_memory == nullptr ||
+			    low_read->GetOpcode() != ValueOpcode::ReadConstBuffer ||
+			    high_read->GetOpcode() != ValueOpcode::ReadConstBuffer ||
+			    !EquivalentValue(m_program, low_read->Arg(0), high_read->Arg(0)) ||
+			    !MemoryIndexBelongsTo(low_index, *low_read) ||
+			    !MemoryIndexBelongsTo(high_index, *high_read) ||
+			    !MatchTableOffset(low_read->Arg(1), key, low_offset, stride) ||
+			    !MatchTableOffset(high_read->Arg(1), high_key, high_offset, high_stride) ||
+			    !EquivalentValue(m_program, key, high_key) || stride != high_stride ||
+			    uint64_t {low_offset} + low_memory->offset > INT32_MAX ||
+			    uint64_t {high_offset} + high_memory->offset !=
+			        uint64_t {low_offset} + low_memory->offset + 4u ||
+			    ((low_offset + low_memory->offset) & 3u) != 0u || (stride & 3u) != 0u ||
+			    low_offset + low_memory->offset + 8u > stride ||
+			    ValidateRuntimeValue(m_program, key, RuntimeValueType::Integer) ||
+			    !MakeRuntimeTableSource(*low_read, root) || root.dword_count != 4u)
+				return false;
+			indirect.selector.emplace(DescriptorSource::IndirectDescriptor::SelectorRead {
+			    .source = UINT32_MAX, .stride = stride, .offset = low_offset + low_memory->offset});
+			break;
+		}
+		// A record pointer read directly from the V# is the nested pointer table's shape
+		// (TryMakeNestedDescriptor), which bounds its key. Chains add at least one hop, and
+		// zero pointers select null only while every read stays in the unmapped first page.
+		if (indirect.chain->hops.empty() ||
+		    uint64_t {indirect.table_offset} + width * sizeof(uint32_t) > 0x4000u ||
+		    std::ranges::any_of(indirect.chain->hops,
+		                        [](uint32_t hop) { return uint64_t {hop} + 8u > 0x4000u; }))
+			return false;
+		indirect.selector->source = InternSource(root);
+		indirect.table_source     = indirect.selector->source;
+		DescriptorSource chain_source;
+		chain_source.dword_count = width;
+		chain_source.dwords.fill(Value(0u));
+		std::copy_n(root.dwords.begin(), 4u, chain_source.dwords.begin());
+		chain_source.indirect_descriptor = std::move(indirect);
+		chain_plan.retain_reads = retain;
+		if (retain) chain_plan.reads.fill(nullptr);
+		chain_plan.handle = &handle;
+		chain_plan.source = InternSource(chain_source);
+		chain_plan.key    = key;
+		chain_plan.roots  = chain_source.dwords;
+		plan              = std::move(chain_plan);
 		return true;
 	}
 
@@ -4095,8 +4338,9 @@ private:
 					if (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
 					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
 					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
-					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
-					                  TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
+					    (!sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
+					    TryMakeMaterialChain(*handle, descriptor, plan) ||
+					    (!sampler && TryMakeIndirectBuffer(*handle, descriptor, plan))) {
 						for (const auto& previous: m_indirect_descriptors) {
 							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 							    !EquivalentValue(m_program, previous.key, plan.key))
@@ -4275,7 +4519,9 @@ private:
 		m_info.samplers.push_back({source, pc});
 		const auto root = static_cast<uint32_t>(m_info.samplers.size() - 1);
 		const auto* descriptor = Source(source);
-		if (descriptor != nullptr && descriptor->indirect_descriptor) {
+		// A material-chain sampler is one S# shared by every record; see MaterializeResources.
+		if (descriptor != nullptr && descriptor->indirect_descriptor &&
+		    !descriptor->indirect_descriptor->chain) {
 			const auto& sources = descriptor->indirect_descriptor->sources;
 			if (sources.empty()) return root;
 			std::vector<uint32_t> resources {root};
