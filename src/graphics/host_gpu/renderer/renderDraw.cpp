@@ -2407,10 +2407,11 @@ static_assert(std::is_trivially_copyable_v<DrawRenderState>); // filled with 0xa
 int DrawStateInPlaceMode() noexcept {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_DRAW_STATE_IN_PLACE");
-		const int   m     = value != nullptr ? std::atoi(value) : 0;
-		if (m == 1 || m == 2) std::printf("KYTY_DRAW_STATE_IN_PLACE=%d\n", m);
-		return m == 1 || m == 2 ? m : 0;
+		const int   m     = value != nullptr && (*value == '0' || *value == '2') ? *value - '0' : 1;
+		if (m != 1) std::printf("KYTY_DRAW_STATE_IN_PLACE=%d\n", m);
+		return m;
 	}();
+	// In-session A/B: arm 0 forces the old path (0), arm 1 keeps the default (1).
 	return mode == 1 && PerfStats::AbOff("draw_state_in_place") ? 0 : mode;
 }
 
