@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/emulatorConfig.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -8,6 +9,7 @@
 #include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -125,6 +127,14 @@ void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) n
 	Add(driver_cache_hit ? Counter::GfxPipelineHitNs : Counter::GfxPipelineMissNs, duration_ns);
 }
 
+void NoteTessPipeline(bool cache_miss, uint64_t duration_ns) noexcept {
+	Add(Counter::TessPipelines, 1);
+	if (cache_miss) {
+		Add(Counter::TessPipelineMisses, 1);
+		Add(Counter::TessPipelineMissNs, duration_ns);
+	}
+}
+
 uint64_t SteadyUs() noexcept {
 	return NowUs();
 }
@@ -197,6 +207,10 @@ bool AbOff(const char* flag) noexcept {
 	       std::strcmp(driven, flag) == 0;
 }
 
+bool AbArmOff() noexcept {
+	return g_ab_period != 0 && g_ab_arm.load(std::memory_order_relaxed) == 0;
+}
+
 void NotePresentedFrame() noexcept {
 	{
 		// Smoothed presentation interval (1/8 of each new interval), always kept: the GPU thread reads
@@ -208,6 +222,11 @@ void NotePresentedFrame() noexcept {
 			const auto recent   = g_recent_frame_us.load(std::memory_order_relaxed);
 			g_recent_frame_us.store(recent == 0 ? interval : recent - recent / 8 + interval / 8,
 			                        std::memory_order_relaxed);
+			Add(interval < 41667   ? Counter::Frames33
+			    : interval < 58333 ? Counter::Frames50
+			    : interval < 75000 ? Counter::Frames67
+			                       : Counter::FramesLong,
+			    1);
 		}
 		last_us = now_us;
 	}
@@ -300,6 +319,28 @@ void MaybeReport() noexcept {
 	std::printf("PERF staging %.1fs: write=%.1fms bytes=%.1fMB copies=%" PRIu64 "\n", seconds,
 	            ms(Counter::StagingWriteNs), static_cast<double>(n(Counter::StagingWriteBytes)) / 1048576.0,
 	            n(Counter::StagingWriteCount));
+	if (n(Counter::PatchDraws) + n(Counter::TessPipelines) != 0) {
+		std::printf("PERF tess %.1fs: patch_draws=%" PRIu64 " per_frame=%.1f %s pipelines=%" PRIu64
+		            " miss=%" PRIu64 "/%.0fms\n",
+		            seconds, n(Counter::PatchDraws),
+		            static_cast<double>(n(Counter::PatchDraws)) /
+		                static_cast<double>(std::max<uint64_t>(n(Counter::Frames), 1)),
+		            Config::TessellationEnabled() ? "drawn" : "skipped", n(Counter::TessPipelines),
+		            n(Counter::TessPipelineMisses), ms(Counter::TessPipelineMissNs));
+	}
+	std::printf("PERF frames %.1fs: f33=%" PRIu64 " f50=%" PRIu64 " f67=%" PRIu64 " flong=%" PRIu64 "\n",
+	            seconds, n(Counter::Frames33), n(Counter::Frames50), n(Counter::Frames67),
+	            n(Counter::FramesLong));
+	if (n(Counter::TessMissLs) + n(Counter::TessMissHs) + n(Counter::TessMissDs) +
+	        n(Counter::TessDeferredDraws) !=
+	    0) {
+		// miss/inline: draw-thread misses / of which translated there.
+		std::printf("PERF tessmiss %.1fs: ls=%" PRIu64 "/%" PRIu64 " hs=%" PRIu64 "/%" PRIu64 " ds=%" PRIu64
+		            "/%" PRIu64 " inline=%.0fms miss=%.0fms deferred_draws=%" PRIu64 "\n",
+		            seconds, n(Counter::TessMissLs), n(Counter::TessInlineLs), n(Counter::TessMissHs),
+		            n(Counter::TessInlineHs), n(Counter::TessMissDs), n(Counter::TessInlineDs),
+		            ms(Counter::TessInlineNs), ms(Counter::TessMissNs), n(Counter::TessDeferredDraws));
+	}
 	if (BindProfMode() != 0) {
 		std::printf("PERF bindback %.1fs: resolve=%.0fms targets=%.0fms pipeline=%.0fms vertex=%.0fms"
 		            " dynamic=%.0fms record=%.0fms flush=%.0fms(%" PRIu64 ")\n",

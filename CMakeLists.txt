@@ -552,6 +552,11 @@ add_executable(async_pipeline_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(async_pipeline_policy_tests PRIVATE ${inc_headers})
 
+add_executable(tess_pretranslate_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TessPretranslatePolicyTests.cpp"
+)
+target_include_directories(tess_pretranslate_policy_tests PRIVATE ${inc_headers})
+
 add_executable(staging_memory_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/StagingMemoryPolicyTests.cpp"
 )
@@ -868,6 +873,7 @@ if(BUILD_TESTING)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)
+	add_test(NAME tess_pretranslate_policy COMMAND $<TARGET_FILE:tess_pretranslate_policy_tests>)
 	add_test(NAME staging_memory_policy COMMAND $<TARGET_FILE:staging_memory_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
@@ -905,6 +911,10 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_negative_offset COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only negative-offset)
 	add_test(NAME shader_recompiler_div_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only div-f32)
 	add_test(NAME shader_recompiler_ds_minmax COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only ds-minmax)
+	add_test(NAME shader_recompiler_hw_rcp COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only rcp)
+	add_test(NAME shader_recompiler_f16_store_rtz COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-float16-store-only)
+	set_tests_properties(shader_recompiler_f16_store_rtz PROPERTIES ENVIRONMENT KYTY_F16_STORE_RTZ=1)
+	add_test(NAME shader_recompiler_hw_sincos COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only sincos)
 	add_test(NAME shader_recompiler_helper_quad
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-append-helper-quad-only)
 	add_test(NAME shader_recompiler_tessellation
@@ -931,6 +941,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
+	add_test(NAME graphics_depth_attachment_feedback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-depth-resource-only)
 	add_test(NAME shader_store
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-store-only)
 	add_test(NAME shader_store_key
@@ -981,7 +993,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME gpu_capture_replay
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-only)
-	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); skipped where it is unset.
+	add_test(NAME gpu_capture_replay_loop
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-loop-only)
+	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); where it is unset, generated synthetic
+	# captures (a replayable one and one with an unmappable range) take the same file path.
 	add_test(NAME gpu_capture_replay_local
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-replay-dir-only)
 	set_tests_properties(gpu_capture_replay_local PROPERTIES SKIP_REGULAR_EXPRESSION "GpuReplayDir skipped")
@@ -1058,6 +1073,7 @@ if(BUILD_TESTING)
 		aliased_color_pass_policy_tests
 		dispatch_chain_policy_tests
 		async_pipeline_policy_tests
+		tess_pretranslate_policy_tests
 		staging_memory_policy_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
@@ -1184,6 +1200,13 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+	if(BUILD_TESTING)
+		add_test(NAME launcher_settings COMMAND $<TARGET_FILE:launcher_settings_tests>)
+		# Windows: Qt's DLLs are not next to the test.
+		set_tests_properties(launcher_settings PROPERTIES
+		                     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
+		add_dependencies(kyty_tests launcher_settings_tests)
+	endif()
 
 	if(LINUX)
 		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)

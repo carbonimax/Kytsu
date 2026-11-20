@@ -52,8 +52,14 @@ uint32_t EnvU32(const char* name, uint32_t fallback) {
 // after this many, pretranslation stops.
 constexpr uint32_t MaxRetiredWorkers = 8;
 
-uint32_t WorkerCount() {
+uint32_t PixelWorkerCount() {
 	static const uint32_t count = std::min(EnvU32("KYTY_SHADER_PRETRANSLATE", 4), 16u);
+	return count;
+}
+
+uint32_t WorkerCount() {
+	static const uint32_t count =
+	    PixelWorkerCount() != 0 || EnvU32("KYTY_TESS_PRETRANSLATE", 0) == 0 ? PixelWorkerCount() : 2u;
 	return count;
 }
 
@@ -72,6 +78,13 @@ struct Job {
 	uint32_t              refills         = 0; // background translations of this key after a use
 	ShaderRecompiler::TranslateResult result; // result.program is empty when packed
 	ShaderRecompiler::IR::PackedProgram packed;
+	// KYTY_TESS_PRETRANSLATE jobs (LS, HS or DS): the draw thread's inputs, copied.
+	struct Tess {
+		ShaderVertexInputInfo            vertex;
+		ShaderRecompiler::CompileOptions options;
+		std::vector<uint32_t>            user_data;
+	};
+	std::unique_ptr<Tess> tess;
 };
 
 struct Stats {
@@ -80,6 +93,8 @@ struct Stats {
 	    queued_at_use {0}, remembered {0},
 	    code_changed {0}, evicted {0}, refills {0}, worker_us {0}, verified {0}, verify_diffs {0}, packed {0},
 	    unpacked_bytes {0}, packed_bytes {0}, pack_us {0}, unpack_us {0};
+	// KYTY_TESS_PRETRANSLATE: TakeTess outcomes; `tess_writes`: taken stages that write memory.
+	std::atomic<uint64_t> tess_queued {0}, tess_pending {0}, tess_taken {0}, tess_inline {0}, tess_writes {0};
 };
 
 struct Pool {
@@ -131,6 +146,18 @@ size_t EstimateBytes(const ShaderRecompiler::TranslateResult& result) {
 // translation inputs matter here, the emission options are the GPU thread's. False: the program has
 // calls, linked per draw.
 bool TranslateJob(const Job& job, ShaderRecompiler::TranslateResult* out) {
+	if (job.tess != nullptr) {
+		// What ProgramCache::Get does for a new LS, HS or DS program without calls.
+		auto options              = job.tess->options;
+		options.input_info.vertex = &job.tess->vertex;
+		options.user_data         = job.tess->user_data;
+		auto source               = ShaderRecompiler::PrepareShaderSource(job.code, options);
+		if (source.decoded.has_swap_pc) {
+			return false;
+		}
+		*out = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		return true;
+	}
 	std::array<uint32_t, HW::UserSgprInfo::SGPRS_MAX> user_data {};
 	ShaderRecompiler::CompileOptions options {.wave_size = job.info.wave_size};
 	options.stage             = ShaderType::Pixel;
@@ -287,7 +314,8 @@ void WorkerMain() {
 	}
 }
 
-// Pool lock held.
+// Pool lock held. Tessellation jobs (a skipped draw waits for them) go ahead of the pixel ones, in
+// draw order among themselves: LS, HS, DS of a draw, older draws first.
 void Enqueue(Pool& pool, std::shared_ptr<Job> job) {
 	if (pool.stopped) {
 		return;
@@ -295,7 +323,13 @@ void Enqueue(Pool& pool, std::shared_ptr<Job> job) {
 	job->order = pool.next_order++;
 	pool.ids.insert(job->id);
 	pool.jobs[job->id] = job;
-	pool.queue.push_back(std::move(job));
+	if (job->tess != nullptr) {
+		const auto last_tess = std::find_if(pool.queue.rbegin(), pool.queue.rend(),
+		                                    [](const auto& queued) { return queued->tess != nullptr; });
+		pool.queue.insert(last_tess.base(), std::move(job));
+	} else {
+		pool.queue.push_back(std::move(job));
+	}
 	if (pool.live_workers < WorkerCount()) {
 		StartWorker(pool);
 	}
@@ -305,11 +339,17 @@ void Enqueue(Pool& pool, std::shared_ptr<Job> job) {
 } // namespace
 
 bool Enabled() noexcept {
-	return WorkerCount() != 0;
+	return PixelWorkerCount() != 0;
+}
+
+bool TessEnabled() noexcept {
+	static const bool enabled = EnvU32("KYTY_TESS_PRETRANSLATE", 0) != 0;
+	return enabled;
 }
 
 bool VerifyEnabled() noexcept {
-	static const bool verify = Enabled() && EnvU32("KYTY_SHADER_PRETRANSLATE_VERIFY", 0) != 0;
+	static const bool verify =
+	    (Enabled() || TessEnabled()) && EnvU32("KYTY_SHADER_PRETRANSLATE_VERIFY", 0) != 0;
 	return verify;
 }
 
@@ -433,6 +473,77 @@ void Remember(uint64_t hash, std::span<const uint32_t> key, std::span<const uint
 	Enqueue(pool, std::move(job));
 }
 
+TessPretranslateTake TakeTess(uint64_t hash, std::span<const uint32_t> key, std::span<const uint32_t> code,
+                              const ShaderRecompiler::CompileOptions& options, const ShaderVertexInputInfo& info,
+                              ShaderRecompiler::TranslateResult& out, bool peek) {
+	auto&            pool = GetPool();
+	const auto       id   = XXH3_64bits_withSeed(key.data(), key.size_bytes(), hash);
+	std::unique_lock lock(pool.mutex);
+	const auto       it    = pool.jobs.find(id);
+	// Jobs left queued when pretranslation stopped are dropped but still listed.
+	const bool       found = it != pool.jobs.end() && it->second->state != State::Dropped;
+	const bool       held  = found && it->second->hash == hash && std::ranges::equal(it->second->key, key);
+	const auto       job   = held ? it->second : nullptr;
+	auto             take  = TessPretranslateDecide(held, held && job->state == State::Ready,
+	                                                held && std::ranges::equal(job->code, code),
+	                                                found || pool.ids.contains(id), pool.stopped);
+	if (peek) {
+		take = TessPretranslatePeek(take);
+		if (take != TessPretranslateTake::Queue) {
+			return take; // nothing taken, dropped or counted
+		}
+	}
+	switch (take) {
+		case TessPretranslateTake::Pending: pool.stats.tess_pending++; return take;
+		case TessPretranslateTake::Inline:
+			if (held) {
+				pool.stats.code_changed++;
+				job->result = {};
+				job->packed = {};
+				DropReady(pool, job);
+			}
+			pool.stats.tess_inline++;
+			return take;
+		case TessPretranslateTake::Queue: {
+			auto queued  = std::make_shared<Job>();
+			queued->hash = hash;
+			queued->id   = id;
+			queued->key.assign(key.begin(), key.end());
+			queued->code.assign(code.begin(), code.end());
+			// The draw thread's pointers and spans are replaced by the job's own copies.
+			queued->tess = std::make_unique<Job::Tess>(Job::Tess {
+			    .vertex    = info,
+			    .options   = options,
+			    .user_data = std::vector<uint32_t>(options.user_data.begin(), options.user_data.end()),
+			});
+			queued->tess->vertex.pixel_input        = nullptr;
+			queued->tess->vertex.stage              = {};
+			queued->tess->options.user_data         = {};
+			queued->tess->options.back_code         = {};
+			queued->tess->options.input_info.vertex = nullptr;
+			pool.stats.tess_queued++;
+			Enqueue(pool, std::move(queued));
+			return take;
+		}
+		case TessPretranslateTake::Ready: break;
+	}
+	out         = std::move(job->result);
+	auto packed = std::move(job->packed);
+	DropReady(pool, job);
+	pool.stats.tess_taken++;
+	lock.unlock();
+	if (packed.Packed()) {
+		const auto begin = PerfStats::SteadyUs();
+		out.program      = packed.Unpack();
+		pool.stats.unpack_us += PerfStats::SteadyUs() - begin;
+	}
+	return TessPretranslateTake::Ready;
+}
+
+void NoteTessWrites() noexcept {
+	GetPool().stats.tess_writes++;
+}
+
 void NoteVerify(bool equal) noexcept {
 	auto& pool = GetPool();
 	pool.stats.verified++;
@@ -442,6 +553,13 @@ void NoteVerify(bool equal) noexcept {
 }
 
 void Report() {
+	if (TessEnabled()) {
+		const auto& s = GetPool().stats;
+		std::printf("PERF tesspre queued=%" PRIu64 " pending=%" PRIu64 " taken=%" PRIu64 " inline=%" PRIu64
+		            " writes=%" PRIu64 " abandoned=%" PRIu64 " evicted=%" PRIu64 "\n",
+		            s.tess_queued.load(), s.tess_pending.load(), s.tess_taken.load(), s.tess_inline.load(),
+		            s.tess_writes.load(), s.abandoned.load(), s.evicted.load());
+	}
 	if (!Enabled()) {
 		return;
 	}

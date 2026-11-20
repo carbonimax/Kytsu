@@ -108,6 +108,14 @@ PFN_vkDestroyShaderModule         g_orig_vkDestroyShaderModule         = nullptr
 int  g_mode   = -1;
 bool g_submit = false;
 
+// KYTY_CP_RECORD_SPIN_TICKS: recorder spin before sleeping (TSC ticks; 0 = sleep at once, measured
+// slower: every resume then costs a wake).
+uint64_t g_spin_ticks = 1000000;
+// Mode 1, on unless KYTY_CP_RECORD_PUBLISH_PER_DRAW=0: publish g_write at draws, dispatches,
+// non-vkCmd calls and before any wait on the recorder, instead of after every command.
+bool                      g_per_draw = false;
+std::array<bool, F_Count> g_publishes {};
+
 std::atomic<VkCommandBuffer> g_target {VK_NULL_HANDLE};
 
 constexpr uint64_t RingBytes = uint64_t {8} << 20u;
@@ -143,6 +151,7 @@ struct ProducerStats {
 	uint64_t                      space_ticks  = 0;
 	uint64_t                      wakes        = 0;
 	uint64_t                      foreign      = 0;
+	uint64_t                      publishes    = 0;
 };
 ProducerStats                g_ps;
 std::atomic<uint64_t>        g_rec_busy_ticks {0};
@@ -184,14 +193,14 @@ void RecorderThread() {
 			// Spin ~250 us first: the GPU thread produces calls every few microseconds while busy.
 			const auto spin_start = Ticks();
 			bool       got        = false;
-			for (uint32_t i = 0;; i++) {
+			for (uint32_t i = 0; g_spin_ticks != 0; i++) {
 				CpuRelax();
 				write = g_write.load(std::memory_order_acquire);
 				if (write != read) {
 					got = true;
 					break;
 				}
-				if ((i & 63u) == 63u && Ticks() - spin_start > 1000000u) {
+				if ((i & 63u) == 63u && Ticks() - spin_start > g_spin_ticks) {
 					break;
 				}
 			}
@@ -228,6 +237,28 @@ inline bool OnGpuThread() noexcept {
 inline bool Captures(VkCommandBuffer buffer) noexcept {
 	return buffer == g_target.load(std::memory_order_relaxed) && buffer != VK_NULL_HANDLE &&
 	       OnGpuThread();
+}
+
+void PublishEnd() noexcept {
+	g_ps.publishes++;
+	// Store-load ordering with the recorder going to sleep (it stores g_sleeping, then loads g_write,
+	// both seq_cst): either it sees this end, or this load sees it asleep and wakes it under the sleep
+	// mutex, so the notification cannot fall between its check and its wait. Explicit, since neither
+	// x86 (store buffer) nor ARM64 orders a plain store before a later load.
+	g_write.store(g_head, std::memory_order_seq_cst);
+	// One notification per sleep.
+	if (g_sleeping.load(std::memory_order_seq_cst) &&
+	    g_sleeping.exchange(false, std::memory_order_acq_rel)) {
+		g_ps.wakes++;
+		Wake();
+	}
+}
+
+// Producer only: commands held back by the per-draw mode, published before any wait on g_read.
+void PublishHeld() noexcept {
+	if (g_per_draw && g_write.load(std::memory_order_relaxed) != g_head) {
+		PublishEnd();
+	}
 }
 
 void DrainFrom(uint64_t until) noexcept {
@@ -269,6 +300,7 @@ inline void Barrier(VkCommandBuffer buffer, uint32_t func) noexcept {
 	}
 	g_ps.trapped[func]++;
 	g_ps.drains++;
+	PublishHeld();
 	DrainFrom(g_head);
 }
 
@@ -278,6 +310,7 @@ uint8_t* Allocate(uint64_t bytes) noexcept {
 	const uint64_t pad    = offset + bytes > RingBytes ? RingBytes - offset : 0;
 	if (g_head + pad + bytes - g_read_seen > RingBytes &&
 	    g_head + pad + bytes - (g_read_seen = g_read.load(std::memory_order_acquire)) > RingBytes) {
+		PublishHeld();
 		const auto t0 = Ticks();
 		while (g_head + pad + bytes - g_read.load(std::memory_order_acquire) > RingBytes) {
 			if (g_sleeping.load(std::memory_order_relaxed)) {
@@ -309,17 +342,10 @@ void Publish(Header* header, uint32_t func) noexcept {
 		g_read.store(read, std::memory_order_relaxed);
 		return;
 	}
-	// Store-load ordering with the recorder going to sleep (it stores g_sleeping, then loads g_write,
-	// both seq_cst): either it sees this end, or this load sees it asleep and wakes it under the sleep
-	// mutex, so the notification cannot fall between its check and its wait. Explicit, since neither
-	// x86 (store buffer) nor ARM64 orders a plain store before a later load.
-	g_write.store(g_head, std::memory_order_seq_cst);
-	// One notification per sleep.
-	if (g_sleeping.load(std::memory_order_seq_cst) &&
-	    g_sleeping.exchange(false, std::memory_order_acq_rel)) {
-		g_ps.wakes++;
-		Wake();
+	if (g_per_draw && !g_publishes[func]) {
+		return;
 	}
+	PublishEnd();
 }
 
 // Bump allocation inside one command's block.
@@ -1351,13 +1377,24 @@ void Install(vk::Device device) {
 		const char* submit = std::getenv("KYTY_CP_RECORD_SUBMIT");
 		g_submit           = submit == nullptr || std::strtol(submit, nullptr, 10) != 0;
 		g_ring = static_cast<uint8_t*>(::operator new(RingBytes, std::align_val_t {64}));
+		if (const char* spin = std::getenv("KYTY_CP_RECORD_SPIN_TICKS"); spin != nullptr) {
+			g_spin_ticks = std::strtoull(spin, nullptr, 10);
+		}
+		const char* per_draw = std::getenv("KYTY_CP_RECORD_PUBLISH_PER_DRAW");
+		g_per_draw = Mode() == 1 && (per_draw == nullptr || std::strtol(per_draw, nullptr, 10) != 0);
+		for (uint32_t i = 0; i < F_Count; i++) {
+			const char* name = g_func_names[i];
+			g_publishes[i]   = std::strncmp(name, "vkCmd", 5) != 0 || std::strncmp(name, "vkCmdDraw", 9) == 0 ||
+			                 std::strncmp(name, "vkCmdDispatch", 13) == 0;
+		}
 		InstallCaptures(d);
 	}
 	if (Mode() == 1) {
 		std::thread(RecorderThread).detach();
 	}
-	std::printf("PERF cmdrec: mode %d installed (ring %" PRIu64 " MiB, submit %d)\n", Mode(),
-	            RingBytes >> 20u, g_submit ? 1 : 0);
+	std::printf("PERF cmdrec: mode %d installed (ring %" PRIu64 " MiB, submit %d, spin %" PRIu64
+	            " ticks, publish per draw %d)\n",
+	            Mode(), RingBytes >> 20u, g_submit ? 1 : 0, g_spin_ticks, g_per_draw ? 1 : 0);
 	std::fflush(stdout);
 }
 
@@ -1370,12 +1407,16 @@ void SetTarget(vk::CommandBuffer buffer) noexcept {
 void Drain() noexcept {
 	if ((g_mode == 1 || g_mode == 2) && OnGpuThread()) {
 		g_ps.drains++;
+		PublishHeld();
 		DrainFrom(g_head);
 	}
 }
 
 void DrainAll() noexcept {
 	if (g_mode == 1 || g_mode == 2) {
+		if (OnGpuThread()) {
+			PublishHeld();
+		}
 		DrainFrom(g_write.load(std::memory_order_acquire));
 	}
 }
@@ -1457,12 +1498,12 @@ void Report(double seconds) {
 		std::printf("PERF cmdrec %.1fs: deferred=%" PRIu64 " (%.1f MiB) recorded=%" PRIu64
 		            " recorder_busy=%.1fms drains=%" PRIu64 " drain_waits=%" PRIu64
 		            " drain_wait=%.1fms space_waits=%" PRIu64 "/%.1fms wakes=%" PRIu64
-		            " sleeps=%" PRIu64 " foreign=%" PRIu64 " trapped=%" PRIu64 ":%s\n",
+		            " sleeps=%" PRIu64 " publishes=%" PRIu64 " foreign=%" PRIu64 " trapped=%" PRIu64 ":%s\n",
 		            seconds, deferred, static_cast<double>(g_ps.bytes) / (1024.0 * 1024.0),
 		            g_rec_commands.exchange(0, std::memory_order_relaxed),
 		            ms(g_rec_busy_ticks.exchange(0, std::memory_order_relaxed)), g_ps.drains,
 		            g_ps.drain_waits, ms(g_ps.drain_ticks), g_ps.space_waits, ms(g_ps.space_ticks),
-		            g_ps.wakes, g_rec_sleeps.exchange(0, std::memory_order_relaxed),
+		            g_ps.wakes, g_rec_sleeps.exchange(0, std::memory_order_relaxed), g_ps.publishes,
 		            g_foreign_total.load(std::memory_order_relaxed), trapped, line.c_str());
 	}
 	g_ps = {};

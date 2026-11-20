@@ -79,8 +79,8 @@ public:
 	static constexpr int MIN_SCREEN_SIZE = 320;
 	static constexpr int MAX_SCREEN_SIZE = 16384;
 
-	// Written with every configuration; 1 = shader store on by default.
-	static constexpr int SETTINGS_VERSION = 1;
+	// Written with every configuration; 1 = shader store on by default, 2 = tessellation on by default.
+	static constexpr int SETTINGS_VERSION = 2;
 
 	static QString NormalizeResolution(const QString& text);
 
@@ -129,7 +129,7 @@ public:
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	int                    flush_draws                 = 0;
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true;
 	bool                   recommended_options         = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   shader_cache_enabled        = true;
