@@ -1074,9 +1074,9 @@ void NoteBindStats(BufferCache& cache, PreparedBindings::BufferSlotStats& slot,
 	        cache.BufferSetEpoch(), info, offset, kind, kept};
 }
 
-// KYTY_BIND_MEMO (default 0): buffer slot memo, after pengui07/KytyPS5 (Petr, GPL-2.0).
-//   0: every slot looks its buffer up (FindBuffers) and binds it (RebindBuffers) at each draw;
-//   1: a slot keeps its source while its V# and slot metadata, the buffer set and the guest virtual
+// KYTY_BIND_MEMO (default 1): buffer slot memo, after pengui07/KytyPS5 (Petr, GPL-2.0).
+//   0: off: every slot looks its buffer up (FindBuffers) and binds it (RebindBuffers) at each draw;
+//   1 (default): a slot keeps its source while its V# and slot metadata, the buffer set and the guest virtual
 //      ranges are unchanged, and keeps its plain-read binding while its range, the buffer set and the
 //      CPU-dirty epochs of the 64 KiB blocks it covers are unchanged; in-session A/B:
 //      KYTY_AB_FLAG=bind_memo (arm 0 = off). Entries left during an off arm stay exact: every input
@@ -1087,13 +1087,13 @@ void NoteBindStats(BufferCache& cache, PreparedBindings::BufferSlotStats& slot,
 int BindMemoMode(const BufferCache& cache) {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_BIND_MEMO");
-		const int   m     = value == nullptr ? 0 : std::atoi(value);
-		if (m != 0) {
+		const int   m     = value == nullptr ? 1 : std::atoi(value);
+		if (value != nullptr) {
 			std::printf("KYTY_BIND_MEMO=%d\n", m);
 		}
 		return m;
 	}();
-	if (mode == 0 || cache.ImportActive() || LateRead::Enabled() || GpuCapture::Enabled()) [[likely]] {
+	if (mode == 0 || cache.ImportActive() || LateRead::Enabled() || GpuCapture::Enabled()) [[unlikely]] {
 		return 0;
 	}
 	return mode == 1 && PerfStats::AbOff("bind_memo") ? 0 : mode;
