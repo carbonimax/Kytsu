@@ -4,6 +4,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -89,6 +90,14 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
 	}
 	return has_writes;
+}
+
+bool StageWritesAnything(const ShaderStageRuntime& runtime) {
+	// Conservative: a written buffer counts even when its descriptor is empty.
+	const auto& info    = runtime.program->info;
+	const auto  written = [](const auto& resource) { return resource.written || resource.atomic; };
+	return runtime.program->has_address_writes || std::ranges::any_of(info.buffers, written) ||
+	       std::ranges::any_of(info.images, written);
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

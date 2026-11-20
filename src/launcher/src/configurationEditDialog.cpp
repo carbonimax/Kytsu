@@ -323,6 +323,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_recommended_options->setChecked(info.recommended_options);
 	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries_enabled);
 	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
+	m_ui->checkBox_native_rt->setChecked(info.native_rt);
 	m_ui->checkBox_shader_cache->setChecked(info.shader_cache_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
@@ -434,6 +435,9 @@ void ConfigurationEditDialog::InitGameDirectories() {
 		}
 	});
 
+	m_show_activity_check = new QCheckBox(tr("Show latest activity in the grid view"), m_game_dirs_group);
+	group_layout->addWidget(m_show_activity_check);
+
 	m_ui->gridLayout->addWidget(m_game_dirs_group, 1, 0, 1, 1);
 	m_game_dirs_group->setVisible(false);
 
@@ -504,6 +508,14 @@ void ConfigurationEditDialog::ShowTab(QWidget* page) {
 			return;
 		}
 	}
+}
+
+void ConfigurationEditDialog::SetShowLatestActivity(bool show) {
+	m_show_activity_check->setChecked(show);
+}
+
+bool ConfigurationEditDialog::GetShowLatestActivity() const {
+	return m_show_activity_check->isChecked();
 }
 
 QString ConfigurationEditDialog::GetAddonsDirectory() const {
@@ -580,6 +592,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.recommended_options       = ui.checkBox_recommended_options->isChecked();
 	info.occlusion_queries_enabled = ui.checkBox_occlusion_queries->isChecked();
 	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
+	info.native_rt                 = ui.checkBox_native_rt->isChecked();
 	info.shader_cache_enabled      = ui.checkBox_shader_cache->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();

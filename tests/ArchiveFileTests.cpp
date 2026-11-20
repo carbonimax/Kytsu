@@ -430,6 +430,21 @@ void CheckExfatImage(const std::filesystem::path &directory) {
             Common::File::IsFileExisting(broken_chain_root / "eboot.bin") &&
             !Common::File::IsFileExisting(broken_chain_root / "fragmented-member-name.bin"),
         "exFAT rejects a bad boot sector, bad geometry and a broken cluster chain");
+
+  // The UTF-16 name of the root entry in cluster 11 starts at byte 66 of that cluster.
+  constexpr size_t UnicodeName = 11 * 512 + 66;
+  auto lone_surrogate = good;
+  lone_surrogate[UnicodeName] = 0x00;
+  lone_surrogate[UnicodeName + 1] = 0xd8; // High surrogate followed by a plain unit.
+  auto trailing_surrogate = good;
+  trailing_surrogate[UnicodeName + 12] = 0xff;
+  trailing_surrogate[UnicodeName + 13] = 0xdb; // High surrogate as the last unit.
+  Check(!Common::File::IsFileExisting(
+            Common::MakeArchivePath(write("lone-surrogate.exfat", lone_surrogate)) / "eboot.bin") &&
+            !Common::File::IsFileExisting(
+                Common::MakeArchivePath(write("trailing-surrogate.exfat", trailing_surrogate)) /
+                "eboot.bin"),
+        "exFAT rejects a directory with a malformed UTF-16 name");
 }
 
 } // namespace

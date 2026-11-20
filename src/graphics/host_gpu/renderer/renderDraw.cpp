@@ -392,7 +392,9 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 #if !defined(__APPLE__)
 	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
 	if (depth.depth_bounds_test_enable) {
-		dynamic_state.SetDepthBounds(ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax());
+		// Without VK_EXT_depth_range_unrestricted the bounds must lie in [0, 1].
+		dynamic_state.SetDepthBounds(std::clamp(ctx.GetDepthBoundsMin(), 0.0f, 1.0f),
+		                             std::clamp(ctx.GetDepthBoundsMax(), 0.0f, 1.0f));
 	}
 #endif
 
@@ -788,8 +790,20 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 	const LateRead::Scope late_read(LateRead::Site::Vertex);
 	for (auto& range: merged_ranges) {
 		// PPSA20298
+		// A vertex buffer the game names before the region is backed is not an error: on the
+		// hardware an unbacked range reads zero and drops writes, so binding nothing reproduces it.
 		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		    Libs::LibKernel::Memory::TryClampRangeSize(range.base_address, range.RequestedSize());
+		if (size == 0) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("PreparedVertexBuffers: vertex buffer range outside mapped memory: "
+				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     range.base_address, range.RequestedSize());
+			}
+			range.acquired_end = range.base_address;
+			continue;
+		}
 		range.acquired_end = range.base_address + size;
 		std::tie(range.buffer, range.offset) = cache.ObtainBuffer(range.base_address, size, false);
 	}
@@ -800,7 +814,14 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
 		const auto  size   = sizes[i];
-		if (size == 0) {
+		// A slot in a merged range with nothing mapped at its base binds nothing, like size 0.
+		const bool unbacked = std::any_of(
+		    merged_ranges.begin(), merged_ranges.begin() + merged_count,
+		    [&](const VertexBufferRange& value) {
+			    return value.acquired_end == value.base_address &&
+			           vertex.addr >= value.base_address && vertex.addr < value.requested_end;
+		    });
+		if (size == 0 || unbacked) {
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
 			}
@@ -870,6 +891,13 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 	return true;
 }
 
+// KYTY_PERF_STATS: once per draw, drawn or skipped ("PERF tess" line).
+static void NotePatchDraw(const HW::UserConfig& ucfg) {
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		PerfStats::Add(PerfStats::Counter::PatchDraws, 1);
+	}
+}
+
 static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
                                     const DrawIndexBufferSource& source) {
 	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
@@ -922,13 +950,16 @@ bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderD
 // Selects the draw's shader programs (PipelineCache::GetGraphicsPrograms). Slots bound to
 // identical CB registers that the PS really exports share one attachment: the pixel program is
 // then selected again with the merge.
-static void RefreshShaders(CommandBuffer& buffer, DrawRenderState& state, bool single_sample) {
+// `first`: the draw's first lookup, whose caller skips the draw without a vertex program
+// (KYTY_TESS_PRETRANSLATE may then leave new tessellation stages to workers); re-lookups find them.
+static void RefreshShaders(CommandBuffer& buffer, DrawRenderState& state, bool single_sample,
+                           bool first = false) {
 	auto& ctx            = buffer.GetRegisters();
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
 	state.ps_input_info  = {};
 	state.mrt_mask       = 0;
 	state.aliased_passes = 0;
-	pipeline_cache.GetGraphicsPrograms(buffer, state, single_sample);
+	pipeline_cache.GetGraphicsPrograms(buffer, state, single_sample, nullptr, first);
 	// A skipped vertex program (host mesh limits) leaves the pixel program unselected.
 	if (!state.ps_active || !state.vertex_info[0].stage) {
 		return;
@@ -1184,8 +1215,7 @@ static bool SameDesc(const TextureCache::ImageDesc& a, const TextureCache::Image
 	       x.guest_format == y.guest_format && x.type == y.type && x.extent == y.extent &&
 	       x.resources == y.resources && x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
 	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.bgra16 == y.bgra16 &&
-	       x.tiled_slice_stride == y.tiled_slice_stride && x.linear_slice_stride == y.linear_slice_stride &&
-	       x.first_tail_level == y.first_tail_level;
+	       x.tiled_slice_stride == y.tiled_slice_stride && x.first_tail_level == y.first_tail_level;
 }
 
 static bool SameColor(const RenderColorInfo& a, const RenderColorInfo& b) {
@@ -1292,7 +1322,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	const auto ps_address = buffer.GetShaders().GetPs().ps_regs.data_addr;
 	if (prepared == DrawPrepared::No) {
 		CpSplitProf::LookupScope lookup;
-		RefreshShaders(buffer, state, GuessSingleSample(ps_address));
+		RefreshShaders(buffer, state, GuessSingleSample(ps_address), true);
 	}
 	// Vertex programs the host cannot run are not compiled.
 	if (!state.vertex_info[0].stage) {
@@ -1707,7 +1737,6 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
 	EXIT_NOT_IMPLEMENTED(
-	    !m_context.GetGraphics().maintenance8_enabled ||
 	    !Prospero::IsRectList(ucfg.GetPrimType()) || draw.indexed || draw.index_count != 3 ||
 	    draw.instance_count != 1 || emit.vertex_offset != 0 || emit.first_instance != 0 ||
 	    state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
@@ -1730,7 +1759,21 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	                     destination.backing.format != vk::Format::eR32Sfloat);
 	const auto rect = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
 	                                    {rendering.width, rendering.height}, 0);
-	if (rect.right > rect.left && rect.bottom > rect.top) {
+	if (rect.right > rect.left && rect.bottom > rect.top &&
+	    !m_context.GetGraphics().maintenance8_enabled) {
+		// A depth-to-color vkCmdCopyImage needs maintenance8: without it, only a full single-level
+		// surface is copied, through a buffer (the bits are kept, no conversion).
+		EXIT_NOT_IMPLEMENTED(rect.left != 0 || rect.top != 0 ||
+		                     rect.right != static_cast<int>(source.backing.extent.width) ||
+		                     rect.bottom != static_cast<int>(source.backing.extent.height) ||
+		                     source.backing.extent != destination.backing.extent ||
+		                     source.backing.mip_levels != 1 || destination.backing.mip_levels != 1 ||
+		                     source.backing.layers != 1 || destination.backing.layers != 1 ||
+		                     depth.desc.view_info.base_level != 0 || depth.desc.view_info.base_layer != 0 ||
+		                     color.desc.view_info.base_level != 0 || color.desc.view_info.base_layer != 0);
+		buffer.EndRendering();
+		cache.CopyImageThroughBuffer(color.image_id, depth.image_id);
+	} else if (rect.right > rect.left && rect.bottom > rect.top) {
 		const vk::ImageCopy region {
 		    {vk::ImageAspectFlagBits::eDepth, depth.desc.view_info.base_level,
 		     depth.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
@@ -1766,15 +1809,8 @@ static void ColorAttachmentPassBarrier(vk::CommandBuffer vk_buffer) {
 
 // KYTY_ASYNC_PIPELINE: buffer, image or by-address writes, whose effects outlive this frame's colors.
 static bool DrawWritesAnything(const DrawRenderState& state) {
-	const auto writes = [](const ShaderStageRuntime& stage) {
-		// Conservative: a written buffer counts even when its descriptor is empty.
-		const auto& info    = stage.program->info;
-		const auto  written = [](const auto& resource) { return resource.written || resource.atomic; };
-		return stage.program->has_address_writes || std::ranges::any_of(info.buffers, written) ||
-		       std::ranges::any_of(info.images, written);
-	};
-	return std::ranges::any_of(state.VertexStages(), [&](const auto& vs) { return writes(vs.stage); }) ||
-	       (state.ps_active && writes(state.ps_input_info.stage));
+	return std::ranges::any_of(state.VertexStages(), [](const auto& vs) { return StageWritesAnything(vs.stage); }) ||
+	       (state.ps_active && StageWritesAnything(state.ps_input_info.stage));
 }
 
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
@@ -1928,10 +1964,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		if (pipelines[0] == nullptr) {
 			// KYTY_ASYNC_PIPELINE: only a draw whose effects are this frame's colors may be skipped while
 			// its pipeline is created; any other miss waits (below), counted by reason.
+			// KYTY_ASYNC_TESS: a depth-only tessellation draw is skipped too (its creation froze the draw
+			// thread); later passes then miss its depth for the frames it waits.
 			using PerfStats::Counter;
+			const bool tess_skip = pipeline_cache.AsyncTess() && state.VertexStages().size() == 3;
 			const auto block = passes                                       ? Counter::AsyncBlockPasses
 			                   : DrawWritesAnything(state)                  ? Counter::AsyncBlockWrites
-			                   : state.color_count == 0                     ? Counter::AsyncBlockDepthOnly
+			                   : state.color_count == 0 && !tess_skip       ? Counter::AsyncBlockDepthOnly
 			                   : m_context.GetOcclusionQueries().Counting() ? Counter::AsyncBlockQuery
 			                                                                : Counter::Count;
 			if (block != Counter::Count) {
@@ -2191,6 +2230,9 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 	DrawRenderState  local_state {.indirect_offsets = args.indirect.offsets,
 	                              .indirect_count   = MeshIndirectGpuEnabled() ? args.indirect.count : 0};
 	DrawRenderState& state = prepared != nullptr ? *prepared : local_state;
+	if (prepared == nullptr) {
+		NotePatchDraw(ucfg);
+	}
 	if (prepared == nullptr && !GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -2300,6 +2342,9 @@ bool RenderExecutor::DrawAutoBody(CommandBuffer& buffer,
 	DrawRenderState  local_state {.indirect_offsets = args.indirect.offsets,
 	                              .indirect_count   = MeshIndirectGpuEnabled() ? args.indirect.count : 0};
 	DrawRenderState& state = prepared != nullptr ? *prepared : local_state;
+	if (prepared == nullptr) {
+		NotePatchDraw(ucfg);
+	}
 	if (prepared == nullptr && !GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;
@@ -2403,6 +2448,7 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 		CpPipeline::Note(CpPipeline::Stat::FallbackShaders);
 		return false;
 	}
+	NotePatchDraw(buffer.GetUserConfig()); // the body runs with a prepared state and does not count it
 	static const bool initialized = [this] {
 		m_context.GetPipelineCache().SetPrefetchHook(PipelinePrefetch, this);
 		CpPipeline::Init(this, PipelineExecute, PipelineRelookup, PipelineFeedback);
@@ -2418,10 +2464,14 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	CpPipeline::SetInLookup(true);
 	{
 		CpSplitProf::LookupScope lookup;
-		RefreshShaders(buffer, record.state, guessed);
+		RefreshShaders(buffer, record.state, guessed, true);
 	}
 	CpPipeline::SetInLookup(false);
 	const bool heap = CpPipeline::TakeHeapInline();
+	// KYTY_TESS_PRETRANSLATE: a skipped draw writes nothing, so queued records need not drain first.
+	if (!heap && record.state.tess_deferred) {
+		return true;
+	}
 	// A draw without a compiled vertex program is skipped inline, like the unqueued path does.
 	if (heap || !record.state.vertex_info[0].stage || DrawWritesMemory(record.state)) {
 		// Later lookups may read what this draw writes, and the image heap is per draw: run it here.

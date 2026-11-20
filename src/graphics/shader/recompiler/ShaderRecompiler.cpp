@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/LaunchedLaneFolding.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -687,8 +688,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (options.profile->ray_query) {
+		if (const auto traced = IR::TraceTraversalsWithRayQueries(ir); traced != 0) {
+			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",
+			     StageName(ir.stage), ir.shader_hash, traced);
+		}
+	}
 
-	IR::CollectShaderInfo(ir, options.input_info);
+	IR::CollectShaderInfo(ir, options.input_info, options.host_features.buffer_int64_atomics);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

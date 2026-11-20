@@ -105,6 +105,12 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	}
 	const auto*   binary = reinterpret_cast<const uint32_t*>(addr);
 	ShaderMapData mapped {data};
+	// Later lookups read this copy instead of the guest header.
+	if (data.input_semantics != nullptr) {
+		std::copy_n(data.input_semantics,
+		            std::min(data.num_input_semantics, ShaderMappedData::MaxInputSemantics),
+		            mapped.input_semantics_snapshot.begin());
+	}
 	// Translation reads the bytes the hash covers.
 	mapped.code_size_bytes = ShaderProgramSize(binary, data.code_size_bytes);
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
@@ -450,8 +456,10 @@ static void ShaderGetStaticInputInfoPS(
 	ShaderSetPixelInputLayout(sh.ps_input_ena, sh.ps_input_addr, sh.ps_in_control, ps_info);
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
-	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
-		const auto& semantic = data.input_semantics[i];
+	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num &&
+	                     i < ShaderMappedData::MaxInputSemantics;
+	     i++) {
+		const auto& semantic = data.input_semantics_snapshot[i];
 		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
@@ -810,9 +818,6 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                     group.primitive_group_size != 1u || group.vertex_group_size != 1u ||
 		                     user_vgpr.vgpr1 || user_vgpr.vgpr2 || user_vgpr.vgpr3 ||
 		                     mesh.max_vertices != sh.m_vgtGsMaxVertOut);
-	} else if (merged) {
-		EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
-		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	}
 	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&

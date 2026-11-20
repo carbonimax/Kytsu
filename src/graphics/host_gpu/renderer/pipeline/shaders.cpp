@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <limits>
 #include <span>
 #include <vector>
@@ -256,6 +257,19 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
+// AMD's Windows driver fails (VK_ERROR_UNKNOWN) to create a ray-query pipeline whose layout has a
+// descriptor set but no acceleration-structure binding. Ray queries reach the TLAS by address and
+// never read this binding: it only makes the layout acceptable to that driver.
+static void AddRayQueryLayoutBinding(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
+                                     vk::ShaderStageFlags                         stages) {
+	uint32_t binding = 0;
+	for (const auto& existing: descriptor_bindings) {
+		binding = std::max(binding, existing.binding + 1);
+	}
+	descriptor_bindings.push_back(
+	    {binding, vk::DescriptorType::eAccelerationStructureKHR, 1, stages, nullptr});
+}
+
 // Creates the descriptor set layout and the pipeline layout that uses it.
 static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                           std::span<const vk::DescriptorSetLayoutBinding> bindings) {
@@ -480,15 +494,21 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (task_module) {
 		pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
 	}
+	bool ray_query = false;
 	for (const auto* stage: vertex_stages) {
 		const auto native_stage = NativeShaderStage(stage->program.stage);
 		AddLayoutBindings(descriptor_bindings, stage->program, native_stage);
 		pipeline.uses_image_heap |= stage->program.info.uses_image_heap;
 		pipeline.push_stages |= native_stage;
+		ray_query |= stage->program.info.ray_query;
 	}
 	if (ps_active) {
 		AddLayoutBindings(descriptor_bindings, pixel->program, vk::ShaderStageFlagBits::eFragment);
 		pipeline.uses_image_heap |= pixel->program.info.uses_image_heap;
+		ray_query |= pixel->program.info.ray_query;
+	}
+	if (ray_query) {
+		AddRayQueryLayoutBinding(descriptor_bindings, pipeline.push_stages);
 	}
 	CreateLayouts(graphics, pipeline, descriptor_bindings);
 
@@ -561,7 +581,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
 	NoteCreationFeedback(result, creation_feedback, true);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (tessellation && !t_quiet_creation) {
+		PerfStats::NoteTessPipeline(t_last_feedback.valid && !t_last_feedback.hit, creation_feedback.duration);
+	}
+	if (result != vk::Result::eSuccess) {
+		EXIT("graphics pipeline creation failed: result=%s (%d) stages=0x%016" PRIx64 ",0x%016" PRIx64
+		     ",0x%016" PRIx64 " ps=0x%016" PRIx64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int32_t>(result), vertex_stages[0]->program.shader_hash,
+		     vertex_stages.size() == 3 ? vertex_stages[1]->program.shader_hash : uint64_t {0},
+		     vertex_stages.size() == 3 ? vertex_stages[2]->program.shader_hash : uint64_t {0},
+		     pixel != nullptr ? pixel->program.shader_hash : uint64_t {0});
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 
@@ -596,6 +626,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, compute.program, vk::ShaderStageFlagBits::eCompute);
+	if (compute.program.info.ray_query) {
+		AddRayQueryLayoutBinding(descriptor_bindings, vk::ShaderStageFlagBits::eCompute);
+	}
 	pipeline.uses_image_heap = compute.program.info.uses_image_heap;
 	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
 	CreateLayouts(graphics, pipeline, descriptor_bindings);
@@ -617,7 +650,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	NoteCreationFeedback(result, creation_feedback, false);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("compute pipeline creation failed: result=%s (%d) module=0x%016" PRIx64 " shader=0x%016" PRIx64
+		     " wave=%u gds=%u image_heap=%u push_descriptors=%u\n",
+		     vk::to_string(result).c_str(), static_cast<int32_t>(result), compute.handle.id,
+		     compute.program.shader_hash, wave_size, compute.program.info.uses_gds ? 1u : 0u,
+		     compute.program.info.uses_image_heap ? 1u : 0u, pipeline.uses_push_descriptors ? 1u : 0u);
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }

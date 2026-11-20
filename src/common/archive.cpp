@@ -44,6 +44,22 @@ public:
 
 namespace {
 
+// Utf16ToUtf8 throws on an unpaired surrogate, and the Clang build has no exceptions: check first.
+bool IsWellFormedUtf16(std::u16string_view text) {
+	for (size_t i = 0; i < text.size(); ++i) {
+		const char16_t unit = text[i];
+		if (unit >= 0xd800 && unit <= 0xdbff) {
+			if (i + 1 == text.size() || text[i + 1] < 0xdc00 || text[i + 1] > 0xdfff) {
+				return false;
+			}
+			++i;
+		} else if (unit >= 0xdc00 && unit <= 0xdfff) {
+			return false;
+		}
+	}
+	return true;
+}
+
 class ZArchiveReaderBackend final: public ArchiveReader {
 public:
 	explicit ZArchiveReaderBackend(std::unique_ptr<ZArchiveReader> reader)
@@ -399,12 +415,11 @@ private:
 			if (name.size() != name_length || name.empty()) {
 				return false;
 			}
-			Node node;
-			try {
-				node.name = Utf16ToUtf8(name);
-			} catch (...) {
+			if (!IsWellFormedUtf16(name)) {
 				return false;
 			}
+			Node node;
+			node.name = Utf16ToUtf8(name);
 			if (node.name == "." || node.name == ".." ||
 			    node.name.find_first_of(std::string_view("/\\\0", 3)) != std::string::npos) {
 				return false;

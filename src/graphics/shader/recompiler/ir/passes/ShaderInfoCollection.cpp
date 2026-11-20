@@ -280,7 +280,7 @@ struct InputUsage {
 };
 
 void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs,
-           const Inst& inst) {
+           const Inst& inst, bool buffer_int64_atomics) {
 	auto& info = program.info;
 	const auto op = inst.GetOpcode();
 	if (ImageOpcodeInfoOf(op).access != ImageAccess::None) {
@@ -342,7 +342,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
-				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
+				// Without host 64-bit buffer atomics a coherent pair store keeps its two word stores.
+				info.buffer_int64_atomics |=
+				    memory.IsCoherentBufferPairLoad(op) ||
+				    (buffer_int64_atomics && memory.IsCoherentBufferPairStore(op));
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
@@ -525,6 +528,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::BvhIntersect: info.bvh = info.uses_dma = true; break;
 		case ValueOpcode::Bvh8Intersect: info.bvh8 = info.uses_dma = true; break;
 		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
+		case ValueOpcode::RayQueryInitialize: info.ray_query = true; break;
 		case ValueOpcode::LoadDeviceAddressU32: info.uses_device_address = true; break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_vote |=
@@ -532,9 +536,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
-		case ValueOpcode::SubgroupUMinU32:
-		case ValueOpcode::SubgroupUMaxU32:
-		case ValueOpcode::SubgroupOrU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::SubgroupReduceU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -579,7 +581,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 
 } // namespace
 
-void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
+void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info,
+                       bool buffer_int64_atomics) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
 		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
 		                                                : "shader info already collected");
@@ -593,7 +596,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = info.uses_dma = info.uses_device_address =
 	        false;
-	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
+	info.bvh = info.ray_query = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
@@ -602,7 +605,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	uint32_t merged_exports = 0;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			Visit(program, input_info, inputs, inst);
+			Visit(program, input_info, inputs, inst, buffer_int64_atomics);
 			if (program.stage == ShaderType::Pixel && inst.GetOpcode() == ValueOpcode::SetAttribute) {
 				const auto& exp = program.export_info[inst.Flags<ExportFlags>().index];
 				if (exp.kind == ExportTargetKind::Mrt && exp.en != 0 && exp.index < 8u) merged_exports |= 1u << exp.index;

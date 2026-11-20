@@ -42,6 +42,7 @@ uint32_t              EmitCompositeExtractU32x2(EmitterState& state, uint32_t ar
 inline constexpr auto EmitCompositeExtractU32x3 = EmitCompositeExtractU32x2;
 inline constexpr auto EmitCompositeExtractU32x4 = EmitCompositeExtractU32x2;
 // Format conversions (stores, D16 samples) keep the GLSL pack; ALU results use EmitPackHalf2x16.
+// KYTY_F16_STORE_RTZ=1 replaces it in formatted stores (EncodeFormattedStoreComponent).
 inline constexpr auto EmitGlslPackHalf2x16 =
     EmitGlsl<GLSLstd450PackHalf2x16, IR::Type::U32, uint32_t>;
 uint32_t              EmitPackHalf2x16(EmitterState& state, uint32_t pair);
@@ -237,9 +238,7 @@ uint32_t              EmitLiveMask(EmitterState& state);
 uint32_t              EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -346,6 +345,13 @@ uint32_t              EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& in
 uint32_t              EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvh8Extract(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhStack(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryValid(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryProceed(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryCandidateFrontFace(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryConfirm(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;

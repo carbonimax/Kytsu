@@ -95,10 +95,15 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// The ring that new per-draw stream copies go to (KYTY_STREAM_HOST_CACHED, bufferCache.cpp).
+	[[nodiscard]] StreamBuffer&                StreamRing() noexcept;
+	// KYTY_TC_LOCK_ORDER (GPU thread): the tick up to which ObtainBuffer(vaddr, size, true) would
+	// wait for priority operations (queued main-queue fault publications), or 0. Never blocks.
+	[[nodiscard]] uint64_t WritePublishTick(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
+			case MemoryUsage::Stream: return StreamRing();
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
 		}
@@ -344,6 +349,7 @@ private:
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::atomic<uint64_t>                             m_color_metadata_epoch {0};
+	// Leaf lock: taken under TextureCache::m_lock (WritePublishTick), never takes another lock.
 	std::mutex                                        m_pending_mutex;
 	std::vector<PendingPublish>                       m_pending_publishes;
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
@@ -377,7 +383,10 @@ private:
 	bool                                              m_reprotect_batch   = false;
 	std::mutex                                        m_deferred_mutex; // deferred protections + copies
 	std::vector<DeferredCopy>                         m_deferred_copies;
+	const bool                                        m_stream_host_cached;
 	StreamBuffer                                      m_stream_buffer;
+	// KYTY_AB_FLAG=stream_host_cached: a ring in the default memory for the forced-off arm.
+	std::unique_ptr<StreamBuffer>                     m_stream_default;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

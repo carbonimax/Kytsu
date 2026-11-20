@@ -4,16 +4,18 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
+constexpr uint32_t DescriptorHeapCount = 1024;
+// Sized for layouts with large texture arrays: a set must fit in a fresh pool.
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 32768},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 8192},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 8192},
 };
 
 } // namespace
@@ -47,6 +49,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.sets.data());
 	if (result == vk::Result::eSuccess) {
 		batch.size = DescriptorSetBatch;
+		PerfStats::Add(PerfStats::Counter::DescSetAllocs, DescriptorSetBatch);
 		return batch.sets[--batch.size];
 	}
 	EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
@@ -60,6 +63,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		           vk::Result::eSuccess) {
 			target.size++;
 		}
+		PerfStats::Add(PerfStats::Counter::DescSetAllocs, target.size);
 		return target.size != 0;
 	};
 	allocate.descriptorSetCount = 1;
@@ -67,11 +71,13 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		return batch.sets[--batch.size];
 	}
 
+	PerfStats::Add(PerfStats::Counter::DescPoolFull, 1);
 	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();
 		EXIT_IF(m_graphics.device.resetDescriptorPool(m_current_pool, {}) != vk::Result::eSuccess);
+		PerfStats::Add(PerfStats::Counter::DescPoolResets, 1);
 	} else {
 		CreateDescriptorPool();
 	}
@@ -85,11 +91,17 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 
 void DescriptorHeap::CreateDescriptorPool() {
 	vk::DescriptorPoolCreateInfo create {};
+	// Ray-query layouts carry one unused acceleration-structure binding (AddRayQueryLayoutBinding).
+	std::vector<vk::DescriptorPoolSize> sizes(DescriptorPoolSizes.begin(), DescriptorPoolSizes.end());
+	if (m_graphics.ray_query_enabled) {
+		sizes.push_back({vk::DescriptorType::eAccelerationStructureKHR, DescriptorHeapCount});
+	}
 	create.maxSets       = DescriptorHeapCount;
-	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
-	create.pPoolSizes    = DescriptorPoolSizes.data();
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
+	PerfStats::Add(PerfStats::Counter::DescPoolCreates, 1);
 }
 
 } // namespace Libs::Graphics
