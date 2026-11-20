@@ -160,9 +160,10 @@ bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uin
 bool                   IsGpuDirtyBufferRange(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
-[[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Stops at the first hole, or with span_holes at the end of the last committed range.
+[[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
 // Like ClampRangeSize, but returns 0 instead of exiting when vaddr is not mapped.
-[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
 // True when vaddr lies in a guest virtual range, committed or only reserved (sparse PRT hole).
 [[nodiscard]] bool IsVirtualAddressKnown(uint64_t vaddr);
 // Advances on every edit of the guest virtual ranges: answers of IsVirtualAddressKnown and

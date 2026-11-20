@@ -515,13 +515,13 @@ public:
 		return true;
 	}
 
-	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size, bool span_holes) {
 		const int mode = MemoMode();
 		if (mode != 0 && virtual_addr != 0 && size != 0 && size <= UINT64_MAX - virtual_addr) {
 			// The span lies inside one committed range: the walk below would return size.
 			if (const auto generation = MemoFind(virtual_addr, size, true); generation != 0) {
 				if (mode == 2) {
-					EXIT_IF(ClampRangeSizeLocked(virtual_addr, size, false, generation) != size);
+					EXIT_IF(ClampRangeSizeLocked(virtual_addr, size, false, generation, span_holes) != size);
 					MemoChecked(true);
 				}
 				return size;
@@ -530,12 +530,12 @@ public:
 				MemoChecked(false);
 			}
 		}
-		return ClampRangeSizeLocked(virtual_addr, size, mode != 0, 0);
+		return ClampRangeSizeLocked(virtual_addr, size, mode != 0, 0, span_holes);
 	}
 
 	// check_generation != 0 (mode 2): returns size if the map changed since that generation.
 	uint64_t ClampRangeSizeLocked(uint64_t virtual_addr, uint64_t size, bool remember,
-	                              uint64_t check_generation) {
+	                              uint64_t check_generation, bool span_holes) {
 		Common::LockGuard lock(m_mutex);
 
 		if (check_generation != 0 && Generation() != check_generation) {
@@ -551,6 +551,14 @@ public:
 		}
 		if (remember) {
 			MemoRemember(vma->second);
+		}
+		if (span_holes) {
+			// The last committed range starting inside the span; vma stops the walk.
+			auto last = m_ranges.lower_bound(virtual_addr + size);
+			do {
+				--last;
+			} while (!IsCommittedRangeType(last->second.type));
+			return std::min(End(last->second.start, last->second.size) - virtual_addr, size);
 		}
 		const auto vma_end = End(vma->second.start, vma->second.size);
 
@@ -1112,8 +1120,8 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
-uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
-	const auto clamped_size = TryClampRangeSize(vaddr, size);
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes) {
+	const auto clamped_size = TryClampRangeSize(vaddr, size, span_holes);
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
@@ -1132,10 +1140,10 @@ bool IsVirtualAddressKnown(uint64_t vaddr) {
 	return g_virtual_ranges->IsKnown(vaddr);
 }
 
-uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size, span_holes);
 	if (clamped_size != 0 && clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",

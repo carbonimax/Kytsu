@@ -1496,7 +1496,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			// instead of aborting.
 			bool unmapped = size != 0 && !Libs::LibKernel::Memory::IsVirtualAddressKnown(address);
 			if (!unmapped && (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX)) {
-				const auto mapped_size = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+				// Oversized finite pool windows are mapped in pieces, so they end at their last
+				// committed range; sentinel ranges stop at the first hole.
+				const auto mapped_size = Libs::LibKernel::Memory::TryClampRangeSize(
+				    address, size, descriptor.NumRecords() != UINT32_MAX);
 				unmapped               = mapped_size == 0;
 				size                   = mapped_size;
 			}
