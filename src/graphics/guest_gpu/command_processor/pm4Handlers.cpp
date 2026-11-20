@@ -1377,7 +1377,7 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
 	// Fork: ProcessPm4 drains the CP pipeline before every block Pm4::IsFlipBlock names.
-	// Driver user data has R = 1; a compute queue's flip has R = 0.
+	// Driver user data has R = 1 in a DCB and R = 0 on a compute queue.
 	if (Pm4::IsFlipBlock(cmd_id, buffer, cp.IsAsyncComputeQueue())) {
 		return (buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_FLIP
 		           ? CpFlip(cp, KYTY_PM4_R(cmd_id), buffer, dw)
