@@ -91,9 +91,14 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 
 void DescriptorHeap::CreateDescriptorPool() {
 	vk::DescriptorPoolCreateInfo create {};
+	// Ray-query layouts carry one unused acceleration-structure binding (AddRayQueryLayoutBinding).
+	std::vector<vk::DescriptorPoolSize> sizes(DescriptorPoolSizes.begin(), DescriptorPoolSizes.end());
+	if (m_graphics.ray_query_enabled) {
+		sizes.push_back({vk::DescriptorType::eAccelerationStructureKHR, DescriptorHeapCount});
+	}
 	create.maxSets       = DescriptorHeapCount;
-	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
-	create.pPoolSizes    = DescriptorPoolSizes.data();
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
 	PerfStats::Add(PerfStats::Counter::DescPoolCreates, 1);

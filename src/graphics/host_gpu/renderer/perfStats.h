@@ -164,6 +164,27 @@ enum class Counter : uint32_t {
 	DescPoolResets,
 	DescPoolFull,
 	DescPoolCreates,
+	PatchDraws,          // tessellation patch draws, drawn or skipped (--no-tessellation)
+	TessPipelines,       // tessellation pipelines created, of which
+	TessPipelineMisses,  //   missed the pipeline cache
+	TessPipelineMissNs,
+	// LS, HS and DS program misses on the draw thread ("PERF tessmiss"), and those it translated
+	// itself; the others (KYTY_TESS_PRETRANSLATE) were translated by a worker and only emitted there.
+	TessMissLs,
+	TessMissHs,
+	TessMissDs,
+	TessInlineLs,
+	TessInlineHs,
+	TessInlineDs,
+	TessInlineNs,      // draw-thread preparation + translation of those
+	TessMissNs,        // whole misses (translation, emission, module)
+	TessDeferredDraws, // KYTY_TESS_PRETRANSLATE: draws skipped while a worker translates their stages
+	// Presented frames by interval, in 60 Hz vsync buckets: < 41.7 ms (33), < 58.3 ms (50),
+	// < 75 ms (67), longer ("PERF frames").
+	Frames33,
+	Frames50,
+	Frames67,
+	FramesLong,
 	Count
 };
 
@@ -186,6 +207,7 @@ void               MaybeReport() noexcept;
 void SetStorageBoundsCounters(const volatile uint32_t* counters) noexcept;
 // A pipeline creation reported by VK_EXT_pipeline_creation_feedback (core in Vulkan 1.3).
 void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) noexcept;
+void NoteTessPipeline(bool cache_miss, uint64_t duration_ns) noexcept;
 
 // KYTY_FRAME_TIMES=<file> (measurement, default off): one line per presented frame with its
 // steady-clock time in microseconds and the flip argument of the latest guest flip completed before
@@ -204,6 +226,8 @@ void NoteFlipArg(int64_t arg) noexcept;
 // frames (A/A). A driven option must be safe to change between two frames (no pipeline, shader or
 // cache-key effect). True when `flag` is driven and the current arm is 0.
 [[nodiscard]] bool AbOff(const char* flag) noexcept;
+// AbOff without the flag name: the current arm is 0. For a hot caller that compared KYTY_AB_FLAG once.
+[[nodiscard]] bool AbArmOff() noexcept;
 
 // KYTY_COMPILE_LOG=<file> (diagnostic, default off): one line per shader registration, program
 // translation miss and pipeline creation, each starting with a kind letter and its steady-clock time

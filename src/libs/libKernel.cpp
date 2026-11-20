@@ -12,6 +12,7 @@
 #include "kernel/eventFlag.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/ioStats.h"
 #include "kernel/memory.h"
 #include "kernel/module.h"
 #include "kernel/pthread.h"
@@ -2889,6 +2890,7 @@ int KYTY_SYSV_ABI KernelAioSubmitReadCommands(KernelAioRwRequest* req, int32_t s
 	const auto submit_id = kernel_aio_next_id();
 	g_kernel_aio_state[submit_id].store(KERNEL_AIO_STATE_PROCESSING, std::memory_order_release);
 
+	const LibKernel::IoStats::ApiScope io(LibKernel::IoStats::Api::Aio);
 	for (int32_t i = 0; i < size; i++) {
 		if (req[i].result == nullptr) {
 			g_kernel_aio_state[submit_id].store(KERNEL_AIO_STATE_ABORTED,

@@ -47,6 +47,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(recommended_options);
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(relaxed_shader_float);
+	KYTY_CFG_SET(native_rt);
 	KYTY_CFG_SET(shader_cache_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
@@ -120,6 +121,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(recommended_options);
 	KYTY_CFG_GET(occlusion_queries_enabled);
 	KYTY_CFG_GET(relaxed_shader_float);
+	KYTY_CFG_GET(native_rt);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
 	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
@@ -181,10 +183,13 @@ void Configuration::WriteSettings(QSettings* s) const {
 
 void Configuration::ReadSettings(QSettings* s) {
 	ReadGameSettingsValues(*s);
-	if (s->value("settings_version", 0).toInt() < 1) {
-		// Saved before the shader store became the default: the stored false was the old default,
-		// not a choice.
+	// Saved before these became the defaults: the stored false was the old default, not a choice.
+	const int version = s->value("settings_version", 0).toInt();
+	if (version < 1) {
 		shader_cache_enabled = true;
+	}
+	if (version < 2) {
+		tessellation_enabled = true;
 	}
 	name               = s->value("name").toString();
 	basedir            = s->value("basedir").toString();

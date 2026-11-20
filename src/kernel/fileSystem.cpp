@@ -1,5 +1,6 @@
 #include "kernel/fileSystem.h"
 #include "kernel/syncTrace.h"
+#include "kernel/ioStats.h"
 #include "graphics/host_gpu/renderer/mipStats.h"
 
 #include <functional>
@@ -529,6 +530,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return descriptor;
 	}
 
+	IoStats::Timer io(IoStats::Api::Open);
 	file->real_name = g_mount_points->ResolvePath(file->name);
 	if (file->real_name.empty()) {
 		g_files->DeleteDescriptor(descriptor);
@@ -592,6 +594,9 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		} else {
 			result = file->f.Open(file->real_name, rw_mode);
+			if (result && IoStats::Enabled()) {
+				IoStats::NoteOpenedPath(IoStats::Api::Open, std::filesystem::hash_value(file->real_name));
+			}
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
@@ -639,6 +644,7 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	EXIT_IF(!file->opened);
 
+	IoStats::Timer io(IoStats::Api::Close);
 	if (!file->directory && file->special == SpecialFile::None) {
 		file->f.Close();
 	}
@@ -717,7 +723,9 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return static_cast<int64_t>(nbytes);
 	}
 
+	IoStats::Timer io(IoStats::Api::Read);
 	file->mutex.Lock();
+	io.Locked();
 
 	bool       is_invalid = file->f.IsInvalid();
 	const auto pos        = file->f.Tell();
@@ -730,6 +738,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
 	file->mutex.Unlock();
+	io.Done(bytes_read);
 
 	if (is_invalid || (!read_ok && bytes_read == 0)) {
 		LOGF("\tfile read failed\n");
@@ -854,7 +863,9 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return static_cast<int64_t>(nbytes);
 	}
 
+	IoStats::Timer io(IoStats::Api::Pread);
 	file->mutex.Lock();
+	io.Locked();
 
 	bool       is_invalid = file->f.IsInvalid();
 	auto       pos        = file->f.Tell();
@@ -869,6 +880,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	const bool restored = file->f.Seek(pos);
 
 	file->mutex.Unlock();
+	io.Done(bytes_read);
 
 	if (is_invalid || !restored || (!read_ok && bytes_read == 0)) {
 		LOGF("\tfile read failed\n");
@@ -928,7 +940,9 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		return KERNEL_ERROR_EBADF;
 	}
 
+	IoStats::Timer    io(IoStats::Api::Preadv);
 	Common::LockGuard lock(file->mutex);
+	io.Locked();
 	if (file->directory) {
 		return KERNEL_ERROR_EISDIR;
 	}
@@ -978,6 +992,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	if (!file->f.Seek(position) || (!read_ok && bytes_read == 0)) {
 		return KERNEL_ERROR_EIO;
 	}
+	io.Done(static_cast<uint64_t>(bytes_read));
 	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,
 	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
 	return bytes_read;

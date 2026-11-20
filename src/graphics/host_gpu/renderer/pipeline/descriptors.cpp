@@ -457,12 +457,7 @@ static bool ResolveTextureMipViewIn(ImageInfo& info, uint32_t physical_levels, b
 	physical.UpdateSize();
 	info.UpdateSize();
 	const auto same_mip = [&](uint32_t target, uint32_t source) {
-		const auto& left  = physical.mip_layout[target];
-		const auto& right = info.mip_layout[source];
-		return left.offset == right.offset && left.size == right.size &&
-		       left.pitch == right.pitch && left.height == right.height &&
-		       left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-		       left.surface_z == right.surface_z &&
+		return physical.mip_layout[target] == info.mip_layout[source] &&
 		       physical.MipExtent(target) == info.MipExtent(source);
 	};
 	if (physical.first_tail_level == info.first_tail_level &&
@@ -584,10 +579,12 @@ bool SameResolvedTextureDesc(const ResolvedTextureDesc& a, const ResolvedTexture
 	       x.pixel_format == y.pixel_format && x.guest_format == y.guest_format &&
 	       x.type == y.type && x.extent == y.extent && x.resources == y.resources &&
 	       x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
-	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.mip_layout == y.mip_layout &&
-	       x.tiled_slice_stride == y.tiled_slice_stride &&
-	       x.linear_slice_stride == y.linear_slice_stride &&
-	       x.first_tail_level == y.first_tail_level &&
+	       x.samples == y.samples && x.tile_mode == y.tile_mode &&
+	       // UpdateSize no longer re-zeroes records past resources.levels (equal on both sides here).
+	       std::equal(x.mip_layout.begin(),
+	                  x.mip_layout.begin() + std::min<size_t>(x.resources.levels, x.mip_layout.size()),
+	                  y.mip_layout.begin()) &&
+	       x.tiled_slice_stride == y.tiled_slice_stride && x.first_tail_level == y.first_tail_level &&
 	       std::memcmp(&x.tiling, &y.tiling, sizeof(x.tiling)) == 0;
 }
 
