@@ -720,17 +720,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 namespace {
 
-// KYTY_RESOLVE_INPLACE (default 0 = off; 1 = on; 2 = verify), with KYTY_TEXTURE_DESC_MEMO=1 only:
-// when PrepareBindings binds a program texture whose kept description is in the memo, it writes the
-// binding straight into its slot (one copy of the description instead of three, no scratch
-// description) and knows the resource by its address instead of comparing it field by field. Any
-// other case runs ResolveTexture. 2 = also resolve each such binding through ResolveTexture and
-// compare ("PERF resolveinplace"). Switchable between frames: KYTY_AB_FLAG=resolve_inplace.
+// KYTY_RESOLVE_INPLACE (default 1 = on; 0 = off, every bind through ResolveTexture as before; 2 =
+// verify), with KYTY_TEXTURE_DESC_MEMO=1 only: when PrepareBindings binds a program texture whose kept
+// description is in the memo, it writes the binding straight into its slot (one copy of the
+// description instead of three, no scratch description) and knows the resource by its address
+// instead of comparing it field by field. An address holds for one render context: the memos are
+// dropped when a RenderExecutor is created or destroyed. Any other case runs ResolveTexture. 2 = also
+// resolve each such binding through ResolveTexture and compare ("PERF resolveinplace"). Switchable
+// between frames: KYTY_AB_FLAG=resolve_inplace.
 uint32_t ResolveInplaceMode() noexcept {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_RESOLVE_INPLACE");
-		const auto  m     = value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
-		if (m != 0) {
+		const auto  m     = value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		if (value != nullptr) {
 			std::printf("KYTY_RESOLVE_INPLACE=%u\n", m);
 		}
 		return m;
