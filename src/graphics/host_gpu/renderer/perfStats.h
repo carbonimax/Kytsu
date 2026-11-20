@@ -158,6 +158,12 @@ enum class Counter : uint32_t {
 	StagingWriteNs,      // guest bytes written into the upload staging ring (any thread)
 	StagingWriteBytes,
 	StagingWriteCount,
+	// Descriptor heaps ("PERF descheap" line): sets allocated, pools recycled once the GPU is done
+	// with them, allocations that found the current pool full, and new pools.
+	DescSetAllocs,
+	DescPoolResets,
+	DescPoolFull,
+	DescPoolCreates,
 	PatchDraws,          // tessellation patch draws, drawn or skipped (--no-tessellation)
 	TessPipelines,       // tessellation pipelines created, of which
 	TessPipelineMisses,  //   missed the pipeline cache
@@ -220,6 +226,8 @@ void NoteFlipArg(int64_t arg) noexcept;
 // frames (A/A). A driven option must be safe to change between two frames (no pipeline, shader or
 // cache-key effect). True when `flag` is driven and the current arm is 0.
 [[nodiscard]] bool AbOff(const char* flag) noexcept;
+// AbOff without the flag name: the current arm is 0. For a hot caller that compared KYTY_AB_FLAG once.
+[[nodiscard]] bool AbArmOff() noexcept;
 
 // KYTY_COMPILE_LOG=<file> (diagnostic, default off): one line per shader registration, program
 // translation miss and pipeline creation, each starting with a kind letter and its steady-clock time

@@ -519,6 +519,8 @@ struct PipelineCache::ProgramCache {
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (diag_log) diag_module_us = PerfStats::SteadyUs() - module_begin;
+		SetVulkanObjectNameF(graphics.device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
+		                     options.shader_hash);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -1428,7 +1430,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
         }
         SetPipelineCreationQuiet(false);
 	};
-	const auto               workers = std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
+	// Several threads compiling pipelines at once trips a crash inside NVIDIA's
+	// libnvidia-glvkspirv, so that driver warms up serially.
+	const auto workers = m_graphics.physical_device_properties.vendorID == 0x10DEu
+	                         ? 1u
+	                         : std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
 	std::vector<std::thread> threads;
 	for (uint32_t i = 1; i < workers && i < jobs.size(); i++) {
 		threads.emplace_back(work);

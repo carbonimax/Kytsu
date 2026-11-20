@@ -5,7 +5,8 @@
 #include <QApplication>
 #include <QColor>
 #include <QDir>
-#include <QEvent>
+#include <QElapsedTimer>
+#include <QFontMetrics>
 #include <QImage>
 #include <QScrollBar>
 #include <QTemporaryDir>
@@ -26,23 +27,6 @@ void Check(bool value, const char *message) {
 bool ShowsBackground(const QColor &color) {
   return color.red() > color.green() + 40 && color.red() > color.blue() + 40;
 }
-
-// The card panel is the app's (white) Window color over the background.
-bool ShowsPanel(const QColor &color) {
-  return !ShowsBackground(color) &&
-         qAbs(color.lightness() - QApplication::palette().color(QPalette::Window).lightness()) < 32;
-}
-
-class PaintCounter final : public QObject {
-public:
-  int paints = 0;
-
-protected:
-  bool eventFilter(QObject * /*watched*/, QEvent *event) override {
-    paints += static_cast<int>(event->type() == QEvent::Paint);
-    return false;
-  }
-};
 
 } // namespace
 
@@ -67,15 +51,20 @@ int main(int argc, char **argv) {
   auto *views = ui.game_views;
   auto *list  = ui.cfgs_list;
   auto *grid  = ui.cfgs_grid;
-  SetupGameGrid(list, grid);
-  grid->setIconSize(QSize(64, 64));
+  // The launcher's carousel setup that the tiles depend on (ConfigureGameGrid).
+  grid->setModel(list->model());
+  grid->setSelectionModel(list->selectionModel());
+  grid->setFlow(QListView::LeftToRight);
+  grid->setWrapping(false);
+  grid->setItemDelegate(new GameGridDelegate(grid));
+  grid->setIconSize(QSize(128, 128));
 
-  QPixmap cover(64, 64);
+  QPixmap cover(128, 128);
   cover.fill(Qt::blue);
   auto *item = new QTreeWidgetItem(list, {QStringLiteral("Game")});
   item->setIcon(GAME_NAME_COLUMN, QIcon(cover));
 
-  host.resize(480, 360);
+  host.resize(800, 600);
   views->SetBackgroundImage(game.path());
   host.show();
   QApplication::processEvents();
@@ -84,38 +73,42 @@ int main(int argc, char **argv) {
   Check(ShowsBackground(views->grab().toImage().pixelColor(empty)),
         "the game background is hidden behind the list view");
 
-  views->setCurrentWidget(grid);
-  QApplication::processEvents();
-  const auto image = views->grab().toImage();
-  Check(ShowsBackground(image.pixelColor(empty)),
-        "the game background is hidden behind the grid view");
-
-  const auto card = grid->visualRect(grid->model()->index(0, GAME_NAME_COLUMN))
-                        .translated(grid->viewport()->mapTo(views, QPoint()));
-  Check(card.width() == 64 + 16, "the card is not the cover plus its padding wide");
-  Check(image.pixelColor(card.topLeft() + QPoint(8 + 32, 8 + 32)) == QColor(Qt::blue),
-        "the cover is not drawn inside the card padding");
-  Check(ShowsPanel(image.pixelColor(card.topLeft() + QPoint(4, 40))),
-        "the card panel does not back its padding");
-
-  PaintCounter counter;
-  grid->viewport()->installEventFilter(&counter);
-  item->setText(GAME_SIZE_COLUMN, QStringLiteral("1.00 GB"));
-  QApplication::processEvents();
-  Check(counter.paints > 0, "the card does not repaint when the game size arrives");
-
   if (breeze) {
-    for (QAbstractScrollArea *view : {static_cast<QAbstractScrollArea *>(grid),
-                                      static_cast<QAbstractScrollArea *>(list)}) {
-      view->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
-      views->setCurrentWidget(view);
-      QApplication::processEvents();
-      const auto *bar = view->verticalScrollBar();
-      Check(ShowsBackground(views->grab().toImage().pixelColor(
-                bar->mapTo(views, QPoint(2, bar->height() - 20)))),
-            "Breeze hides the game background behind a scroll bar");
-    }
+    list->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+    QApplication::processEvents();
+    const auto *bar = list->verticalScrollBar();
+    Check(ShowsBackground(views->grab().toImage().pixelColor(
+              bar->mapTo(views, QPoint(2, bar->height() - 20)))),
+          "Breeze hides the game background behind a scroll bar");
   }
+
+  list->setCurrentItem(item);
+  views->setCurrentWidget(grid);
+  grid->SetBackgroundImage(game.path());
+  // Let the pop-in and the selected tile's growth finish.
+  QElapsedTimer clock;
+  clock.start();
+  while (clock.elapsed() < 1500) {
+    QApplication::processEvents();
+  }
+  const auto image = grid->viewport()->grab().toImage();
+  Check(ShowsBackground(image.pixelColor(grid->viewport()->width() - 10,
+                                         grid->viewport()->height() - 10)),
+        "the carousel does not paint the game background");
+  const auto tile = grid->TileRect(0);
+  Check(tile.width() == 128 * 3 / 4, "the selected tile is not three quarters of the slider size");
+  Check(image.pixelColor(tile.center()) == QColor(Qt::blue), "the tile does not show the cover");
+
+  // A title that supports PS5 Pro mode carries the badge in the tile's top-right corner.
+  item->setData(GAME_NAME_COLUMN, Qt::UserRole, true);
+  QApplication::processEvents();
+  auto font = grid->font();
+  font.setBold(true);
+  const int    inset = QFontMetrics(font).height() / 3;
+  const QPoint badge = tile.topRight() + QPoint(-inset - 2, inset + QFontMetrics(font).height() / 2);
+  const auto   pro   = grid->viewport()->grab().toImage().pixelColor(badge);
+  Check(qAbs(pro.red() - 0x53) < 24 && qAbs(pro.green() - 0x4a) < 24 && qAbs(pro.blue() - 0xb7) < 24,
+        "the carousel tile does not show the PS5 Pro badge");
 
   std::printf("LauncherGameViewsTests: passed%s\n", breeze ? "" : " (Breeze checks skipped)");
   return 0;

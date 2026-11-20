@@ -38,6 +38,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1829,6 +1830,105 @@ LIB_DEFINE(InitLibKernelWriteThrottling) {
 
 } // namespace LibKernelWriteThrottling
 
+namespace LibKernelModuleInfo {
+
+LIB_VERSION("libkernel_module_info", 1, "libkernel", 1, 1);
+
+// PS5 module info layout (352 bytes).
+struct ModuleInfo2 {
+	uint64_t st_size;
+	char     name[256];
+	struct {
+		uint64_t address;
+		uint32_t size;
+		int32_t  prot;
+	} segments[4];
+	uint32_t segment_count;
+	uint8_t  fingerprint[20];
+};
+
+// Module enumeration for crash-report tooling; some titles call it at startup.
+static int KYTY_SYSV_ABI KernelGetModuleList2(int32_t* handles, uint64_t num_array,
+                                              uint64_t* out_count) {
+	PRINT_NAME();
+
+	if (handles == nullptr || out_count == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+
+	auto*             rt    = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto        ids   = rt->GetProgramIds();
+	const auto        count = static_cast<uint64_t>(ids.size());
+	uint64_t          index = 0;
+	for (; index < count && index < num_array; index++) {
+		handles[index] = ids[index];
+	}
+
+	if (count > num_array) {
+		return LibKernel::KERNEL_ERROR_ENOMEM;
+	}
+
+	*out_count = index;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI KernelGetModuleInfo2(int32_t handle, ModuleInfo2* info) {
+	PRINT_NAME();
+
+	if (info == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (info->st_size != sizeof(ModuleInfo2)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	auto* rt      = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto* program = rt->FindProgramById(handle);
+	if (program == nullptr || program->elf == nullptr) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+
+	const auto* ehdr = program->elf->GetEhdr();
+	const auto* phdr = program->elf->GetPhdr();
+	if (ehdr == nullptr || phdr == nullptr) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+
+	std::memset(info, 0, sizeof(ModuleInfo2));
+	info->st_size = sizeof(ModuleInfo2);
+
+	if (program->dynamic_info != nullptr && program->dynamic_info->so_name != nullptr &&
+	    program->dynamic_info->so_name[0] != '\0') {
+		std::snprintf(info->name, sizeof(info->name), "%s", program->dynamic_info->so_name);
+	} else {
+		auto fallback_name = Common::PathToString(program->file_name.filename());
+		std::snprintf(info->name, sizeof(info->name), "%s", fallback_name.c_str());
+	}
+
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_type != Loader::PT_LOAD || phdr[i].p_memsz == 0) {
+			continue;
+		}
+		if (info->segment_count >= std::size(info->segments)) {
+			break;
+		}
+		auto& segment   = info->segments[info->segment_count++];
+		segment.address = program->base_vaddr + phdr[i].p_vaddr;
+		segment.size    = static_cast<uint32_t>(phdr[i].p_memsz);
+		segment.prot    = ((phdr[i].p_flags & 4) != 0 ? 1 : 0) | ((phdr[i].p_flags & 2) != 0 ? 2 : 0) |
+		               ((phdr[i].p_flags & 1) != 0 ? 4 : 0);
+	}
+
+	return OK;
+}
+
+LIB_DEFINE(InitLibKernel_1_ModuleInfo) {
+	LIB_FUNC("QgsKEUfkqMA", KernelGetModuleInfo2);
+	LIB_FUNC("ZzzC3ZGVAkc", KernelGetModuleList2);
+}
+
+} // namespace LibKernelModuleInfo
+
 namespace Posix {
 
 LIB_VERSION("Posix", 1, "libkernel", 1, 1);
@@ -2289,16 +2389,21 @@ constexpr int32_t FIBER_ERROR_INVALID    = -2141650940; /* 0x80590004 */
 constexpr int32_t FIBER_ERROR_PERMISSION = -2141650939; /* 0x80590005 */
 constexpr int32_t FIBER_ERROR_STATE      = -2141650938; /* 0x80590006 */
 
-constexpr uint32_t FIBER_MAGIC_START       = 0xdef1649c;
-constexpr uint32_t FIBER_MAGIC_END         = 0xb37592a0;
-constexpr uint32_t FIBER_OPT_MAGIC         = 0xbb40e64d;
-constexpr uint64_t FIBER_STACK_MAGIC       = 0x7149f2ca7149f2ca;
-constexpr uint64_t FIBER_CONTEXT_MIN_SIZE  = 512;
-constexpr size_t   FIBER_MAX_NAME_LENGTH   = 31;
-constexpr uint32_t FIBER_STATE_RUNNING     = 1;
-constexpr uint32_t FIBER_STATE_IDLE        = 2;
-constexpr uint32_t FIBER_STATE_TERMINATED  = 3;
-constexpr uint32_t FIBER_FLAG_SET_FPU_REGS = 0x100;
+constexpr uint32_t FIBER_MAGIC_START        = 0xdef1649c;
+constexpr uint32_t FIBER_MAGIC_END          = 0xb37592a0;
+constexpr uint32_t FIBER_OPT_MAGIC          = 0xbb40e64d;
+constexpr uint64_t FIBER_STACK_MAGIC        = 0x7149f2ca7149f2ca;
+constexpr uint64_t FIBER_CONTEXT_MIN_SIZE   = 512;
+constexpr size_t   FIBER_MAX_NAME_LENGTH    = 31;
+constexpr uint32_t FIBER_STATE_RUNNING      = 1;
+constexpr uint32_t FIBER_STATE_IDLE         = 2;
+constexpr uint32_t FIBER_STATE_TERMINATED   = 3;
+constexpr uint32_t FIBER_STATE_RECLAIMING   = 4;
+constexpr uint32_t FIBER_STATE_RETURNING    = 5;
+constexpr uint64_t FIBER_SMALL_CONTEXT_SIZE = 64u * 1024u;
+constexpr uint64_t FIBER_HOST_STACK_SIZE    = 64u * 1024u;
+constexpr uint64_t FIBER_PAGE_SIZE          = 16u * 1024u;
+constexpr uint32_t FIBER_FLAG_SET_FPU_REGS  = 0x100;
 
 using FiberEntry = KYTY_SYSV_ABI void (*)(uint64_t arg_on_initialize, uint64_t arg_on_run);
 
@@ -2318,9 +2423,11 @@ struct FiberCpuContext {
 	uint64_t      rsp;
 	uint64_t      rip;
 	Common::FpEnv fp_env;
+	uint64_t      stack_base;
+	uint64_t      stack_limit;
 };
 
-static_assert(sizeof(FiberCpuContext) == 88);
+static_assert(sizeof(FiberCpuContext) == 104);
 
 struct FiberObject {
 	uint32_t        magic_start;
@@ -2340,6 +2447,8 @@ struct FiberObject {
 	uint64_t        arg_on_return;
 	bool            context_valid;
 	uint32_t        magic_end;
+	uint64_t        stack_address;
+	uint64_t        stack_size;
 };
 
 static_assert(sizeof(FiberObject) <= 256);
@@ -2367,7 +2476,13 @@ struct FiberThreadContext {
 	FiberObject*    returned_fiber;
 	FiberObject*    pending_idle_fiber;
 	FiberCpuContext cpu_context;
+	bool            entry_returned;
+	bool            exit_thread;
+	void*           exit_value;
 };
+
+static Common::Mutex                                    g_fiber_stacks_mutex;
+static std::unordered_map<uint64_t, const FiberObject*> g_fiber_stacks;
 
 static const auto g_fiber_context_key = [] {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2429,12 +2544,71 @@ static bool FiberCompareExchangeState(FiberObject* fiber, uint32_t expected, uin
 	                             std::memory_order_acquire);
 }
 
+static bool FiberClaimForReclaim(FiberObject* fiber, bool allow_terminated) {
+	for (;;) {
+		const auto state = FiberLoadState(fiber);
+		if (state == FIBER_STATE_RETURNING) {
+#if defined(__x86_64__) || defined(_M_X64)
+			asm volatile("pause");
+#endif
+			std::this_thread::yield();
+			continue;
+		}
+		if (state != FIBER_STATE_IDLE && (!allow_terminated || state != FIBER_STATE_TERMINATED)) {
+			return false;
+		}
+		if (FiberCompareExchangeState(fiber, state, FIBER_STATE_RECLAIMING)) {
+			return true;
+		}
+	}
+}
+
 static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	fiber->context_valid = valid;
 	fiber->context       = valid ? &fiber->saved_context : nullptr;
 }
 
+static void FiberReleaseStack(FiberObject* fiber) {
+	Common::LockGuard lock(g_fiber_stacks_mutex);
+	const auto        stack = g_fiber_stacks.find(fiber->stack_address);
+	if (stack != g_fiber_stacks.end() && stack->second == fiber) {
+		LibKernel::Memory::ReleaseGuestStack(fiber->stack_address);
+		const auto unmap_result =
+		    LibKernel::Memory::KernelMunmap(fiber->stack_address, fiber->stack_size);
+		EXIT_IF(unmap_result != OK);
+		g_fiber_stacks.erase(stack);
+	}
+	fiber->stack_address = 0;
+	fiber->stack_size    = 0;
+}
+
+static bool FiberAcquireStack(FiberObject* fiber) {
+	if (fiber->stack_address != 0 || fiber->size_context >= FIBER_SMALL_CONTEXT_SIZE) {
+		return true;
+	}
+	const uint64_t size    = (fiber->size_context + FIBER_HOST_STACK_SIZE + FIBER_PAGE_SIZE - 1) &
+	                         ~(FIBER_PAGE_SIZE - 1);
+	const auto     address = LibKernel::Memory::AllocateGuestStackMemory(
+	    0, size, Common::VirtualMemory::Mode::ReadWrite, "fiber_stack");
+	if (address == 0) {
+		return false;
+	}
+	LibKernel::Memory::PrepareGuestStack(address, size, "fiber stack", false);
+	Common::LockGuard lock(g_fiber_stacks_mutex);
+	g_fiber_stacks.emplace(address, fiber);
+	fiber->stack_address = address;
+	fiber->stack_size    = size;
+	return true;
+}
+
 #if defined(__x86_64__) || defined(_M_X64)
+static_assert(offsetof(FiberCpuContext, stack_base) == 88);
+static_assert(offsetof(FiberCpuContext, stack_limit) == 96);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static_assert(offsetof(NT_TIB, StackBase) == 8);
+static_assert(offsetof(NT_TIB, StackLimit) == 16);
+#endif
+
 [[gnu::naked,
   gnu::returns_twice]] static KYTY_SYSV_ABI int FiberSaveContext(FiberCpuContext* /*ctx*/) {
 	asm volatile("movq %rdi, %r10\n\t"
@@ -2452,6 +2626,12 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	             "movq %r11, 72(%r10)\n\t"
 	             "stmxcsr 80(%r10)\n\t"
 	             "fnstcw 84(%r10)\n\t"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             "movq %gs:8, %r11\n\t"
+	             "movq %r11, 88(%r10)\n\t"
+	             "movq %gs:16, %r11\n\t"
+	             "movq %r11, 96(%r10)\n\t"
+#endif
 	             "xorl %eax, %eax\n\t"
 	             "retq\n");
 }
@@ -2479,6 +2659,12 @@ FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
 	             "movl %edx, (%rsp)\n\t"
 	             "ldmxcsr (%rsp)\n\t"
 	             "fldcw 84(%r10)\n\t"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             "movq 88(%r10), %rdx\n\t"
+	             "movq %rdx, %gs:8\n\t"
+	             "movq 96(%r10), %rdx\n\t"
+	             "movq %rdx, %gs:16\n\t"
+#endif
 	             "movq 64(%r10), %rsp\n\t"
 	             "jmp *%r11\n");
 }
@@ -2499,15 +2685,19 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
-	                            static_cast<uintptr_t>(fiber->size_context);
-	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
+	const auto      stack_start = fiber->stack_address != 0
+	                                  ? fiber->stack_address
+	                                  : reinterpret_cast<uint64_t>(fiber->addr_context);
+	const auto stack_size = fiber->stack_address != 0 ? fiber->stack_size : fiber->size_context;
+	const auto stack_top  = stack_start + stack_size;
+	auto       rsp        = (stack_top & ~static_cast<uintptr_t>(0x0f));
 	rsp -= sizeof(uint64_t);
 	*reinterpret_cast<uint64_t*>(rsp) = 0;
 
 	ctx.rsp = rsp;
 	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
 	ctx.rdi = reinterpret_cast<uint64_t>(fiber);
+	// stack_base/stack_limit stay 0: guest code runs with zeroed TEB stack bounds, as on guest threads.
 	if ((fiber->flags & FIBER_FLAG_SET_FPU_REGS) != 0) {
 		Common::WriteFpEnv(Common::GuestFpEnv);
 	}
@@ -2521,12 +2711,12 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 	fiber->entry(fiber->arg_on_initialize, fiber->arg_on_run);
 
-	FiberStoreState(fiber, FIBER_STATE_TERMINATED);
 	FiberSetContextValid(fiber, false);
 	fiber->arg_on_return  = 0;
 	auto* context = FiberGetThreadContext();
 	context->returned_fiber = fiber;
-	context->current_fiber = nullptr;
+	context->entry_returned = true;
+	FiberStoreState(fiber, FIBER_STATE_RETURNING);
 
 	FiberRestoreContext(&context->cpu_context, 1);
 }
@@ -2557,12 +2747,20 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 		return FIBER_ERROR_INVALID;
 	}
 
-	std::memset(fiber, 0, sizeof(*fiber));
+	if (FiberIsValid(fiber)) {
+		if (!FiberClaimForReclaim(fiber, true)) {
+			return FIBER_ERROR_STATE;
+		}
+		FiberReleaseStack(fiber);
+	} else {
+		std::memset(fiber, 0, sizeof(*fiber));
+		fiber->magic_start = FIBER_MAGIC_START;
+		fiber->magic_end   = FIBER_MAGIC_END;
+		FiberStoreState(fiber, FIBER_STATE_RECLAIMING);
+	}
 	std::strncpy(fiber->name, name, FIBER_MAX_NAME_LENGTH);
 	fiber->name[FIBER_MAX_NAME_LENGTH] = '\0';
 
-	fiber->magic_start       = FIBER_MAGIC_START;
-	fiber->state             = FIBER_STATE_IDLE;
 	fiber->entry             = entry;
 	fiber->arg_on_initialize = arg_on_initialize;
 	fiber->addr_context      = addr_context;
@@ -2573,7 +2771,8 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 	    (addr_context != nullptr ? static_cast<uint8_t*>(addr_context) + size_context : nullptr);
 	std::memset(&fiber->saved_context, 0, sizeof(fiber->saved_context));
 	FiberSetContextValid(fiber, false);
-	fiber->magic_end = FIBER_MAGIC_END;
+	fiber->arg_on_run    = 0;
+	fiber->arg_on_return = 0;
 
 	if (addr_context != nullptr) {
 		char owner[48];
@@ -2588,6 +2787,7 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 	     fiber->name, reinterpret_cast<uint64_t>(entry), reinterpret_cast<uint64_t>(addr_context),
 	     size_context);
 
+	FiberStoreState(fiber, FIBER_STATE_IDLE);
 	return OK;
 }
 
@@ -2629,11 +2829,13 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	if (!FiberIsValid(fiber)) {
 		return FIBER_ERROR_INVALID;
 	}
-	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
+	if (!FiberClaimForReclaim(fiber, false)) {
 		return FIBER_ERROR_STATE;
 	}
 	LibKernel::Memory::ReleaseGuestStack(reinterpret_cast<uint64_t>(fiber->addr_context));
-
+	FiberSetContextValid(fiber, false);
+	FiberReleaseStack(fiber);
+	FiberStoreState(fiber, FIBER_STATE_TERMINATED);
 	return OK;
 }
 
@@ -2649,6 +2851,8 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
+	const bool stack_acquired = FiberAcquireStack(fiber);
+	EXIT_IF(!stack_acquired);
 
 	fiber->arg_on_run    = arg_on_run;
 	fiber->arg_on_return = 0;
@@ -2663,13 +2867,19 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 		FiberStartOnGuestStack(fiber);
 	}
 
-	auto* returned_fiber  = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
+	auto* returned_fiber    = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
 	const auto return_value = returned_fiber->arg_on_return;
-	const auto return_code =
-	    FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK;
+	const auto return_code  = context.entry_returned ? FIBER_ERROR_STATE : OK;
 	// Copy results before another thread can acquire and resume the fiber.
 	FiberCompleteSwitch(nullptr);
 	FiberSetThreadContext(nullptr);
+	if (context.entry_returned) {
+		FiberReleaseStack(returned_fiber);
+		FiberStoreState(returned_fiber, FIBER_STATE_TERMINATED);
+	}
+	if (context.exit_thread) {
+		LibKernel::PthreadExit(context.exit_value);
+	}
 
 	if (arg_on_return != nullptr) {
 		*arg_on_return = return_value;
@@ -2693,6 +2903,8 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
+	const bool stack_acquired = FiberAcquireStack(fiber);
+	EXIT_IF(!stack_acquired);
 
 	auto* caller = context->current_fiber;
 
@@ -2754,6 +2966,22 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 	}
 
 	return OK;
+}
+
+void FiberExitThread(void* value, void (*run_destructors)()) {
+	auto* context = FiberGetThreadContext();
+	if (context != nullptr) {
+		run_destructors();
+		auto* fiber = context->current_fiber;
+		FiberSetContextValid(fiber, false);
+		fiber->arg_on_return    = 0;
+		context->returned_fiber = fiber;
+		context->entry_returned = true;
+		context->exit_thread    = true;
+		context->exit_value     = value;
+		FiberStoreState(fiber, FIBER_STATE_RETURNING);
+		FiberRestoreContext(&context->cpu_context, 1);
+	}
 }
 
 int32_t KYTY_SYSV_ABI FiberGetInfo(FiberObject* fiber, FiberInfo* fiber_info) {
@@ -3385,6 +3613,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LibKernelApr::InitLibKernel_1_Apr(s);
 	Posix::InitLibKernel_1_Posix(s);
 	LibKernelWriteThrottling::InitLibKernelWriteThrottling(s);
+	LibKernelModuleInfo::InitLibKernel_1_ModuleInfo(s);
 
 	LIB_OBJECT("f7uOxY9mM1U", &LibKernel::g_stack_chk_guard);
 	LIB_OBJECT("djxxOmW6-aw", &LibKernel::g_progname);

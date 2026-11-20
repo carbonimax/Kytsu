@@ -84,6 +84,11 @@ struct MemoryInfo {
 		       !typed && !formatted && data_bits == 32u;
 	}
 
+	[[nodiscard]] bool IsCoherentBufferPairStore(ValueOpcode opcode) const {
+		return kind == ResourceKind::Buffer && opcode == ValueOpcode::StoreBufferU32x2 &&
+		       coherent && !typed && !formatted && data_bits == 32u;
+	}
+
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
@@ -625,9 +630,17 @@ struct DescriptorSource {
 
 			bool operator==(const PointerTable& other) const = default;
 		};
+		// The selector reads a 64-bit pointer from its record. Each hop loads the next 64-bit
+		// pointer at that byte offset; the descriptor is read at table_offset of the last one.
+		struct PointerChain {
+			std::vector<uint32_t> hops;
+
+			bool operator==(const PointerChain& other) const = default;
+		};
 		std::optional<SelectorRead> selector;
 		std::optional<uint32_t> table_maximum;
 		std::optional<PointerTable> pointer_table;
+		std::optional<PointerChain> chain;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;
@@ -645,6 +658,8 @@ struct DescriptorSource {
 		// range.
 		Value                 selector_first;
 		Value    selector_mask;
+		// Negative selector values never reach the resource (a dominating key >= 0 test).
+		bool                  selector_nonnegative = false;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectDescriptor& other) const = default;
