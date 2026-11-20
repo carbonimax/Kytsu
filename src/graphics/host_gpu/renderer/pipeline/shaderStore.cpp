@@ -71,6 +71,7 @@ constexpr std::array ShaderEnvironment {
     "KYTY_VS_PACKED_WAVE32",      "KYTY_VERTEX_TABLE_BACKING_READS", "KYTY_SRT_PROTECTED_LOADS",
     "KYTY_PERVERTEX_EXPERIMENTAL", "KYTY_SHADER_OPT",                "KYTY_SHADER_OPT_LANES",
     "KYTY_F16_ROUNDING",          "KYTY_TESS_HS_MODEL",              "KYTY_F16_STORE_RTZ",
+    "KYTY_DEPTH_COMPARE_COLOR",
 };
 
 uint64_t FrameChecksum(Frame frame, std::span<const uint8_t> compressed) {

@@ -33,6 +33,7 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
 		bool                          skip_degamma               = false;
+		uint32_t                      manual_compare             = 0; // ImageResource::manual_compare
 		bool                          fmask                      = false;
 		uint32_t                      sample_min_lod             = 0;
 		uint32_t                      view_min_level             = 0;
@@ -54,6 +55,12 @@ struct ResourceSpecialization {
 
 	bool operator==(const ResourceSpecialization&) const = default;
 };
+
+// KYTY_DEPTH_COMPARE_COLOR=1 (default off, read once): a comparison sample of a direct color
+// image whose guest format has no depth view (outside DEPTH_FORMAT_POLICIES) reads the texel and
+// compares it in the shader with the S# function, instead of a Dref sample of a color view, which
+// Vulkan leaves undefined. Rule from arigandores/KytyPS5 359b1c3b5.
+bool DepthCompareColorEnabled();
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.

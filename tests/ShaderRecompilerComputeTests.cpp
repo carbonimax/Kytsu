@@ -60,6 +60,7 @@
 #include "graphics/shader/recompiler/ir/ProgramPack.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/rectListShader.h"
@@ -17917,8 +17918,11 @@ public:
 
   // A comparison sample of a k8UNorm texture, a guest format with no depth view: the 4x4 PCF case
   // of arigandores/KytyPS5 359b1c3b5. It prints every answer next to the CPU PCF (compare each
-  // texel, then the bilinear weights) and NEAREST references; `strict` requires them.
-  void CheckDepthCompareColorTexture(bool strict) {
+  // texel, then the bilinear weights) and NEAREST references. With KYTY_DEPTH_COMPARE_COLOR=1 the
+  // shader compares the sampled texel: NEAREST must match exactly, LINEAR must equal the test of the
+  // filtered texel, and no Dref sample may remain.
+  void CheckDepthCompareColorTexture() {
+    const bool manual = ShaderRecompiler::IR::DepthCompareColorEnabled();
     constexpr const char *name = "DepthCompareColorTexture";
     constexpr uintptr_t base = 0x0000000204b00000ull;
     constexpr uint64_t allocation_size = 0x10000;
@@ -17988,8 +17992,12 @@ public:
       test.user_data[50] = static_cast<u32>(points.size() * references.size() * sizeof(uint32_t));
       test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
                       ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      if (manual) {
+        test.forbidden_spirv = {"OpImageSampleDref"};
+      }
       std::vector<double> pcf;
       std::vector<double> nearest;
+      std::vector<double> step;
       for (const auto reference : references) {
         for (const auto &point : points) {
           AppendVMovLiteral(&test.code, 20, std::bit_cast<uint32_t>(reference));
@@ -18007,14 +18015,21 @@ public:
           const auto pass = [&](int x, int y) { return reference <= texel(x, y) ? 1.0 : 0.0; };
           pcf.push_back((1.0 - a) * (1.0 - b) * pass(i0, j0) + a * (1.0 - b) * pass(i0 + 1, j0) +
                         (1.0 - a) * b * pass(i0, j0 + 1) + a * b * pass(i0 + 1, j0 + 1));
+          const double filtered = (1.0 - a) * (1.0 - b) * texel(i0, j0) +
+                                  a * (1.0 - b) * texel(i0 + 1, j0) +
+                                  (1.0 - a) * b * texel(i0, j0 + 1) + a * b * texel(i0 + 1, j0 + 1);
+          step.push_back(reference <= filtered ? 1.0 : 0.0);
           nearest.push_back(pass(static_cast<int>(std::floor(4.0 * point.s)),
                                  static_cast<int>(std::floor(4.0 * point.t))));
         }
       }
       AppendEnd(&test.code);
       const auto compiled = CompileCase(test, SubgroupSize());
+      // The shader path turns the image into a plain one that carries 1 + LESS_EQUAL.
       Require(name, "comparison resource", compiled.program.info.images.size() == 1 &&
-                  compiled.program.info.images[0].depth_compare,
+                  (manual ? compiled.program.info.images[0].manual_compare == 4u &&
+                                !compiled.program.info.images[0].depth_compare
+                          : compiled.program.info.images[0].depth_compare),
               "the comparison sample lost its comparison resource");
       ShaderRecompiler::IR::DescriptorValue value{};
       value.dword_count = 8;
@@ -18036,13 +18051,14 @@ public:
       const auto answers = ReadBuffer(name, output, pcf.size());
       for (size_t k = 0; k < pcf.size(); k++) {
         const double got = std::bit_cast<float>(answers[k]);
-        const double want = linear ? pcf[k] : nearest[k];
+        const double want = !linear ? nearest[k] : manual ? step[k] : pcf[k];
         const bool ok = std::abs(got - want) <= 1.0 / 64.0;
         mismatches += ok ? 0u : 1u;
-        std::printf("[s4] filter=%s ref=%.3f s=%.3f t=%.3f got=%.4f pcf=%.4f nearest=%.0f %s\n",
-                    linear ? "linear" : "point", references[k / points.size()],
+        std::printf("[s4] manual=%d filter=%s ref=%.3f s=%.3f t=%.3f got=%.4f pcf=%.4f "
+                    "nearest=%.0f step=%.0f %s\n",
+                    manual ? 1 : 0, linear ? "linear" : "point", references[k / points.size()],
                     points[k % points.size()].s, points[k % points.size()].t, got, pcf[k],
-                    nearest[k], ok ? "ok" : "DIFF");
+                    nearest[k], step[k], ok ? "ok" : "DIFF");
       }
       DestroyBuffer(&output);
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -18052,8 +18068,9 @@ public:
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "comparison texture release failed");
-    if (strict) {
-      Require(name, "PCF answers", mismatches == 0, "a k8UNorm comparison differs from PCF");
+    if (manual) {
+      Require(name, "shader comparison", mismatches == 0,
+              "a k8UNorm shader comparison differs from its reference");
     }
     std::printf("[gpu]     %-32s %s (%u differ)\n", name, mismatches == 0 ? "ok" : "report", mismatches);
   }
@@ -62984,7 +63001,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-compare-color-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckDepthCompareColorTexture(false);
+    vulkan.CheckDepthCompareColorTexture();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
