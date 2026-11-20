@@ -36,11 +36,15 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -49,6 +53,40 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// The shader whose images PrepareBindings resolves (0 elsewhere), for the S4 counter.
+thread_local uint64_t t_binding_shader_hash = 0;
+
+// shortcut: measurement only (KYTY_PERF_STATS=1), no behaviour change; remove once the
+// depth-compare rule for color formats is decided. Every depth-compare bind counts; one that ends
+// on a color image with a guest format outside DEPTH_FORMAT_POLICIES keeps a color view with a
+// comparison sampler, which Vulkan leaves undefined. Logs each new (shader, guest format) pair
+// of those, and the totals at each power of two of all depth-compare binds.
+void NoteDepthCompareBind(Prospero::BufferFormat guest_format, vk::Format image_format,
+                          bool color_image) {
+	if (!PerfStats::Enabled()) {
+		return;
+	}
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint32_t>> seen;
+	static uint64_t                                binds = 0, outside = 0;
+	const auto format = static_cast<uint32_t>(guest_format);
+	const bool hit    = color_image && FindGuestDepthFormatPolicy(guest_format) == nullptr;
+	std::lock_guard lock(mutex);
+	++binds;
+	if (hit) {
+		++outside;
+		if (seen.emplace(t_binding_shader_hash, format).second) {
+			std::printf("PERF arifix-s4 shader=0x%016" PRIx64 " guest_format=%u image_format=%d\n",
+			            t_binding_shader_hash, format, static_cast<int>(image_format));
+		}
+	}
+	if (std::has_single_bit(binds)) {
+		std::printf("PERF arifix-s4-seen compare_binds=%" PRIu64 " outside_table=%" PRIu64
+		            " pairs=%zu\n",
+		            binds, outside, seen.size());
+	}
+}
 
 } // namespace
 
@@ -685,6 +723,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
+	if (resource.depth_compare) {
+		NoteDepthCompareBind(desc.info.guest_format, image->info.pixel_format,
+		                     !stencil_association && !image->info.IsDepth());
+	}
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
@@ -938,7 +980,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				MipStats::Mark(descriptor.MipStatsCntId());
 			}
 		}
+		t_binding_shader_hash = program.shader_hash;
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		t_binding_shader_hash = 0;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();

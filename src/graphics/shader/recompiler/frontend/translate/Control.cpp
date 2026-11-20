@@ -43,13 +43,25 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 	}
 }
 
-void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
-                            bool negate_exec, bool negate_source, bool write_64) {
+void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, SaveExecOp operation,
+                            bool negate_exec, bool negate_source, bool negate_result,
+                            bool write_64) {
 	const auto combine = [&](IR::U32 old, IR::U32 src) {
 		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
 		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
-		return operation == IR::ValueOpcode::LogicalAnd ? ir.BitwiseAnd(lhs, rhs)
-		                                                : ir.BitwiseOr(lhs, rhs);
+		const auto value = operation == SaveExecOp::And ? ir.BitwiseAnd(lhs, rhs)
+		                   : operation == SaveExecOp::Or ? ir.BitwiseOr(lhs, rhs)
+		                                                 : ir.BitwiseXor(lhs, rhs);
+		return negate_result ? ir.BitwiseNot(value) : value;
+	};
+	const auto combine_lanes = [&](IR::U1 lhs, IR::U1 rhs) {
+		// Only the form's own ops, so the AND/OR forms keep their IR.
+		const auto value =
+		    operation == SaveExecOp::And  ? ir.LogicalAnd(lhs, rhs)
+		    : operation == SaveExecOp::Or ? ir.LogicalOr(lhs, rhs)
+		                                  : ir.LogicalAnd(ir.LogicalOr(lhs, rhs),
+		                                                  ir.LogicalNot(ir.LogicalAnd(lhs, rhs)));
+		return negate_result ? ir.LogicalNot(value) : value;
 	};
 	if (!write_64) {
 		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
@@ -70,8 +82,7 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 	const std::array old_mask {ir.GetExecLo(), ir.GetExecHi()};
 	const std::array mask {combine(old_mask[0], src_mask[0]), combine(old_mask[1], src_mask[1])};
 	WriteMask(inst.dst, old, old_mask, true);
-	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo), IR::U1(ir.Emit(operation, {lhs, rhs})),
-	          mask);
+	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo), combine_lanes(lhs, rhs), mask);
 	ir.SetScc(ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u))));
 }
 
