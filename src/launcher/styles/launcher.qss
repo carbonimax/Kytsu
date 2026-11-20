@@ -7,6 +7,16 @@ QListView#cfgs_grid {
     outline: 0;
 }
 
+/* The carousel paints its own background; this gradient only shows before it first paints. */
+QListView#cfgs_grid {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0b1d3a, stop:1 #05080f);
+    color: white;
+}
+
+QListView#cfgs_grid::item {
+    background: transparent;
+}
+
 QTreeWidget#cfgs_list::item {
     background: transparent;
     border-bottom: 1px solid palette(mid);
