@@ -602,8 +602,16 @@ private:
 	}
 
 	static bool SplitPlaceholder(uint64_t vaddr, uint64_t size) {
-		return VirtualFree(reinterpret_cast<void*>(vaddr), size,
-		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
+		if (VirtualFree(reinterpret_cast<void*>(vaddr), size,
+		                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0) {
+			return true;
+		}
+		const auto error = static_cast<uint32_t>(GetLastError());
+		LOGF_COLOR(Log::Color::Red,
+		           "\t guest placeholder split failed: base=0x%016" PRIx64 " size=0x%016" PRIx64
+		           " error=0x%08" PRIx32 "\n",
+		           vaddr, size, error);
+		return false;
 	}
 
 	bool ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
