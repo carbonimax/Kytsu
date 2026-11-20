@@ -906,6 +906,23 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+// A download can reach past the guest mapping (unmapped holes after a VMA): only the mapped
+// prefix is written back, and a prefix without host backing is skipped.
+static void WriteDownloadBacking(uint64_t guest, const uint8_t* host, uint64_t size) {
+	const auto writable = Libs::LibKernel::Memory::TryClampRangeSize(guest, size);
+	if (writable == 0) {
+		LOGF("BufferCache: skipped GPU download into unmapped guest addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     guest, size);
+		return;
+	}
+	if (!Libs::LibKernel::Memory::TryWriteBacking(guest, host, writable)) {
+		LOGF("BufferCache: skipped GPU download write without host backing addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     guest, writable);
+	}
+}
+
 std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(Buffer&  buffer,
                                                                               uint64_t vaddr,
                                                                               uint64_t size,
@@ -955,8 +972,8 @@ std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(B
 				auto& ring = m_readback_queue->Ring();
 				ring.Invalidate(offset, Common::AlignUp(total_size, 256));
 				for (const auto& copy: copies) {
-					Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-					                                      mapped + (copy.dstOffset - offset), copy.size);
+					WriteDownloadBacking(buffer_address + copy.srcOffset,
+					                     mapped + (copy.dstOffset - offset), copy.size);
 				}
 				m_readback_queue->Release(seq);
 				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
@@ -1095,8 +1112,8 @@ void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> co
 	publish_out = [mapped, offset, total_size, buffer_address, download = &download, copies = std::move(copies)] {
 		download->Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			WriteDownloadBacking(buffer_address + copy.srcOffset, mapped + (copy.dstOffset - offset),
+			                     copy.size);
 		}
 	};
 }
@@ -1135,10 +1152,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, m_graphics.null_descriptor_enabled ? MemoryUsage::DeviceLocal : MemoryUsage::Stream, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
+	// Bound in place of a missing guest buffer, so a read must see zeros.
 	if (!m_graphics.null_descriptor_enabled) {
 		auto& buffer = GetBuffer(null_id);
 		std::memset(buffer.Mapped().data(), 0, static_cast<size_t>(buffer.Size()));
 		buffer.Flush(0, buffer.Size());
+	} else {
+		auto& buffer = GetBuffer(null_id);
+		buffer.Fill(0, buffer.Size(), 0);
 	}
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	if (graphics.readback_queue != nullptr && AsyncFaultReadbacks()) {
@@ -2993,8 +3014,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
-		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
-			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		// Private mappings are copied and backing holes read as zeros, like buffer uploads; a range
+		// outside the guest address space reads as zeros too.
+		if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+			std::memset(mapped, 0, static_cast<size_t>(size));
 		}
 	});
 }
@@ -3168,6 +3191,10 @@ void BufferCache::RunGarbageCollector() {
 	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
+		// The memory tracker cannot hold address 0.
+		if (buffer.CpuAddress() == 0) {
+			return false;
+		}
 		WaitPendingPublishes(buffer.CpuAddress(), buffer.Size());
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");

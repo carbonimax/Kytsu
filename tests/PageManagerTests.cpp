@@ -723,7 +723,8 @@ void TestConcurrentSharedWatchers() {
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 256; count++) {
+    // The write-watcher count is 16-bit: the 65536th watcher overflows.
+    for (uint32_t count = 0; count <= UINT16_MAX; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }
