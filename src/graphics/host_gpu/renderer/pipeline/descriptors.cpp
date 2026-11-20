@@ -81,12 +81,17 @@ void NoteDepthCompareColorBind(const Program& program, const Snapshot& snapshot,
 			samplers += fmt::format(" s={:08x},{:08x},{:08x},{:08x}", s[0], s[1], s[2], s[3]);
 		}
 	}
+	// First 4 guest bytes at the T# address (texel 0 of a linear k8UNorm), or "-" when unreadable.
+	const uint64_t address = ((static_cast<uint64_t>(t[1] & 0xffu) << 32u) | t[0]) << 8u;
+	uint32_t       bytes   = 0;
+	const auto     texel   = Libs::LibKernel::Memory::TryReadBacking(address, &bytes, sizeof(bytes))
+	                             ? fmt::format("{:08x}", bytes) : std::string("-");
 	std::printf("PERF s4-color shader=0x%016" PRIx64 " stage=%u img=%u fmt=%u host_fmt=%d "
-	            "extent=%ux%u layers=%u gpu=%d t=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x%s\n",
+	            "extent=%ux%u layers=%u gpu=%d bytes=%s t=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x%s\n",
 	            program.shader_hash, static_cast<uint32_t>(program.stage), index, format,
 	            static_cast<int>(image.info.pixel_format), image.info.extent.width,
 	            image.info.extent.height, image.info.resources.layers, image.IsGpuModified() ? 1 : 0,
-	            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], samplers.c_str());
+	            texel.c_str(), t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], samplers.c_str());
 }
 
 } // namespace
