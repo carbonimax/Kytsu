@@ -966,6 +966,10 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	PerfStats::MarkGpuThread();
+	if (const auto processor = Common::Thread::ReserveCoreForCurrentThread(); processor >= 0) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GPU: command processor assigned to the core of logical processor {}.\n", processor));
+	}
 
 	for (;;) {
 		Submission                   submission;
