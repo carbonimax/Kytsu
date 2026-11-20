@@ -55908,6 +55908,62 @@ void CheckSampledColorViews() {
 }
 #endif
 
+// One comparison S# serves a k32Float image (depth view, native comparison) and a k8UNorm image
+// (no depth view). With KYTY_DEPTH_COMPARE_COLOR=1 the k8UNorm image compares in the shader through
+// its own sampler variant without the S# function, and the depth image keeps the native one.
+void CheckDepthCompareColorSharedSampler() {
+  constexpr const char *name = "DepthCompareColorSharedSampler";
+  const bool manual = ShaderRecompiler::IR::DepthCompareColorEnabled();
+  const auto texture = [](uint64_t address, Prospero::BufferFormat format) {
+    return ShaderTextureResource{{static_cast<u32>(address >> 8u),
+        (static_cast<u32>(format) << 20u) | (3u << 30u), 3u << 14u,
+        DstSel(4, 4, 4, 4) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+        0, 0x00700000u, 0, 0}};
+  };
+  const auto color = texture(0x204b00000ull, Prospero::BufferFormat::k8UNorm);
+  const auto depth = texture(0x204c00000ull, Prospero::BufferFormat::k32Float);
+  const ShaderSamplerResource sampler{{3u << 12u, 0, 0, 0}}; // LESS_EQUAL
+  TestCase test;
+  test.name = name;
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = color.DstSelXYZW();
+  std::copy_n(color.fields, 8, test.user_data.begin());
+  std::copy_n(sampler.fields, 4, test.user_data.begin() + 8);
+  std::copy_n(depth.fields, 8, test.user_data.begin() + 12);
+  test.user_data[50] = 2u * sizeof(u32);
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  for (const u32 reg : {20u, 21u, 22u}) AppendVMovLiteral(&test.code, reg, std::bit_cast<u32>(0.5f));
+  test.code.push_back(EncodeMimg0(0x2f, 1)); // image_sample_c_lz 2D, k8UNorm at s[0:7]
+  test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+  test.code.push_back(EncodeMimg0(0x2f, 1)); // same S#, k32Float at s[12:19]
+  test.code.push_back(EncodeMimg1(1, 20, 3, 2));
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendStoreVgpr(&test.code, 1, 1);
+  AppendEnd(&test.code);
+  const auto compiled = CompileCase(test, 64);
+  const auto &info = compiled.program.info;
+  Require(name, "resources", info.images.size() == 2 && info.sampled_pairs.size() == 2,
+          "expected two images and two sampled pairs");
+  const auto plain = std::ranges::count_if(info.images, [](const auto &image) {
+    return image.manual_compare == 4u && !image.depth_compare;
+  });
+  const auto native = std::ranges::count_if(info.images, [](const auto &image) {
+    return image.manual_compare == 0u && image.depth_compare;
+  });
+  Require(name, "image paths", manual ? plain == 1 && native == 1 : plain == 0 && native == 2,
+          "the k8UNorm image did not take the shader comparison next to the native depth image");
+  for (const auto &pair : info.sampled_pairs) {
+    Require(name, "sampler variant",
+            pair.sampler < info.samplers.size() &&
+                info.samplers[pair.sampler].depth_compare == info.images[pair.image].depth_compare,
+            "a sampler variant disagrees with the comparison of its image");
+  }
+  Require(name, "sampler count", info.samplers.size() == (manual ? 2u : 1u),
+          "the shared comparison sampler did not split into a plain and a comparison variant");
+  std::printf("[host]    %-32s ok (manual=%d)\n", name, manual ? 1 : 0);
+}
+
 void CheckSampledDepthResource() {
   ShaderRecompiler::IR::ImageResource resource{};
   resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -63001,6 +63057,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-compare-color-only") == 0) {
     VulkanHarness vulkan;
+    CheckDepthCompareColorSharedSampler();
     vulkan.CheckDepthCompareColorTexture();
     return 0;
   }
@@ -63124,6 +63181,7 @@ int main(int argc, char **argv) {
   CheckSampledColorViews();
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
+  CheckDepthCompareColorSharedSampler();
   CheckDepthTextureEncoding();
   vulkan.CheckSamplerBorderColors();
   vulkan.CheckSamplerFilterMode();

@@ -170,9 +170,12 @@ bool ValidatePackedUnormSampling(const ResourcePlan& program, const ResourceSnap
 	return true;
 }
 
-enum class SamplerClass : uint8_t { Float, Integer };
+// Manual: the plain sample of a shader-compared image (manual_compare) needs a variant without the
+// S# comparison, which another image of the same guest sampler may still use natively.
+enum class SamplerClass : uint8_t { Float, Integer, Manual };
 
 SamplerClass ClassifySampler(const ImageResource& image) {
+	if (image.manual_compare != 0u) return SamplerClass::Manual;
 	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
 	               image.numeric_class == Prospero::TextureNumericClass::Sint
 	           ? SamplerClass::Integer : SamplerClass::Float;
@@ -895,7 +898,7 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::vector<std::array<uint32_t, 2>> mapping;
+	std::vector<std::array<uint32_t, 3>> mapping;
 	std::vector<Binding>                bindings;
 };
 
@@ -940,21 +943,15 @@ private:
 };
 
 // 1 + the DEPTH_COMPARE_FUNC every sampler of image `index` carries, or 0 (native) when they
-// differ or one of them also serves a native comparison image, whose host sampler keeps
-// compareEnable: a plain sample through it would be undefined too.
+// differ. A sampler shared with a native comparison image gets a Manual variant (SamplerClass).
 static uint32_t ManualCompareFunction(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                                       uint32_t index) {
 	uint32_t function = 0;
 	for (const auto& pair: program.info.sampled_pairs) {
 		if (pair.image != index) continue;
 		if (pair.sampler >= snapshot.samplers.size()) return 0;
-		const bool shared = std::ranges::any_of(program.info.sampled_pairs, [&](const auto& other) {
-			return other.sampler == pair.sampler && other.image != index &&
-			       other.image < program.info.images.size() &&
-			       program.info.images[other.image].depth_compare;
-		});
 		const auto value = 1u + ((snapshot.samplers[pair.sampler].dwords[0] >> 12u) & 0x7u);
-		if (shared || (function != 0 && function != value)) return 0;
+		if (function != 0 && function != value) return 0;
 		function = value;
 	}
 	return function;
@@ -2254,7 +2251,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::Integer;
-		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		samplers[index].integer_border        = binding.type == SamplerClass::Integer;
 	}
 	for (uint32_t index = 0; index < sampler_plan.bindings.size(); index++) {
 		const auto& binding = sampler_plan.bindings[index];
