@@ -157,6 +157,18 @@ public:
 	[[nodiscard]] uint64_t ColorMetadataEpoch() const {
 		return m_color_metadata_epoch.load(std::memory_order_relaxed);
 	}
+	// Advances whenever a buffer is registered or unregistered (GPU thread).
+	[[nodiscard]] uint64_t BufferSetEpoch() const noexcept { return m_buffer_set_epoch; }
+	// KYTY_BIND_MEMO: see MemoryTracker::CpuDirtyEpoch.
+	[[nodiscard]] uint64_t CpuDirtyEpoch(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.CpuDirtyEpoch(vaddr, size);
+	}
+	// KYTY_BIND_MEMO: a kept binding still counts as a use of its buffer (GC age).
+	void TouchBinding(const Buffer& buffer) { TouchBuffer(buffer); }
+	// KYTY_BIND_MEMO_STATS: synchronizations that uploaded CPU data, or that copied an image or
+	// went through imported memory (GPU thread).
+	[[nodiscard]] uint64_t SyncUploads() const noexcept { return m_sync_uploads; }
+	[[nodiscard]] uint64_t SyncOther() const noexcept { return m_sync_other; }
 	void               ProcessFaultBuffer();
 	// Synchronizes the queued BDA ranges that are mapped, with deferred uploads (see
 	// BeginDeferredUploads).
@@ -329,6 +341,9 @@ private:
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
+	uint64_t                                          m_buffer_set_epoch = 0;
+	uint64_t                                          m_sync_uploads     = 0;
+	uint64_t                                          m_sync_other       = 0;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	// KYTY_CP_PIPELINE: the GPU thread's program lookups test the ranges while the back thread runs.

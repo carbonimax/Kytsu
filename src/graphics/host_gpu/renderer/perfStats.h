@@ -179,6 +179,43 @@ enum class Counter : uint32_t {
 	Frames50,
 	Frames67,
 	FramesLong,
+	// KYTY_BIND_MEMO_STATS=1 (measurement; needs KYTY_PERF_STATS=1), CP back thread only: buffer slot
+	// lookups a memo could keep ("PERF bindmemo"). Each *Ns includes one clock read (BmClockNs per call).
+	BmCalls,       // RebindBuffers: NativeStorageBuffer calls
+	BmNs,
+	BmClockNs,     // one empty clock pair per call (to subtract)
+	BmNull,        // null range
+	BmNullNs,
+	BmWritten,     // written binding
+	BmWrittenNs,
+	BmStream,      // read copied into the stream buffer (CPU-dirty range)
+	BmStreamNs,
+	BmWork,        // read whose synchronization uploaded, copied an image or went through imported memory
+	BmWorkNs,
+	BmClean,       // read with nothing to do
+	BmCleanNs,
+	BmTexel,       //   of clean: formatted (texel) reads
+	BmTexelNs,
+	BmSlotHit,     //   of clean: same input and result as the slot's previous lookup (stored after no stream/image),
+	BmSlotHitNs,   //   no buffer (un)registered in between
+	BmSlotTexel,   //     of slot hits: texel
+	BmSlotTexelNs,
+	BmSlotDiff,    //   same slot input and buffer set, but another result (a memo would be wrong)
+	BmRangeHit,    //   of clean: the same by (range, kind) in a 4096-entry direct-mapped table
+	BmRangeHitNs,
+	FbSlots,       // FindBuffers: buffer slots
+	FbNs,
+	FbClockNs,
+	FbHit,         // same program, V# and resulting source as the slot's previous draw, buffer set unchanged
+	FbHitNs,
+	// KYTY_BIND_MEMO=2 (descriptors.cpp): slots the memo would keep, looked up anyway, and differences
+	// ("PERF bindverify").
+	BvFindChecked,
+	BvFindDiffs,
+	BvBindChecked,
+	BvBindDiffs,
+	BvBindMisses,  // plain-read slots the memo could not keep (key or epoch changed, or not stored)
+	BvBindRaced,   // of checked: differed, but the CPU-dirty epoch moved during the lookup itself
 	Count
 };
 
@@ -192,6 +229,8 @@ enum class Counter : uint32_t {
 // descriptor evaluation, specialization, permutation search), counts what changes between lookups and
 // which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
 [[nodiscard]] bool SrtProfEnabled() noexcept;
+// KYTY_BIND_MEMO_STATS=1 (measurement, default off; needs KYTY_PERF_STATS=1), on the CP back thread.
+[[nodiscard]] bool BindMemoStatsEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;

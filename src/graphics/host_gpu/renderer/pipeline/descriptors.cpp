@@ -30,6 +30,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -115,7 +116,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    const Buffer** obtained = nullptr) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -137,6 +139,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	if (obtained != nullptr) {
+		*obtained = buffer;
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -952,10 +957,216 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
+namespace {
+
+using StatsClock = std::chrono::steady_clock;
+
+uint64_t StatsNs(StatsClock::time_point a, StatsClock::time_point b) {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+}
+
+// KYTY_BIND_MEMO_STATS: one FindBuffers slot, timed from construction; at destruction it counts
+// whether the slot found the same source for the same program and V# as its previous draw.
+struct FindSlotStats {
+	FindSlotStats(PreparedBindings::BufferSlotStats* slot, const PreparedBindings::BufferSource& source,
+	              const void* program, const ShaderRecompiler::IR::DescriptorValue& value, bool written,
+	              const BufferCache& cache)
+	    : slot(slot), source(source), program(program), value(value), written(written), cache(cache) {
+		if (slot != nullptr) {
+			const auto c0 = StatsClock::now();
+			start         = StatsClock::now();
+			PerfStats::Add(PerfStats::Counter::FbClockNs, StatsNs(c0, start));
+			epoch = cache.BufferSetEpoch();
+		}
+	}
+	~FindSlotStats() {
+		if (slot == nullptr) return;
+		const auto ns = StatsNs(start, StatsClock::now());
+		PerfStats::Add(PerfStats::Counter::FbSlots, 1);
+		PerfStats::Add(PerfStats::Counter::FbNs, ns);
+		// Sentinel write ranges also depend on the other stages (not kept, as in the fork).
+		const bool sentinel = written && DecodeNativeDescriptor<ShaderBufferResource>(value).NumRecords() == UINT32_MAX;
+		if (!sentinel && slot->program == program && slot->value == value && slot->find_epoch == epoch &&
+		    epoch == cache.BufferSetEpoch() && slot->source.address == source.address &&
+		    slot->source.size == source.size && slot->source.id == source.id) {
+			PerfStats::Add(PerfStats::Counter::FbHit, 1);
+			PerfStats::Add(PerfStats::Counter::FbHitNs, ns);
+		}
+		slot->program    = sentinel ? nullptr : program;
+		slot->value      = value;
+		slot->source     = source;
+		slot->find_epoch = cache.BufferSetEpoch();
+	}
+	PreparedBindings::BufferSlotStats*           slot;
+	const PreparedBindings::BufferSource&        source;
+	const void*                                  program;
+	const ShaderRecompiler::IR::DescriptorValue& value;
+	bool                                         written;
+	const BufferCache&                           cache;
+	StatsClock::time_point                       start {};
+	uint64_t                                     epoch = 0;
+};
+
+// KYTY_BIND_MEMO_STATS: classifies one NativeStorageBuffer call of RebindBuffers (CP back thread).
+void NoteBindStats(BufferCache& cache, PreparedBindings::BufferSlotStats& slot,
+                   const PreparedBindings::BufferSource& source, const ShaderRecompiler::IR::BufferResource& resource,
+                   const vk::DescriptorBufferInfo& info, uint32_t offset, uint64_t epoch0, uint64_t uploads0,
+                   uint64_t other0, uint64_t clock_ns, uint64_t ns) {
+	using PerfStats::Add;
+	using C = PerfStats::Counter;
+	Add(C::BmCalls, 1);
+	Add(C::BmNs, ns);
+	Add(C::BmClockNs, clock_ns);
+	const bool texel = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+	const auto kind  = static_cast<uint32_t>(resource.written ? 1 : texel ? 3 : 2);
+	const bool upload = cache.SyncUploads() != uploads0;
+	const bool other  = cache.SyncOther() != other0;
+	const bool stream = info.buffer && info.buffer == cache.GetUtilityBuffer(MemoryUsage::Stream).Handle();
+	bool       kept   = false;
+	if (source.address == 0 || source.size == 0) {
+		Add(C::BmNull, 1);
+		Add(C::BmNullNs, ns);
+	} else if (resource.written) {
+		Add(C::BmWritten, 1);
+		Add(C::BmWrittenNs, ns);
+	} else if (stream) {
+		Add(C::BmStream, 1);
+		Add(C::BmStreamNs, ns);
+	} else if (upload || other) {
+		Add(C::BmWork, 1);
+		Add(C::BmWorkNs, ns);
+		kept = !other; // after an upload the range is clean: a memo may store it
+	} else {
+		kept = true;
+		Add(C::BmClean, 1);
+		Add(C::BmCleanNs, ns);
+		if (kind == 3) {
+			Add(C::BmTexel, 1);
+			Add(C::BmTexelNs, ns);
+		}
+		const bool same_key = slot.kept && slot.address == source.address && slot.size == source.size &&
+		                      slot.kind == kind && slot.bind_epoch == epoch0 && epoch0 == cache.BufferSetEpoch();
+		if (same_key && slot.info == info && slot.offset == offset) {
+			Add(C::BmSlotHit, 1);
+			Add(C::BmSlotHitNs, ns);
+			if (kind == 3) {
+				Add(C::BmSlotTexel, 1);
+				Add(C::BmSlotTexelNs, ns);
+			}
+		} else if (same_key) {
+			Add(C::BmSlotDiff, 1);
+		}
+		struct RangeEntry {
+			uint64_t                 address = 0, size = 0, epoch = UINT64_MAX;
+			vk::DescriptorBufferInfo info;
+			uint32_t                 offset = 0, kind = 0;
+		};
+		static std::array<RangeEntry, 4096> table {}; // back thread only
+		auto& e = table[((source.address ^ (source.size << 40u) ^ kind) * 0x9e3779b97f4a7c15ull) >> 52u];
+		if (e.address == source.address && e.size == source.size && e.kind == kind && e.epoch == epoch0 &&
+		    epoch0 == cache.BufferSetEpoch() && e.info == info && e.offset == offset) {
+			Add(C::BmRangeHit, 1);
+			Add(C::BmRangeHitNs, ns);
+		}
+		e = {source.address, source.size, cache.BufferSetEpoch(), info, offset, kind};
+	}
+	slot = {slot.program, slot.value, slot.source, slot.find_epoch, source.address, source.size,
+	        cache.BufferSetEpoch(), info, offset, kind, kept};
+}
+
+// KYTY_BIND_MEMO (default 0): buffer slot memo, after pengui07/KytyPS5 (Petr, GPL-2.0).
+//   0: every slot looks its buffer up (FindBuffers) and binds it (RebindBuffers) at each draw;
+//   1: a slot keeps its source while its V# and slot metadata, the buffer set and the guest virtual
+//      ranges are unchanged, and keeps its plain-read binding while its range, the buffer set and the
+//      CPU-dirty epochs of the 64 KiB blocks it covers are unchanged; in-session A/B:
+//      KYTY_AB_FLAG=bind_memo (arm 0 = off). Entries left during an off arm stay exact: every input
+//      they depend on is in their key;
+//   2: verify: each slot a memo would keep is looked up and bound anyway and compared ("PERF bindverify").
+// Off while imported memory, the late-read detector or a GPU capture is active (their bookkeeping
+// runs inside the lookups).
+int BindMemoMode(const BufferCache& cache) {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_BIND_MEMO");
+		const int   m     = value == nullptr ? 0 : std::atoi(value);
+		if (m != 0) {
+			std::printf("KYTY_BIND_MEMO=%d\n", m);
+		}
+		return m;
+	}();
+	if (mode == 0 || cache.ImportActive() || LateRead::Enabled() || GpuCapture::Enabled()) [[likely]] {
+		return 0;
+	}
+	return mode == 1 && PerfStats::AbOff("bind_memo") ? 0 : mode;
+}
+
+// KYTY_BIND_MEMO=2: the first differences, in the log (counts: "PERF bindverify", KYTY_PERF_STATS=1).
+void NoteVerifyDiff(const char* what, uint64_t address, uint64_t size, const char* why) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("KYTY_BIND_MEMO=2: %s diff addr=0x%016" PRIx64 " size=0x%" PRIx64 ": %s\n", what, address, size, why);
+	}
+}
+
+// KYTY_BIND_MEMO: one FindBuffers slot. Reads the generations before the lookup (an edit during it
+// makes the next draw miss) and stores the found source at destruction; in verify mode compares it
+// with the kept one.
+struct FindSlotMemo {
+	FindSlotMemo(PreparedBindings::BufferSlotMemo* memo, const PreparedBindings::BufferSource& source,
+	             const ShaderRecompiler::IR::DescriptorValue& value, const ShaderRecompiler::IR::BufferResource& metadata,
+	             const BufferCache& cache, bool check)
+	    : memo(memo), source(source), value(value), metadata(metadata), check(check) {
+		if (memo != nullptr) {
+			buffers = cache.BufferSetEpoch();
+			ranges  = LibKernel::Memory::VirtualRangesGeneration();
+			kept    = memo->source;
+		}
+	}
+	~FindSlotMemo() {
+		if (memo == nullptr) return;
+		if (check) {
+			PerfStats::Add(PerfStats::Counter::BvFindChecked, 1);
+			if (source.address != kept.address || source.size != kept.size || source.id != kept.id) {
+				PerfStats::Add(PerfStats::Counter::BvFindDiffs, 1);
+				NoteVerifyDiff("find", source.address, source.size, "other source");
+			}
+		}
+		// Sentinel write ranges also depend on the other stages' reads: not kept.
+		const bool sentinel =
+		    metadata.written && DecodeNativeDescriptor<ShaderBufferResource>(value).NumRecords() == UINT32_MAX;
+		memo->value           = value;
+		memo->max_byte_extent = metadata.max_byte_extent;
+		memo->written         = metadata.written;
+		memo->scalar          = metadata.scalar;
+		memo->find_kept       = !sentinel;
+		memo->find_buffers    = buffers;
+		memo->find_ranges     = ranges;
+		memo->source          = source;
+	}
+	PreparedBindings::BufferSlotMemo*            memo;
+	const PreparedBindings::BufferSource&        source;
+	const ShaderRecompiler::IR::DescriptorValue& value;
+	const ShaderRecompiler::IR::BufferResource&  metadata;
+	bool                                         check;
+	PreparedBindings::BufferSource               kept;
+	uint64_t                                     buffers = 0, ranges = 0;
+};
+
+bool FindKept(const PreparedBindings::BufferSlotMemo& memo, const ShaderRecompiler::IR::DescriptorValue& value,
+              const ShaderRecompiler::IR::BufferResource& metadata, const BufferCache& cache) {
+	return memo.find_kept && memo.value == value && memo.max_byte_extent == metadata.max_byte_extent &&
+	       memo.written == metadata.written && memo.scalar == metadata.scalar &&
+	       memo.find_buffers == cache.BufferSetEpoch() &&
+	       memo.find_ranges == LibKernel::Memory::VirtualRangesGeneration();
+}
+
+} // namespace
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindFindBuffersNs, PerfStats::BindProfEnabled());
 	auto& cache = m_context.GetBufferCache();
+	const bool memo_stats = PerfStats::BindMemoStatsEnabled();
+	const int  memo_mode  = BindMemoMode(cache);
 	BufferCache::UploadBatch upload_batch(cache);
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
@@ -966,10 +1177,31 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
 		}
+		if (memo_stats) {
+			prepared.buffer_stats.resize(prepared.buffer_sources.size());
+		}
+		if (memo_mode != 0) {
+			prepared.buffer_memo.resize(prepared.buffer_sources.size());
+		}
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
+			PreparedBindings::BufferSlotMemo* memo  = nullptr;
+			bool                              check = false;
+			if (memo_mode != 0) {
+				memo = &prepared.buffer_memo[metadata.descriptor_index];
+				if (FindKept(*memo, snapshot.buffers[resource], metadata, cache)) {
+					if (memo_mode == 1) {
+						source = memo->source;
+						continue;
+					}
+					check = true;
+				}
+			}
+			const FindSlotMemo slot_memo(memo, source, snapshot.buffers[resource], metadata, cache, check);
+			const FindSlotStats slot_stats(memo_stats ? &prepared.buffer_stats[metadata.descriptor_index] : nullptr,
+			                               source, &program, snapshot.buffers[resource], metadata.written, cache);
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
@@ -1045,13 +1277,88 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	const bool memo_stats = PerfStats::BindMemoStatsEnabled();
+	if (memo_stats) {
+		prepared.buffer_stats.resize(prepared.buffers.size());
+	}
+	auto&     cache     = m_context.GetBufferCache();
+	const int memo_mode = BindMemoMode(cache);
+	if (memo_mode != 0) {
+		prepared.buffer_memo.resize(prepared.buffers.size());
+	}
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
 		PerfStats::ScopedTimer obtain_timer(PerfStats::Counter::BindObtainNs, PerfStats::SrtProfEnabled());
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		const auto& source = prepared.buffer_sources[index];
+		// Plain reads only: written bindings record GPU ownership and texel reads may copy an image.
+		const bool plain_read = !resource.written && !resource.formatted &&
+		                        !(resource.read && Config::SyncRawImageBuffersEnabled());
+		if (memo_mode != 0 && plain_read && source.address != 0 && source.size != 0) {
+			auto&      memo      = prepared.buffer_memo[index];
+			const auto cpu_epoch = cache.CpuDirtyEpoch(source.address, source.size); // before the dirty check
+			const bool kept = memo.bind_kept && memo.address == source.address && memo.size == source.size &&
+			                  memo.bind_buffers == cache.BufferSetEpoch() && memo.cpu_epoch == cpu_epoch;
+			if (kept && memo_mode == 1) {
+				// The range is as clean as when it was bound: the lookup would find the same buffer
+				// and have nothing to upload.
+				GpuCapture::Touch(source.address, source.size);
+				cache.TouchBinding(*memo.buffer);
+				prepared.buffers[index] = memo.info;
+				buffer_offset           = memo.offset;
+			} else {
+				const auto    uploads0 = cache.SyncUploads();
+				const auto    other0   = cache.SyncOther();
+				const Buffer* buffer   = nullptr;
+				prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset, &buffer);
+				const auto& info   = prepared.buffers[index];
+				const bool  stream = info.buffer == cache.GetUtilityBuffer(MemoryUsage::Stream).Handle();
+				const bool  other  = cache.SyncOther() != other0;
+				if (kept) {
+					PerfStats::Add(PerfStats::Counter::BvBindChecked, 1);
+					const char* why = stream                            ? "stream copy"
+					                  : other                           ? "image or imported sync"
+					                  : cache.SyncUploads() != uploads0 ? "upload"
+					                  : info != memo.info               ? "other descriptor"
+					                  : buffer_offset != memo.offset    ? "other offset"
+					                                                    : nullptr;
+					if (why != nullptr && cache.CpuDirtyEpoch(source.address, source.size) != cpu_epoch) {
+						// A guest write that faulted during this lookup: had it landed just after,
+						// the full path would miss it too until the next draw.
+						PerfStats::Add(PerfStats::Counter::BvBindRaced, 1);
+					} else if (why != nullptr) {
+						PerfStats::Add(PerfStats::Counter::BvBindDiffs, 1);
+						NoteVerifyDiff("bind", source.address, source.size, why);
+					}
+				} else if (memo_mode == 2) {
+					PerfStats::Add(PerfStats::Counter::BvBindMisses, 1);
+				}
+				// A stream copy is valid for this draw only; image copies are redone at each bind.
+				memo.bind_kept    = !stream && !other && buffer != nullptr;
+				memo.address      = source.address;
+				memo.size         = source.size;
+				memo.bind_buffers = cache.BufferSetEpoch();
+				memo.cpu_epoch    = cpu_epoch;
+				memo.buffer       = buffer;
+				memo.info         = info;
+				memo.offset       = buffer_offset;
+			}
+		} else if (memo_stats) [[unlikely]] {
+			const auto c0      = StatsClock::now();
+			const auto c1      = StatsClock::now();
+			const auto epoch0  = cache.BufferSetEpoch();
+			const auto upload0 = cache.SyncUploads();
+			const auto other0  = cache.SyncOther();
+			prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
+			                                              resource, buffer_offset);
+			NoteBindStats(cache, prepared.buffer_stats[index], prepared.buffer_sources[index], resource,
+			              prepared.buffers[index], buffer_offset, epoch0, upload0, other0, StatsNs(c0, c1),
+			              StatsNs(c1, StatsClock::now()));
+		} else {
+			prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
+			                                              resource, buffer_offset);
+		}
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =

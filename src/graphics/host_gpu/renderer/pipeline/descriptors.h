@@ -38,6 +38,38 @@ struct PreparedBindings {
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
+	// KYTY_BIND_MEMO_STATS (measurement): each buffer slot's previous lookups.
+	struct BufferSlotStats {
+		const void*                           program = nullptr;
+		ShaderRecompiler::IR::DescriptorValue value;
+		BufferSource                          source;
+		uint64_t                              find_epoch = UINT64_MAX;
+		uint64_t                              address = 0, size = 0;
+		uint64_t                              bind_epoch = UINT64_MAX;
+		vk::DescriptorBufferInfo              info;
+		uint32_t                              offset = 0;
+		uint32_t                              kind   = 0;
+		bool                                  kept   = false; // a memo could store this result
+	};
+	std::vector<BufferSlotStats>          buffer_stats;
+	// KYTY_BIND_MEMO (descriptors.cpp): each buffer slot's last lookups and what they depended on.
+	struct BufferSlotMemo {
+		// FindBuffers: the V# and slot metadata, the buffer-set and virtual-range generations then.
+		ShaderRecompiler::IR::DescriptorValue value;
+		uint32_t                              max_byte_extent = 0;
+		bool                                  written = false, scalar = false;
+		bool                                  find_kept = false;
+		uint64_t                              find_buffers = 0, find_ranges = 0;
+		BufferSource                          source;
+		// RebindBuffers (plain reads): the range, buffer-set epoch and CPU-dirty epoch then.
+		bool                                  bind_kept = false;
+		uint64_t                              address = 0, size = 0;
+		uint64_t                              bind_buffers = 0, cpu_epoch = 0;
+		const Buffer*                         buffer = nullptr;
+		vk::DescriptorBufferInfo              info;
+		uint32_t                              offset = 0;
+	};
+	std::vector<BufferSlotMemo>           buffer_memo;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;

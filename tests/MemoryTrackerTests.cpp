@@ -409,6 +409,36 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+// KYTY_BIND_MEMO: the CPU-dirty epoch of a range moves when one of its pages becomes CPU-modified,
+// and not for pages already CPU-modified or in another 64 KiB block.
+void TestCpuDirtyEpoch() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto block_pages = Libs::Graphics::RegionManager::DirtyBlockPages;
+  auto *memory = Allocate(block_pages * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto other = address + block_pages * page_size;
+  Check(tracker.CpuDirtyEpoch(address, page_size) == 0, "untracked range has an epoch");
+  tracker.ForEachUploadRange(
+      address, block_pages * 2 * page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto clean = tracker.CpuDirtyEpoch(address, page_size);
+  Check(clean != 0, "tracked range has no epoch");
+  tracker.MarkRegionAsCpuModified(other, page_size);
+  Check(tracker.CpuDirtyEpoch(address, page_size) == clean,
+        "a write in another block moved the epoch");
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  const auto dirty = tracker.CpuDirtyEpoch(address, page_size);
+  Check(dirty != clean, "a page turning CPU-modified did not move the epoch");
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  Check(tracker.CpuDirtyEpoch(address, page_size) == dirty,
+        "an already CPU-modified page moved the epoch");
+  Check(tracker.CpuDirtyEpoch(address, block_pages * 2 * page_size) != 0, "two-block range has no epoch");
+  tracker.MarkRegionAsCpuModified(address, block_pages * 2 * page_size);
+  Release(memory);
+}
+
 // KYTY_MEM_IMPORT_WATCH: the CPU-dirty hook sees each run of pages that turns CPU-modified, while the
 // pages are still write-protected, and nothing for pages already CPU-modified.
 struct CpuDirtyCall {
@@ -1516,6 +1546,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuDirtyEpoch();
   TestCpuDirtyHook();
   TestUploadWithoutDeferral();
   TestCleanUploadPreservesOwnership();

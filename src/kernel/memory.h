@@ -153,6 +153,9 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
 // True when vaddr lies in a guest virtual range, committed or only reserved (sparse PRT hole).
 [[nodiscard]] bool IsVirtualAddressKnown(uint64_t vaddr);
+// Advances on every edit of the guest virtual ranges: answers of IsVirtualAddressKnown and
+// TryClampRangeSize seen under an unchanged value still hold (read it before the query).
+[[nodiscard]] uint64_t VirtualRangesGeneration();
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // A guest thread stack or fiber context about to be used (Graphics::GuestStacks): registers it for

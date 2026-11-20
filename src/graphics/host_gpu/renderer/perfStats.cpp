@@ -104,6 +104,14 @@ bool SrtProfEnabled() noexcept {
 	return enabled;
 }
 
+bool BindMemoStatsEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BIND_MEMO_STATS");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled && CpPipeline::IsBackThread();
+}
+
 void Add(Counter counter, uint64_t value) noexcept {
 	if (Enabled()) {
 		g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
@@ -398,6 +406,25 @@ void MaybeReport() noexcept {
 		            n(Counter::SrtWithBuffers), n(Counter::SrtWithImages), n(Counter::SrtWithSamplers),
 		            n(Counter::SrtFormatSpec), ms(Counter::BindFindImageNs), ms(Counter::BindSamplerNs),
 		            ms(Counter::BindObtainNs), ms(Counter::BindUploadNs), ms(Counter::BindViewNs));
+	}
+	if (n(Counter::BmCalls) + n(Counter::FbSlots) != 0) {
+		std::printf("PERF bindmemo %.1fs: frames=%" PRIu64 " calls=%" PRIu64 "(%.2fms,clock=%.2fms) null=%" PRIu64
+		            "(%.2fms) written=%" PRIu64 "(%.2fms) stream=%" PRIu64 "(%.2fms) work=%" PRIu64 "(%.2fms) clean=%" PRIu64
+		            "(%.2fms) texel=%" PRIu64 "(%.2fms) slot_hit=%" PRIu64 "(%.2fms) slot_texel=%" PRIu64 "(%.2fms) slot_diff=%" PRIu64
+		            " range_hit=%" PRIu64 "(%.2fms) find=%" PRIu64 "(%.2fms,clock=%.2fms) find_hit=%" PRIu64 "(%.2fms)\n",
+		            seconds, n(Counter::Frames), n(Counter::BmCalls), ms(Counter::BmNs), ms(Counter::BmClockNs),
+		            n(Counter::BmNull), ms(Counter::BmNullNs), n(Counter::BmWritten), ms(Counter::BmWrittenNs),
+		            n(Counter::BmStream), ms(Counter::BmStreamNs), n(Counter::BmWork), ms(Counter::BmWorkNs),
+		            n(Counter::BmClean), ms(Counter::BmCleanNs), n(Counter::BmTexel), ms(Counter::BmTexelNs),
+		            n(Counter::BmSlotHit), ms(Counter::BmSlotHitNs), n(Counter::BmSlotTexel), ms(Counter::BmSlotTexelNs),
+		            n(Counter::BmSlotDiff), n(Counter::BmRangeHit), ms(Counter::BmRangeHitNs), n(Counter::FbSlots),
+		            ms(Counter::FbNs), ms(Counter::FbClockNs), n(Counter::FbHit), ms(Counter::FbHitNs));
+	}
+	if (n(Counter::BvFindChecked) + n(Counter::BvBindChecked) + n(Counter::BvBindMisses) != 0) {
+		std::printf("PERF bindverify %.1fs: find_checked=%" PRIu64 " find_diffs=%" PRIu64 " bind_checked=%" PRIu64
+		            " bind_diffs=%" PRIu64 " bind_raced=%" PRIu64 " bind_misses=%" PRIu64 "\n",
+		            seconds, n(Counter::BvFindChecked), n(Counter::BvFindDiffs), n(Counter::BvBindChecked),
+		            n(Counter::BvBindDiffs), n(Counter::BvBindRaced), n(Counter::BvBindMisses));
 	}
 	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0 || walk.reuse_checks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64

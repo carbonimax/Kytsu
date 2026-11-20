@@ -644,6 +644,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
 	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
+	m_buffer_set_epoch++;
 	if constexpr (insert) {
 		m_buffers.emplace(buffer.CpuAddress(), id);
 		m_total_used_memory += buffer.Size();
@@ -2601,6 +2602,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer) {
 	MemTrackProf::Timer prof_timer(MemTrackProf::Counter::SyncNs, MemTrackProf::Counter::SyncCount);
 	if (buffer.IsImported()) {
+		m_sync_other++;
 		// The GPU reads the guest's bytes at execution: nothing to upload, no re-protection. A
 		// write only takes GPU ownership (CPU readers wait for the writer, see PublishImported).
 		const auto tick = m_scheduler.CurrentTick();
@@ -2645,6 +2647,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, !is_written); });
 	if (source) {
+		m_sync_uploads++;
 		NoteBufferWrite(vaddr, size, true);
 		auto& command = m_scheduler.Current();
 		const bool batch = m_upload_batch_depth != 0;
@@ -2733,7 +2736,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (is_texel_buffer && !is_written) {
 		// May copy an image into the buffer.
 		NoteBufferWrite(vaddr, size);
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
+		const bool filled = SynchronizeBufferFromImage(buffer, vaddr, size);
+		m_sync_other += filled ? 1 : 0;
+		return filled;
 	}
 	return false;
 }
