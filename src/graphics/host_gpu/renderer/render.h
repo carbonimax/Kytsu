@@ -286,6 +286,10 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// KYTY_RESOLVE_INPLACE (descriptors.cpp): a program resource's binding from the description memo.
+	[[nodiscard]] bool ResolveKeptTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                                      const ShaderRecompiler::IR::DescriptorValue& value,
+	                                      TextureBinding& out, bool verify);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.

@@ -179,6 +179,13 @@ enum class Counter : uint32_t {
 	Frames50,
 	Frames67,
 	FramesLong,
+	// KYTY_RESOLVE_INPLACE (descriptors.cpp, "PERF resolveinplace"): textures bound in place, and with =2
+	// those resolved again by the main path and compared.
+	RiKept,
+	RiChecked,
+	RiDiffs,
+	RiResourceDiffs, // the address said same resource, the full comparison did not
+	RiRaced,         // only the image differed, and the texture cache epoch moved between the lookups
 	Count
 };
 
