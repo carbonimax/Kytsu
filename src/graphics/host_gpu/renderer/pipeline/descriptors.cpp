@@ -191,8 +191,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 		return false;
 	}
 	// Bits 0-7 name the mip-stats counter. A clear COMPRESSION_EN disables the metadata and its
-	// settings.
-	const auto         metadata_control = descriptor.fields[6] & 0x00ffff00u;
+	// settings. MaxUncompBlkSize/MaxCompBlkSize (bits 15-18) size DCC blocks; HTILE depth ignores them.
+	constexpr uint32_t dcc_block_size_mask = 0x00078000u;
+	const auto         metadata_control    = descriptor.fields[6] & 0x00ffff00u & ~dcc_block_size_mask;
 	constexpr uint32_t pipe_aligned     = 1u << 19u;
 	if (!descriptor.MetaCompress()) {
 		return true;
@@ -990,13 +991,20 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
-					// Sentinel write ranges end before tables captured by any bound stage.
+					// Sentinel write ranges end before tables captured by any bound stage. A
+					// compute dispatch's own scalar reads may overlap its writes (the scalar cache
+					// is not coherent with the dispatch's vector writes, so the values captured at
+					// dispatch start are a valid result), so a table at the start of its own range
+					// is allowed; later tables still end the range so it never grows past the
+					// existing limits.
 					for (const auto* reader: stages) {
+						const bool own_compute_reads =
+						    reader == stage && program.stage == ShaderType::Compute;
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
+							} else if (address - read_address < read_size && !own_compute_reads) {
 								EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}

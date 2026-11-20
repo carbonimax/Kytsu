@@ -36,7 +36,9 @@ public:
 	// The same for the pages of the range that are not GPU-modified (their newer bytes stay on the GPU).
 	void               MarkRegionAsCpuModifiedExceptGpu(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
-	// Only for ranges whose complete tracker pages have no cache-buffer owner.
+	// Releases the GPU's claim on the range's pages and gives them to the CPU in one critical
+	// section. Only for ranges whose complete tracker pages have no cache-buffer owner, or whose
+	// GPU data was just downloaded for a guest write (BufferCache::ReadMemory).
 	void               ReleaseUnownedRegion(uint64_t vaddr, uint64_t size);
 	// Marks up to `size` bytes from page-aligned `vaddr` CPU-modified (unprotected), stopping at
 	// the first GPU-modified page and at the region end. Returns the bytes marked.

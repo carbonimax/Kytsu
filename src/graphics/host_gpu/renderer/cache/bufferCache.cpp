@@ -1213,8 +1213,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			// Cache buffers cover whole tracker pages, so this range has nothing to download.
+		// A write releases the GPU's pages and claims them for the CPU in one critical section.
+		// As two calls, a buffer synchronization on another thread could mark a page GPU-dirty in
+		// between, and the CPU claim exits on "CPU dirty state conflicts with GPU dirty state".
+		// The guest writes these bytes, so what the GPU wrote there is superseded.
+		const auto take_for_cpu = [&] {
 			const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 			{
 				std::lock_guard ranges_lock(m_gpu_ranges_mutex);
@@ -1222,16 +1225,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			m_memory_tracker.ReleaseUnownedRegion(vaddr, size);
 			QueueBdaSync(vaddr, size);
+		};
+		if (is_write && !IsRegionRegistered(vaddr, size)) {
+			// Cache buffers cover whole tracker pages, so this range has nothing to download.
+			take_for_cpu();
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		if (DownloadBufferMemory<false>(buffer, vaddr, size) && !is_write) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			QueueBdaSync(vaddr, size);
+			take_for_cpu();
 		}
 	});
 }

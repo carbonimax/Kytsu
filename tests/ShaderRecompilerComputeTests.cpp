@@ -56002,9 +56002,9 @@ void CheckRenderTargetFormatContract() {
       GraphicContext{}, Prospero::ChannelLayout::k5_6_5, Prospero::ChannelType::kUNorm,
       Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "RGB565 UNorm",
-          rgb565.format == vk::Format::eB5G6R5UnormPack16 &&
+          rgb565.format == vk::Format::eR5G6B5UnormPack16 &&
               rgb565.bytes_per_element == 2u &&
-              rgb565.export_mapping.IsIdentity(),
+              rgb565.export_mapping == Prospero::ColorMappingBgra,
           "RGB565 UNorm render-target tuple was rejected");
 
   const auto uint_format = TextureGetRenderTargetFormat(
@@ -56881,6 +56881,11 @@ void CheckDepthTextureEncoding() {
   Require("DepthTextureEncoding", "compressed HTILE descriptor",
           IsSupportedDepthTextureEncoding(compressed_descriptor),
           "valid compressed depth descriptor required a prior depth target");
+  auto dcc_block_sizes = compressed_descriptor;
+  dcc_block_sizes.fields[6] |= 0x00030000u; // DCC block sizes: no meaning for HTILE
+  Require("DepthTextureEncoding", "compressed HTILE with DCC block sizes",
+          IsSupportedDepthTextureEncoding(dcc_block_sizes),
+          "HTILE depth descriptor rejected its DCC block-size bits");
 
   const ShaderTextureResource disabled_metadata{{
       0x20018100u, 0xc1600000u, 0x021bc1dfu, 0x91800204u,
