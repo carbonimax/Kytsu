@@ -8,6 +8,7 @@
 #include "graphics/shader/shaderPretranslate.h"
 #include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -417,6 +418,14 @@ void MaybeReport() noexcept {
 		            n(Counter::AsyncBlockWrites), n(Counter::AsyncBlockDepthOnly), n(Counter::AsyncBlockQuery),
 		            n(Counter::AsyncBlockPasses), n(Counter::AsyncBlockCap));
 	}
+	if (n(Counter::DescSetAllocs) + n(Counter::DescPoolCreates) != 0) {
+		static uint64_t pools = 0; // pools are only destroyed with their heap: created = alive
+		pools += n(Counter::DescPoolCreates);
+		std::printf("PERF descheap %.1fs: sets=%" PRIu64 " pool_full=%" PRIu64 " resets=%" PRIu64
+		            " created=%" PRIu64 " pools=%" PRIu64 "\n",
+		            seconds, n(Counter::DescSetAllocs), n(Counter::DescPoolFull), n(Counter::DescPoolResets),
+		            n(Counter::DescPoolCreates), pools);
+	}
 	if (const auto* bounds = g_bounds_counters.load(std::memory_order_relaxed); bounds != nullptr) {
 		// Totals since launch; nonzero_loads must stay 0.
 		std::printf("PERF bounds verify: oob_loads=%u nonzero_loads=%u oob_stores=%u tail_reads=%u\n",
@@ -430,6 +439,7 @@ void MaybeReport() noexcept {
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	MemTrackProf::Report(seconds, n(Counter::Frames));
 	LateRead::Report(seconds, n(Counter::Frames));
+	LibKernel::Memory::ReportSparseCopyCache();
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
 	LibKernel::IoStats::Report(seconds);

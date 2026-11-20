@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -17,6 +18,7 @@ extern "C" {
 #include <libavutil/buffer.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
@@ -302,18 +304,25 @@ private:
 			return Result::OversizeDecode;
 		}
 
+		uint32_t sample = 1u;
+		if (m_config.codec_type != CODEC_TYPE_AVC && TenBitOutputEnabled()) {
+			const auto* format = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
+			if (format == nullptr) return Result::ApiFail;
+			if (format->comp[0].depth == 10) sample = 2u;
+		}
 		const auto width       = static_cast<uint32_t>(frame->width);
 		const auto height      = static_cast<uint32_t>(frame->height);
 		const auto pitch       = AlignUp(width, 256);
+		const auto row_bytes   = pitch * sample;
 		const auto chroma_rows = (static_cast<uint64_t>(height) + 1u) / 2u;
-		const auto required =
-		    static_cast<uint64_t>(pitch) * height + static_cast<uint64_t>(pitch) * chroma_rows;
+		const auto required    = static_cast<uint64_t>(row_bytes) * (height + chroma_rows);
 		if (required > frame_buffer.size) {
 			return Result::FrameBufferSize;
 		}
 
 		auto* dst = static_cast<uint8_t*>(frame_buffer.data);
 		std::memset(dst, 0, static_cast<size_t>(required));
+		const auto target = sample == 2u ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
 		if (frame->format == AV_PIX_FMT_NV12) {
 			for (uint32_t y = 0; y < height; y++) {
 				std::memcpy(dst + static_cast<size_t>(y) * pitch,
@@ -325,20 +334,26 @@ private:
 				            frame->data[1] + static_cast<ptrdiff_t>(y) * frame->linesize[1], width);
 			}
 		} else {
-			m_sws = sws_getCachedContext(m_sws, frame->width, frame->height,
-			                             static_cast<AVPixelFormat>(frame->format), frame->width,
-			                             frame->height, AV_PIX_FMT_NV12, SWS_FAST_BILINEAR, nullptr,
-			                             nullptr, nullptr);
+			m_sws = sws_getCachedContext(
+			    m_sws, frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
+			    frame->width, frame->height, target, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
 			if (m_sws == nullptr) {
 				return Result::ApiFail;
 			}
-			uint8_t* output_planes[4]  = {dst, dst + static_cast<size_t>(pitch) * height, nullptr,
-			                              nullptr};
-			int      output_strides[4] = {static_cast<int>(pitch), static_cast<int>(pitch), 0, 0};
+			uint8_t* output_planes[4] = {dst, dst + static_cast<size_t>(row_bytes) * height,
+			                             nullptr, nullptr};
+			int output_strides[4] = {static_cast<int>(row_bytes), static_cast<int>(row_bytes), 0,
+			                         0};
 			if (sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, output_planes,
 			              output_strides) != frame->height) {
 				return Result::ApiFail;
 			}
+		}
+		if (sample == 2u) {
+			// DEFAULT stores 10-bit samples in the low bits, unlike P010.
+			auto* pixels = reinterpret_cast<uint16_t*>(dst);
+			for (size_t i = 0; i < required / sizeof(uint16_t); ++i)
+				pixels[i] >>= 6;
 		}
 
 		output->valid           = true;
@@ -347,6 +362,7 @@ private:
 		output->codec_type      = m_config.codec_type;
 		output->width           = width;
 		output->pitch           = pitch;
+		output->pitch_in_bytes  = row_bytes;
 		output->height          = height;
 		output->buffer          = frame_buffer.data;
 		output->buffer_size     = frame_buffer.size;
@@ -410,6 +426,14 @@ Result Submit(Instance* instance, const Input& input, uint32_t* produced) {
 
 Result Receive(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
 	return instance->Receive(frame_buffer, output);
+}
+
+bool TenBitOutputEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VIDEODEC2_TEN_BIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
 }
 
 Result Finalize(Instance* instance) {

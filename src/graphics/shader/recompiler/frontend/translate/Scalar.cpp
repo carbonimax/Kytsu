@@ -25,28 +25,32 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			// HW_ID2 identifies graphics compute as QUEUE=6, ME=0.
 			WriteOperand(inst.dst, IR::Value(inst.src0.value == 0x1818u ? 6u : 0u));
 			return;
-		case O::S_SETREG_B32: EmitControlNop(); return;
+		case O::S_SETREG_B32:
+		case O::S_SETREG_IMM32_B32: EmitControlNop(); return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
 		case O::S_WAITCNT: return;
 
-		case O::S_AND_SAVEEXEC_B32:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
-			return;
-		case O::S_ANDN1_SAVEEXEC_B32:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
-			return;
-		case O::S_ORN2_SAVEEXEC_B32:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, false);
-			return;
-		case O::S_AND_SAVEEXEC_B64:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true);
-			return;
-		case O::S_ANDN1_SAVEEXEC_B64:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true);
-			return;
-		case O::S_ORN2_SAVEEXEC_B64:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, true);
-			return;
+		// EXEC = S0 op EXEC; the N1/N2 forms negate S0/EXEC, NAND/NOR/XNOR the result.
+		case O::S_AND_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::And, false, false, false, false); return;
+		case O::S_OR_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::Or, false, false, false, false); return;
+		case O::S_XOR_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::Xor, false, false, false, false); return;
+		case O::S_ANDN2_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::And, true, false, false, false); return;
+		case O::S_ORN2_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::Or, true, false, false, false); return;
+		case O::S_NAND_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::And, false, false, true, false); return;
+		case O::S_NOR_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::Or, false, false, true, false); return;
+		case O::S_XNOR_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::Xor, false, false, true, false); return;
+		case O::S_ANDN1_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::And, false, true, false, false); return;
+		case O::S_ORN1_SAVEEXEC_B32: S_SAVEEXEC(inst, SaveExecOp::Or, false, true, false, false); return;
+		case O::S_AND_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::And, false, false, false, true); return;
+		case O::S_OR_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::Or, false, false, false, true); return;
+		case O::S_XOR_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::Xor, false, false, false, true); return;
+		case O::S_ANDN2_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::And, true, false, false, true); return;
+		case O::S_ORN2_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::Or, true, false, false, true); return;
+		case O::S_NAND_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::And, false, false, true, true); return;
+		case O::S_NOR_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::Or, false, false, true, true); return;
+		case O::S_XNOR_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::Xor, false, false, true, true); return;
+		case O::S_ANDN1_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::And, false, true, false, true); return;
+		case O::S_ORN1_SAVEEXEC_B64: S_SAVEEXEC(inst, SaveExecOp::Or, false, true, false, true); return;
 		case O::S_ADD_U32: ADD_U32(inst, false, false); return;
 		case O::S_ADDC_U32: ADD_U32(inst, false, true); return;
 		case O::S_SUB_U32: SUB_U32(inst, false, false); return;

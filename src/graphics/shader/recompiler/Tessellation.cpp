@@ -29,8 +29,8 @@ struct TessellationAddress {
 // Reflects the LS output stride, or the HS output stride and patch constant range.
 void ReflectTessellationLayout(const Decoder::Program& program, bool local,
                                ShaderTessellationInputInfo& info) {
-	// Registers tracks the VGPRs, then the SGPR codes through VCC_HI.
-	constexpr uint32_t scalars = IR::NumScalarRegs + 2u;
+	// Registers tracks the VGPRs, then the scalar codes through TTMP15 (VCC at 106/107).
+	constexpr uint32_t scalars = IR::NumScalarRegs;
 	using namespace Decoder;
 	using Address   = TessellationAddress;
 	using Kind      = Address::Kind;

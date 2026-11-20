@@ -392,7 +392,9 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 #if !defined(__APPLE__)
 	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
 	if (depth.depth_bounds_test_enable) {
-		dynamic_state.SetDepthBounds(ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax());
+		// Without VK_EXT_depth_range_unrestricted the bounds must lie in [0, 1].
+		dynamic_state.SetDepthBounds(std::clamp(ctx.GetDepthBoundsMin(), 0.0f, 1.0f),
+		                             std::clamp(ctx.GetDepthBoundsMax(), 0.0f, 1.0f));
 	}
 #endif
 
@@ -788,8 +790,20 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 	const LateRead::Scope late_read(LateRead::Site::Vertex);
 	for (auto& range: merged_ranges) {
 		// PPSA20298
+		// A vertex buffer the game names before the region is backed is not an error: on the
+		// hardware an unbacked range reads zero and drops writes, so binding nothing reproduces it.
 		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		    Libs::LibKernel::Memory::TryClampRangeSize(range.base_address, range.RequestedSize());
+		if (size == 0) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("PreparedVertexBuffers: vertex buffer range outside mapped memory: "
+				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     range.base_address, range.RequestedSize());
+			}
+			range.acquired_end = range.base_address;
+			continue;
+		}
 		range.acquired_end = range.base_address + size;
 		std::tie(range.buffer, range.offset) = cache.ObtainBuffer(range.base_address, size, false);
 	}
@@ -800,7 +814,14 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
 		const auto  size   = sizes[i];
-		if (size == 0) {
+		// A slot in a merged range with nothing mapped at its base binds nothing, like size 0.
+		const bool unbacked = std::any_of(
+		    merged_ranges.begin(), merged_ranges.begin() + merged_count,
+		    [&](const VertexBufferRange& value) {
+			    return value.acquired_end == value.base_address &&
+			           vertex.addr >= value.base_address && vertex.addr < value.requested_end;
+		    });
+		if (size == 0 || unbacked) {
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
 			}
@@ -1716,7 +1737,6 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
 	EXIT_NOT_IMPLEMENTED(
-	    !m_context.GetGraphics().maintenance8_enabled ||
 	    !Prospero::IsRectList(ucfg.GetPrimType()) || draw.indexed || draw.index_count != 3 ||
 	    draw.instance_count != 1 || emit.vertex_offset != 0 || emit.first_instance != 0 ||
 	    state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
@@ -1739,7 +1759,21 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	                     destination.backing.format != vk::Format::eR32Sfloat);
 	const auto rect = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
 	                                    {rendering.width, rendering.height}, 0);
-	if (rect.right > rect.left && rect.bottom > rect.top) {
+	if (rect.right > rect.left && rect.bottom > rect.top &&
+	    !m_context.GetGraphics().maintenance8_enabled) {
+		// A depth-to-color vkCmdCopyImage needs maintenance8: without it, only a full single-level
+		// surface is copied, through a buffer (the bits are kept, no conversion).
+		EXIT_NOT_IMPLEMENTED(rect.left != 0 || rect.top != 0 ||
+		                     rect.right != static_cast<int>(source.backing.extent.width) ||
+		                     rect.bottom != static_cast<int>(source.backing.extent.height) ||
+		                     source.backing.extent != destination.backing.extent ||
+		                     source.backing.mip_levels != 1 || destination.backing.mip_levels != 1 ||
+		                     source.backing.layers != 1 || destination.backing.layers != 1 ||
+		                     depth.desc.view_info.base_level != 0 || depth.desc.view_info.base_layer != 0 ||
+		                     color.desc.view_info.base_level != 0 || color.desc.view_info.base_layer != 0);
+		buffer.EndRendering();
+		cache.CopyImageThroughBuffer(color.image_id, depth.image_id);
+	} else if (rect.right > rect.left && rect.bottom > rect.top) {
 		const vk::ImageCopy region {
 		    {vk::ImageAspectFlagBits::eDepth, depth.desc.view_info.base_level,
 		     depth.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},

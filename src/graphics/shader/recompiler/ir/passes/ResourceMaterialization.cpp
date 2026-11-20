@@ -13,6 +13,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdio>
+#include <deque>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -227,11 +228,14 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
 	return ReadTable(base & AddressMask & ~uint64_t {3}, size, offset & ~uint64_t {3}, runtime, words);
 }
 
-bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
+bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource,
+                             bool bounded_table) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
 	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
+	    (bounded_table && resource.formatted && descriptor.RawFormat() >
+	        static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float)) ||
 	    (!formatted_read && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u))) {
 		value.dwords.fill(0u);
 		return true;
@@ -554,8 +558,111 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 			key = std::min(field, selector->maximum);
 		}
 		if (selector->excluded) std::erase(keys, *selector->excluded);
+		if (indirect.selector_nonnegative)
+			std::erase_if(keys, [](uint32_t key) { return key >= 0x80000000u; });
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+	}
+	return true;
+}
+
+// Table addresses of a material pointer chain, read once per materialization and shared
+// by every descriptor slot that follows the same records.
+struct MaterialChain {
+	uint32_t              source = 0;
+	uint32_t              stride = 0;
+	uint32_t              offset = 0;
+	std::vector<uint32_t> hops;
+	std::vector<uint64_t> bases;
+};
+using MaterialChains = std::deque<MaterialChain>; // Stable addresses for returned bases.
+
+uint64_t PointerValue(const std::array<uint32_t, 2>& words) {
+	return ((static_cast<uint64_t>(words[1]) << 32u) | words[0]) & AddressMask;
+}
+
+const std::vector<uint64_t>* ReadMaterialChain(const ResourcePlan& program,
+                                               const DescriptorSource::IndirectDescriptor& indirect,
+                                               const SrtRuntime& runtime, MaterialChains& chains) {
+	if (!indirect.selector || !indirect.chain || indirect.selector->stride == 0u) return nullptr;
+	const auto& selector = *indirect.selector;
+	for (const auto& chain: chains) {
+		if (chain.source == selector.source && chain.stride == selector.stride &&
+		    chain.offset == selector.offset && chain.hops == indirect.chain->hops)
+			return &chain.bases;
+	}
+	DescriptorValue      value;
+	ShaderBufferResource table;
+	if (!WalkedDescriptor(program, selector.source, value) || !DecodeBufferDescriptor(value, table))
+		return nullptr;
+	// S_BUFFER_LOAD bounds the record index only by the V# byte size.
+	const uint64_t count = table.Base48() == 0u ? 0u : table.GetSize() / selector.stride;
+	if (count > MaxIndirectDescriptorProbes) {
+		SpecializationFail(
+		    fmt::format("material table has {} records of {} bytes", count, selector.stride));
+		return nullptr;
+	}
+	MaterialChain chain {
+	    selector.source, selector.stride, selector.offset, indirect.chain->hops, {}};
+	chain.bases.resize(count);
+	std::vector<uint32_t> records;
+	if (selector.stride <= 64u) {
+		records.resize(count * selector.stride / 4u);
+		if (!ReadScalarTable(table.Base48(), table.GetSize(), 0u, runtime, records)) return nullptr;
+	}
+	for (uint64_t record = 0; record < count; ++record) {
+		std::array<uint32_t, 2> pointer {};
+		const auto              at = record * selector.stride + selector.offset;
+		if (!records.empty()) {
+			std::copy_n(records.begin() + at / 4u, 2u, pointer.begin());
+		} else if (!ReadScalarTable(table.Base48(), table.GetSize(), at, runtime, pointer)) {
+			return nullptr;
+		}
+		auto base = PointerValue(pointer);
+		for (const auto hop: chain.hops) {
+			// Records past the ones a draw uses may hold no readable tables; they select null.
+			if (base == 0u || !ReadScalarTable(base, UINT64_MAX, hop, runtime, pointer)) {
+				base = 0u;
+				break;
+			}
+			base = PointerValue(pointer);
+		}
+		chain.bases[record] = base;
+	}
+	return &chains.emplace_back(std::move(chain)).bases;
+}
+
+bool ReadChainDescriptor(uint64_t base, uint32_t offset, const SrtRuntime& runtime,
+                         std::span<uint32_t> words) {
+	std::ranges::fill(words, 0u);
+	if (base != 0u && ReadScalarTable(base, UINT64_MAX, offset, runtime, words)) return true;
+	std::ranges::fill(words, 0u);
+	return false;
+}
+
+// Material records share one sampler binding, so every readable record must agree. Zeroed
+// S#s are skipped: unused records past the ones a draw selects commonly hold no sampler.
+bool MaterializeChainSampler(const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
+                             const SrtRuntime& runtime, MaterialChains& chains,
+                             DescriptorValue& value) {
+	const auto* bases = ReadMaterialChain(program, indirect, runtime, chains);
+	if (bases == nullptr) return false;
+	value          = {.dword_count = 4u};
+	uint64_t first = UINT64_MAX;
+	for (uint64_t record = 0; record < bases->size(); ++record) {
+		DescriptorValue candidate {.dword_count = 4u};
+		if (!ReadChainDescriptor((*bases)[record], indirect.table_offset, runtime,
+		                         std::span(candidate.dwords).first(4u)) ||
+		    std::ranges::all_of(candidate.dwords, [](uint32_t word) { return word == 0u; }))
+			continue;
+		if (first == UINT64_MAX) {
+			value = candidate;
+			first = record;
+		} else if (candidate != value) {
+			return SpecializationFail(fmt::format(
+			    "material records {} and {} select different samplers at table offset {}", first,
+			    record, indirect.table_offset));
+		}
 	}
 	return true;
 }
@@ -567,13 +674,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
                                    const SrtRuntime& runtime, ResourceSnapshot& snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
-                                   Normalize&& normalize) {
+                                   Normalize&& normalize, MaterialChains* chains = nullptr) {
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
 	const auto* selector = indirect.selector ? &*indirect.selector : nullptr;
-	const bool byte_keys = IsBoundedDescriptorTable(program, indirect);
-	auto* selector_keys = selector != nullptr
+	const bool byte_keys = !indirect.chain && IsBoundedDescriptorTable(program, indirect);
+	// Material chains enumerate their own records instead of a shared selector domain.
+	auto* selector_keys = selector != nullptr && !indirect.chain
 	    ? &program.selector_keys[program.selector_groups[source_index]] : nullptr;
 	auto& keys = selector_keys != nullptr ? selector_keys->values : program.material_keys;
 	auto& byte_offsets = program.material_keys;
@@ -623,7 +731,15 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		return failed("candidate", fmt::format("candidate_offset={:#x} {}={} stride={} step={}",
 		    offset & ~uint64_t {3}, key_kind, key, indirect.table_stride, step));
 	};
-	if (sources.empty()) {
+	const std::vector<uint64_t>* chain_bases = nullptr;
+	if (indirect.chain) {
+		// Every record of the table is a key; the GPU key is the record index.
+		if (chains == nullptr ||
+		    (chain_bases = ReadMaterialChain(program, indirect, runtime, *chains)) == nullptr)
+			return false;
+		keys.resize(chain_bases->size());
+		std::iota(keys.begin(), keys.end(), 0u);
+	} else if (sources.empty()) {
 		if (selector == nullptr) keys.clear();
 		DescriptorValue material_value;
 		if ((selector != nullptr && (byte_keys || !selector_keys->resolved) &&
@@ -852,7 +968,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		uint64_t table_offset = 0;
 		DescriptorValue candidate;
 		candidate.dword_count = dword_count;
-		if (sources.empty()) {
+		if (chain_bases != nullptr) {
+			ReadChainDescriptor((*chain_bases)[key], indirect.table_offset, runtime,
+			                    std::span(candidate.dwords).first(read_dwords));
+		} else if (sources.empty()) {
 			table_offset = byte_keys ? key
 			    : uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
 			          (indirect.table_immediate & ~3u);
@@ -1380,7 +1499,27 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 			list->erase(std::unique(list->begin(), list->end()), list->end());
 		}
 	}
-	for (auto& block: blocks) block.condition = predicate(block.condition);
+	// A condition whose successors reach no resources cannot change the active set; following
+	// both edges is exact for it, and it must not capture scalar reads (e.g. assert traps).
+	std::vector<uint8_t> reaches_resources(blocks.size());
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (uint32_t i = 0; i < blocks.size(); i++) {
+			if (reaches_resources[i]) continue;
+			const auto& block = blocks[i];
+			if (!block.sources.empty() || !block.srt_reads.empty() ||
+			    std::ranges::any_of(block.successors,
+			                        [&](uint32_t successor) { return reaches_resources[successor] != 0; })) {
+				reaches_resources[i] = 1;
+				changed              = true;
+			}
+		}
+	}
+	for (auto& block: blocks) {
+		const bool relevant = std::ranges::any_of(
+		    block.successors, [&](uint32_t successor) { return reaches_resources[successor] != 0; });
+		block.condition = relevant ? predicate(block.condition) : Value {};
+	}
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
 		return {};
@@ -1746,7 +1885,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.selector_groups.resize(plan.descriptor_sources.size(), UINT32_MAX);
 	for (uint32_t source = 0; source < plan.descriptor_sources.size(); ++source) {
 		const auto& descriptor = program.descriptor_sources[source].indirect_descriptor;
-		if (!descriptor || !descriptor->selector) continue;
+		if (!descriptor || !descriptor->selector || descriptor->chain) continue;
 		const auto& a = *descriptor;
 		uint32_t group = 0;
 		for (; group < group_sources.size(); ++group) {
@@ -1770,6 +1909,27 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		bool complete = false;
 	};
 	std::unordered_map<const Inst*, ControlValue> predicates;
+
+	const auto reads_written_buffer = [&](Value value) {
+		std::vector<Value>              pending {value};
+		std::unordered_set<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto* inst = pending.back().Resolve().TryInstruction();
+			pending.pop_back();
+			if (inst == nullptr || !visited.insert(inst).second) continue;
+			if (inst->GetOpcode() == ValueOpcode::LoadBufferU32) {
+				const auto& memory = program.memory_info.at(inst->Flags<MemoryFlags>().index);
+				// Planning-only memory keeps its SGPR quad index in `resource`, not a buffer index.
+				if (memory.kind == ResourceKind::Buffer && !memory.planning_only &&
+				    memory.resource < program.info.buffers.size() &&
+				    program.info.buffers[memory.resource].written)
+					return true;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); ++index)
+				pending.push_back(inst->Arg(index));
+		}
+		return false;
+	};
 	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
 		value = value.Resolve();
 		if (value.IsEmpty()) return {};
@@ -1792,7 +1952,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			entry.complete = true;
 			return result = projected;
 		};
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
+		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer) &&
+		    !reads_written_buffer(value)) {
 			uniform_control = true;
 			capture_control_reads |=
 			    !ValidateRuntimeValue(program, value, RuntimeValueType::ImmutableInteger);
@@ -1938,12 +2099,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (WalkedActive(program, base.source)) {
+					const bool bounded_table = IsBoundedDescriptorTable(program, *source->indirect_descriptor);
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot,
 					        snapshot.buffers, specialization.buffers,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
+						            value, source->indirect_descriptor->indexed, base, bounded_table);
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}
@@ -1977,6 +2139,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 		buffer.null_fallback      = !runtime.null_descriptor_supported && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u);
 	}
+	MaterialChains chains;
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -2014,7 +2177,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;
-			        })) {
+			        }, &chains)) {
 				return resource_failed("image", i, image.source, snapshot.images.size());
 			}
 		} else {
@@ -2039,7 +2202,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto* descriptor = Source(program, source);
 			if (descriptor == nullptr) return false;
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
-			if (indirect != nullptr && indirect->sources.empty()) {
+			if (indirect != nullptr && indirect->chain) {
+				// A material-chain sampler is one S# shared by every record.
+				snapshot.samplers[i] = {.dword_count = 4u};
+				if (WalkedActive(program, source) &&
+				    !MaterializeChainSampler(program, *indirect, observed, chains, snapshot.samplers[i]))
+					return resource_failed("sampler", i, source, snapshot.samplers.size());
+			} else if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
 				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,

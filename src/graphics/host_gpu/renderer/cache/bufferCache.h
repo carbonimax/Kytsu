@@ -97,6 +97,9 @@ public:
 	                                                        BufferId id              = {});
 	// The ring that new per-draw stream copies go to (KYTY_STREAM_HOST_CACHED, bufferCache.cpp).
 	[[nodiscard]] StreamBuffer&                StreamRing() noexcept;
+	// KYTY_TC_LOCK_ORDER (GPU thread): the tick up to which ObtainBuffer(vaddr, size, true) would
+	// wait for priority operations (queued main-queue fault publications), or 0. Never blocks.
+	[[nodiscard]] uint64_t WritePublishTick(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -346,6 +349,7 @@ private:
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::atomic<uint64_t>                             m_color_metadata_epoch {0};
+	// Leaf lock: taken under TextureCache::m_lock (WritePublishTick), never takes another lock.
 	std::mutex                                        m_pending_mutex;
 	std::vector<PendingPublish>                       m_pending_publishes;
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
