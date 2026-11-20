@@ -13,12 +13,16 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -942,18 +946,40 @@ private:
 	uint32_t                                    count = 0;
 };
 
+// shortcut: measurement only (KYTY_PERF_STATS=1), no behaviour change; remove with the s4-color
+// report. Counts why a comparison image without a depth view keeps (or leaves) the native path.
+static void NoteManualCompareGate(const char* reason) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) return;
+	static std::mutex                          mutex;
+	static std::map<std::string, uint64_t>     counts;
+	std::lock_guard lock(mutex);
+	const auto count = ++counts[reason];
+	if (std::has_single_bit(count)) std::printf("PERF s4-gate reason=%s count=%" PRIu64 "\n", reason, count);
+}
+
 // 1 + the DEPTH_COMPARE_FUNC every sampler of image `index` carries, or 0 (native) when they
 // differ. A sampler shared with a native comparison image gets a Manual variant (SamplerClass).
 static uint32_t ManualCompareFunction(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                                       uint32_t index) {
 	uint32_t function = 0;
+	bool     shared   = false;
 	for (const auto& pair: program.info.sampled_pairs) {
 		if (pair.image != index) continue;
-		if (pair.sampler >= snapshot.samplers.size()) return 0;
+		if (pair.sampler >= snapshot.samplers.size()) return NoteManualCompareGate("sampler-oob"), 0;
 		const auto value = 1u + ((snapshot.samplers[pair.sampler].dwords[0] >> 12u) & 0x7u);
-		if (function != 0 && function != value) return 0;
+		if (function != 0 && function != value) return NoteManualCompareGate("sampler-mismatch"), 0;
 		function = value;
+		shared   = shared || std::ranges::any_of(program.info.sampled_pairs, [&](const auto& other) {
+			         return other.sampler == pair.sampler && other.image != index &&
+			                other.image < program.info.images.size() &&
+			                program.info.images[other.image].depth_compare;
+		         });
 	}
+	NoteManualCompareGate(function == 0 ? "no-pair" : shared ? "manual-shared" : "manual");
 	return function;
 }
 
@@ -1024,10 +1050,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    });
 		// shortcut: direct images only, and the shader compares the filtered texel (not PCF of four
 		// texels); extend to indirect tables and gathers with weights if a title needs them.
-		if (DepthCompareColorEnabled() && !storage && base.depth_compare && !base.heap && i == base_index &&
-		    image.indirect_root == ImageResource::NoIndirectImage &&
-		    FindGuestDepthFormatPolicy(format) == nullptr) {
-			image.manual_compare = ManualCompareFunction(program, snapshot, i);
+		if (DepthCompareColorEnabled() && base.depth_compare && FindGuestDepthFormatPolicy(format) == nullptr) {
+			if (storage) NoteManualCompareGate("storage");
+			else if (base.heap) NoteManualCompareGate("heap");
+			else if (i != base_index) NoteManualCompareGate("not-base");
+			else if (image.indirect_root != ImageResource::NoIndirectImage) NoteManualCompareGate("indirect");
+			else image.manual_compare = ManualCompareFunction(program, snapshot, i);
 		}
 		// The shader decodes direct 8 and 8_8 sRGB textures where the device has no sRGB view.
 		if (!storage && !base.depth_compare && !image.skip_degamma &&
