@@ -558,6 +558,23 @@ struct TextureDescMemoEntry {
 constexpr size_t TextureDescMemoSlots = 4096;
 thread_local std::unique_ptr<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>
     t_texture_desc_memo;
+// Bumped when a RenderExecutor (so a render context) is created or destroyed: the programs and images
+// an entry names may be gone, and the next context may reuse their addresses and image ids.
+std::atomic<uint64_t> g_texture_desc_memo_generation {0};
+thread_local uint64_t t_texture_desc_memo_generation = 0;
+
+// The calling thread's memo (null when it has none and !create), emptied if a context came or went.
+std::array<TextureDescMemoEntry, TextureDescMemoSlots>* TextureDescMemo(bool create) {
+	const auto generation = g_texture_desc_memo_generation.load(std::memory_order_relaxed);
+	if (t_texture_desc_memo_generation != generation) {
+		t_texture_desc_memo.reset();
+		t_texture_desc_memo_generation = generation;
+	}
+	if (create && !t_texture_desc_memo) {
+		t_texture_desc_memo = std::make_unique<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>();
+	}
+	return t_texture_desc_memo.get();
+}
 
 size_t TextureDescMemoSlot(const ShaderRecompiler::IR::ImageResource& resource,
                            const ShaderRecompiler::IR::DescriptorValue& value) noexcept {
@@ -629,11 +646,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto          memo_mode = resource.heap ? 0u : TextureDescMemoMode();
 	TextureDescMemoEntry* memo     = nullptr;
 	if (memo_mode != 0) {
-		if (!t_texture_desc_memo) {
-			t_texture_desc_memo =
-			    std::make_unique<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>();
-		}
-		memo = &(*t_texture_desc_memo)[TextureDescMemoSlot(resource, value)];
+		memo = &(*TextureDescMemo(true))[TextureDescMemoSlot(resource, value)];
 		if (!(memo->valid && memo->value == value && memo->resource == resource)) {
 			memo = nullptr;
 		} else if (memo_mode == 2) {
@@ -728,10 +741,11 @@ uint32_t ResolveInplaceMode() noexcept {
 // After ResolveTexture: marks the memo entry it kept or stored for `resource` (owned by a program).
 void MarkStableTexture(const ShaderRecompiler::IR::ImageResource& resource,
                        const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (!t_texture_desc_memo) {
+	auto* const table = TextureDescMemo(false);
+	if (table == nullptr) {
 		return;
 	}
-	auto& entry = (*t_texture_desc_memo)[TextureDescMemoSlot(resource, value)];
+	auto& entry = (*table)[TextureDescMemoSlot(resource, value)];
 	if (entry.valid && entry.value == value && entry.resource == resource) {
 		entry.stable = &resource;
 	}
@@ -757,15 +771,20 @@ bool SameImageDescExact(const TextureCache::ImageDesc& a, const TextureCache::Im
 
 } // namespace
 
+void RenderExecutor::DropTextureDescMemos() noexcept {
+	g_texture_desc_memo_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
 // ResolveTexture's path for a description kept in the memo, written into `out`; false, with nothing
 // done, when the memo does not hold this program resource and T#.
 bool RenderExecutor::ResolveKeptTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                         const ShaderRecompiler::IR::DescriptorValue& value,
                                         TextureBinding& out, bool verify) {
-	if (resource.heap || !t_texture_desc_memo) {
+	auto* const table = resource.heap ? nullptr : TextureDescMemo(false);
+	if (table == nullptr) {
 		return false;
 	}
-	auto& memo = (*t_texture_desc_memo)[TextureDescMemoSlot(resource, value)];
+	auto& memo = (*table)[TextureDescMemoSlot(resource, value)];
 	if (memo.stable != &resource || !memo.valid || !(memo.value == value)) {
 		return false;
 	}

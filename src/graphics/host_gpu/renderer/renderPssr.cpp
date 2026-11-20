@@ -64,6 +64,7 @@ void MemoryBarrier(vk::CommandBuffer command) {
 } // namespace
 
 RenderExecutor::~RenderExecutor() {
+	DropTextureDescMemos();
 	auto&      graphics = m_context.GetGraphics();
 	const auto device   = graphics.device;
 	if (m_pssr_motion != nullptr) {
