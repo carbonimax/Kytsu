@@ -36,11 +36,15 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -49,6 +53,40 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// The shader whose images PrepareBindings resolves (0 elsewhere), for the S4 counter.
+thread_local uint64_t t_binding_shader_hash = 0;
+
+// shortcut: measurement only (KYTY_PERF_STATS=1), no behaviour change; remove once the
+// depth-compare rule for color formats is decided. Every depth-compare bind counts; one that ends
+// on a color image with a guest format outside DEPTH_FORMAT_POLICIES keeps a color view with a
+// comparison sampler, which Vulkan leaves undefined. Logs each new (shader, guest format) pair
+// of those, and the totals at each power of two of all depth-compare binds.
+void NoteDepthCompareBind(Prospero::BufferFormat guest_format, vk::Format image_format,
+                          bool color_image) {
+	if (!PerfStats::Enabled()) {
+		return;
+	}
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint32_t>> seen;
+	static uint64_t                                binds = 0, outside = 0;
+	const auto format = static_cast<uint32_t>(guest_format);
+	const bool hit    = color_image && FindGuestDepthFormatPolicy(guest_format) == nullptr;
+	std::lock_guard lock(mutex);
+	++binds;
+	if (hit) {
+		++outside;
+		if (seen.emplace(t_binding_shader_hash, format).second) {
+			std::printf("PERF arifix-s4 shader=0x%016" PRIx64 " guest_format=%u image_format=%d\n",
+			            t_binding_shader_hash, format, static_cast<int>(image_format));
+		}
+	}
+	if (std::has_single_bit(binds)) {
+		std::printf("PERF arifix-s4-seen compare_binds=%" PRIu64 " outside_table=%" PRIu64
+		            " pairs=%zu\n",
+		            binds, outside, seen.size());
+	}
+}
 
 } // namespace
 
@@ -124,7 +162,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	     .storage_bounds = static_cast<ShaderRecompiler::Spirv::StorageBounds>(graphics.storage_bounds),
 	     .storage_bounds_alignment = graphics.storage_bounds_alignment};
 	const bool device_bounds = profile.storage_bounds == ShaderRecompiler::Spirv::StorageBounds::Device;
-	if (address == 0 || size == 0) {
+	// A base in guest page 0 is a null or garbage descriptor.
+	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 		// Without shader checks only a null descriptor reads zero and drops writes.
 		if (device_bounds) return {nullptr, 0, vk::WholeSize};
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
@@ -191,8 +230,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 		return false;
 	}
 	// Bits 0-7 name the mip-stats counter. A clear COMPRESSION_EN disables the metadata and its
-	// settings.
-	const auto         metadata_control = descriptor.fields[6] & 0x00ffff00u;
+	// settings. MaxUncompBlkSize/MaxCompBlkSize (bits 15-18) size DCC blocks; HTILE depth ignores them.
+	constexpr uint32_t dcc_block_size_mask = 0x00078000u;
+	const auto         metadata_control    = descriptor.fields[6] & 0x00ffff00u & ~dcc_block_size_mask;
 	constexpr uint32_t pipe_aligned     = 1u << 19u;
 	if (!descriptor.MetaCompress()) {
 		return true;
@@ -407,6 +447,10 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
+	const auto base_layer = descriptor.Type() == Prospero::ImageType::kColor1D ||
+	                                descriptor.Type() == Prospero::ImageType::kColor2D
+	                            ? 0u
+	                            : descriptor.BaseArray5();
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -427,7 +471,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = base_layer;
 			if (view.base_layer >= image_layers) {
 				EXIT("texture base layer is out of bounds\n");
 			}
@@ -679,6 +723,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
+	if (resource.depth_compare) {
+		NoteDepthCompareBind(desc.info.guest_format, image->info.pixel_format,
+		                     !stencil_association && !image->info.IsDepth());
+	}
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
@@ -787,6 +835,7 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+	const bool meta_compress       = block_bytes == 0 && !resource.r128 && descriptor.MetaCompress();
 	auto& desc = out.desc;
 	desc       = {};
 	desc.info.data         = {address, 0};
@@ -799,12 +848,12 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
-		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
+		                           meta_compress, view_levels,
 		                           view_base)) {
 			// The layout stores no mip past MAX_MIP here, so a view starting in the chain ends at
 			// MAX_MIP; dynamic-mip shaders still count mips up to LAST_LEVEL.
@@ -834,7 +883,7 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
 		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
@@ -911,6 +960,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
+	prepared.buffer_sources.clear();
+	prepared.buffers.clear();
 	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
@@ -929,7 +980,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				MipStats::Mark(descriptor.MipStatsCntId());
 			}
 		}
+		t_binding_shader_hash = program.shader_hash;
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		t_binding_shader_hash = 0;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
@@ -979,19 +1032,26 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				// still needs its full payload when NumRecords is smaller than it.
 				size = std::max(size, uint64_t {metadata.max_byte_extent});
 			}
-			if (address == 0 || size == 0) {
+			if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 				source = {};
 				continue;
 			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
-					// Sentinel write ranges end before tables captured by any bound stage.
+					// Sentinel write ranges end before tables captured by any bound stage. A
+					// compute dispatch's own scalar reads may overlap its writes (the scalar cache
+					// is not coherent with the dispatch's vector writes, so the values captured at
+					// dispatch start are a valid result), so a table at the start of its own range
+					// is allowed; later tables still end the range so it never grows past the
+					// existing limits.
 					for (const auto* reader: stages) {
+						const bool own_compute_reads =
+						    reader == stage && program.stage == ShaderType::Compute;
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
+							} else if (address - read_address < read_size && !own_compute_reads) {
 								EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}

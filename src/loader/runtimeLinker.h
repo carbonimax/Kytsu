@@ -161,6 +161,10 @@ public:
 	void RelocateAll();
 	void RelocateProgram(Program* program);
 
+	/// Binds the HLE stdio slots and fflush to the given libc.prx, or to nothing for nullptr.
+	void BindGuestLibc(Program* libc);
+	/// Re-reads the libc.prx stdio slot variables after its initializers have run.
+	void RefreshGuestLibc(Program* libc);
 	void  Execute(const std::filesystem::path& game_patch = {});
 	int   StartModule(Program* program, size_t args, const void* argp, module_func_t func);
 	int   StopModule(Program* program, size_t args, const void* argp, module_func_t func);
@@ -179,6 +183,8 @@ public:
 	Program*        FindProgramByAddr(uint64_t vaddr);
 	Program*        FindProgramById(int32_t id);
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
+
+	[[nodiscard]] std::vector<int32_t> GetProgramIds();
 
 	static uint8_t* TlsGetAddr(Program* program);
 	static void     DeleteTls(Program* program, int thread_id);

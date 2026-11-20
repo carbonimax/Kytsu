@@ -1104,6 +1104,12 @@ static int ConvertSocketOptionName(int level, int option) {
 			case 0x1002: return SO_RCVBUF;
 			case 0x1007: return SO_ERROR;
 			case 0x1105: return SO_SNDTIMEO;
+			case 0x1106: return SO_RCVTIMEO;
+#if defined(_WIN32)
+			// SO_ONESBCAST (all-ones broadcast route): Winsock sends to 255.255.255.255 with
+			// broadcast permission.
+			case 0x10000: return SO_BROADCAST;
+#endif
 			default: break;
 		}
 	} else if (level == 6 && option == 1) {
@@ -2244,7 +2250,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	}
 
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
-	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	const bool socket_timeout = (level == 0xffff && (optname == 0x1105 || optname == 0x1106));
 	optname                = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
@@ -2256,7 +2262,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 #endif
 	SocketLength len = static_cast<SocketLength>(*optlen);
 	void*        value = optval;
-	if (send_timeout) {
+	if (socket_timeout) {
 		if (*optlen < sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
@@ -2267,7 +2273,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	                 &len) != 0) {
 		return SetHostSocketError();
 	}
-	if (send_timeout) {
+	if (socket_timeout) {
 #if defined(_WIN32)
 		const int64_t usec = static_cast<int64_t>(timeout) * 1000;
 #else
@@ -2356,7 +2362,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 #endif
 		return failed ? SetHostSocketError() : 0;
 	}
-	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	const bool socket_timeout = (level == 0xffff && (optname == 0x1105 || optname == 0x1106));
 	optname                = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
@@ -2366,7 +2372,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 #else
 	timeval timeout {};
 #endif
-	if (send_timeout) {
+	if (socket_timeout) {
 		if (optlen != sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
