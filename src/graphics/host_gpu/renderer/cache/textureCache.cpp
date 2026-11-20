@@ -1039,22 +1039,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		     cached.info.extent.height, cached.info.extent.depth, requested.pitch);
 	}
 
-	const int32_t requested_mip = requested.MipOf(cached.info);
-	if (requested_mip >= 0) {
-		const int32_t layer = requested.SliceOf(cached.info, requested_mip);
-		return {cached_id, requested_mip, layer};
+	if (const auto view = requested.SubresourceOf(cached.info); view.mip >= 0) {
+		return {cached_id, view.mip, view.layer};
 	}
 
-	const int32_t mip = cached.info.MipOf(requested);
-	if (mip >= 0) {
-		const int32_t layer = cached.info.SliceOf(requested, mip);
+	if (const auto view = cached.info.SubresourceOf(requested); view.mip >= 0) {
 		if (!merged_id) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
-		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
-		             static_cast<uint32_t>(layer));
+		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(view.mip),
+		             static_cast<uint32_t>(view.layer));
 		FreeImage(cached_id);
 		return {merged_id};
 	}
@@ -1072,11 +1068,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id);
-	const int32_t mip = source.info.MipOf(info);
-	const int32_t layer = source.info.SliceOf(info, mip);
-	if (layer >= 0) {
-		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
-		             static_cast<uint32_t>(layer));
+	if (const auto view = source.info.SubresourceOf(info); view.mip >= 0) {
+		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(view.mip),
+		             static_cast<uint32_t>(view.layer));
 	} else {
 		CopyImage(expanded_id, source_id);
 	}
@@ -1631,15 +1625,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 		// into a larger image that starts before that data, offset them by where the data starts
 		// in the final image (a position taken from an earlier candidate may no longer apply).
 		// A smaller mip can also start at the image's own address (mips stored smallest first);
-		// only a one-mip descriptor of a mip chain can be one (SliceOf needs both).
+		// only a one-mip descriptor of a mip chain can be one (SubresourceOf needs both).
 		if (desc.info.data.address != image.info.data.address ||
 		    (desc.info.resources.levels == 1 && image.info.resources.levels > 1 &&
 		     desc.info.extent != image.info.extent)) {
-			const int32_t mip   = desc.info.MipOf(image.info);
-			const int32_t layer = mip >= 0 ? desc.info.SliceOf(image.info, mip) : -1;
-			if (layer >= 0) {
-				desc.view_info.base_level += static_cast<uint32_t>(mip);
-				desc.view_info.base_layer += static_cast<uint32_t>(layer);
+			if (const auto view = desc.info.SubresourceOf(image.info); view.mip >= 0) {
+				desc.view_info.base_level += static_cast<uint32_t>(view.mip);
+				desc.view_info.base_layer += static_cast<uint32_t>(view.layer);
 			}
 		}
 		image.tick_accessed_last = m_gc_tick;
