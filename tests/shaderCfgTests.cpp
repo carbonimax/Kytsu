@@ -2450,6 +2450,27 @@ void TestNewShaderRecompilerScalarVectorAlu() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerTrapTemporaries() {
+  // A title uses trap temporaries (TTMP3 is scalar operand code 0x6f on RDNA) as
+  // scratch scalar registers. They decode into the slots at their operand codes.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),          // s0 = 1
+      EncodeSop2(0x00, 111, 0, 129),  // s_add_u32 ttmp3, s0, 1
+      EncodeSop2(0x00, 2, 111, 1),    // s_add_u32 s2, ttmp3, s1
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("S_ADD_U32 ttmp3, s0, 1") != std::string::npos),
+        "new decoder did not decode TTMP destination");
+  Check((result.decoded_dump.find("S_ADD_U32 s2, ttmp3, s1") != std::string::npos),
+        "new decoder did not decode TTMP source");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
   // Lane-read instructions have scalar results, but their VOP3A destination is
   // encoded in VDST [7:0], not the VOP3B SDST field [14:8].
@@ -7864,6 +7885,43 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// A FLAT load carrying only the DLC cache hint, and s_sext_i32_i16 into vcc_lo.
+void TestNewShaderRecompilerFlatCachePolicyAndScalarSext() {
+  const uint32_t shader[] = {
+      0xdc341000u, 0x007d0004u,          // flat_load_dwordx2 v[0:1], v[4:5] dlc
+      EncodeFlat0(0x0c, 2, 0) | (1u << 16u),
+      EncodeFlat1(2, 0x7d, 0, 4),        // global_load_dword v2, v[4:5], off glc
+      0xbeea1a0bu,                       // s_sext_i32_i16 vcc_lo, s11
+      EncodeSop1(0x19, 3, 1),            // s_sext_i32_i8 s3, s1
+      EncodeVop1(0x01, 6, 3),            // v_mov_b32 v6, s3
+      EncodeVop1(0x01, 7, 106),          // v_mov_b32 v7, vcc_lo
+      // Results go to LDS: writable FLAT/GLOBAL needs GPU ownership tracking here.
+      EncodeDs0(0x0d, 0),  EncodeDs1(0, 6, 8), // ds_write_b32 v8, v6
+      EncodeDs0(0x0d, 4),  EncodeDs1(0, 7, 8), // ds_write_b32 v8, v7 offset:4
+      EncodeDs0(0x4d, 8),  EncodeDs1(0, 0, 8), // ds_write_b64 v8, v[0:1] offset:8
+      EncodeDs0(0x0d, 16), EncodeDs1(0, 2, 8), // ds_write_b32 v8, v2 offset:16
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("unsupported") == std::string::npos,
+        "FLAT cache-policy bits or S_SEXT were still refused");
+  Check(result.decoded_dump.find("S_SEXT_I32_I16 vcc_lo, s11") != std::string::npos,
+        "new decoder did not decode S_SEXT_I32_I16");
+  Check(result.decoded_dump.find("S_SEXT_I32_I8 s3, s1") != std::string::npos,
+        "new decoder did not decode S_SEXT_I32_I8");
+  Check(result.ir_dump.find("BitFieldSExtract %2, 0x00000000, 0x00000010") != std::string::npos,
+        "S_SEXT_I32_I16 did not lower to a 16-bit sign extract");
+  Check(result.ir_dump.find("BitFieldSExtract %1, 0x00000000, 0x00000008") != std::string::npos,
+        "S_SEXT_I32_I8 did not lower to an 8-bit sign extract");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract for S_SEXT");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerUnbasedFlatUsesBda() {
   const uint32_t shader[] = {
       EncodeFlat0(0x0c, 0, 0),
@@ -11222,6 +11280,21 @@ void TestOptionalShaderHostFeatures() {
   Check(supported.spirv == limited.spirv,
         "unused optional host features changed the shader");
   CheckSpirvBinaryValidates(limited.spirv);
+  // buffer_store_dwordx2 v[2:3], off, s[0:3], 0 glc: one 64-bit store with host 64-bit buffer
+  // atomics, two word stores (and no Int64Atomics) without them.
+  const uint32_t pair_store_shader[] = {0xe0744000u, 0x80000200u, EncodeSopp(0x01)};
+  options.host_features = {true, true};
+  const auto wide_store = RecompileForTest(pair_store_shader, options);
+  CheckSpirvBinaryValidates(wide_store.spirv);
+  Check(SpirvContainsCapability(wide_store.spirv, 12u) &&
+            DisassembleSpirvBinary(wide_store.spirv).find("OpAtomicStore") != std::string::npos,
+        "glc DWORDX2 store was not one 64-bit store with host support");
+  options.host_features.buffer_int64_atomics = false;
+  const auto split_store = RecompileForTest(pair_store_shader, options);
+  CheckSpirvBinaryValidates(split_store.spirv);
+  Check(!SpirvContainsCapability(split_store.spirv, 12u) &&
+            DisassembleSpirvBinary(split_store.spirv).find("OpAtomicStore") == std::string::npos,
+        "glc DWORDX2 store needed 64-bit buffer atomics without host support");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   const uint32_t atomic_shader[] = {0xe1680018u, 0x80000000u, EncodeSopp(0x01)};
   options.host_features = {true, false};
@@ -11281,6 +11354,33 @@ void TestNewShaderRecompilerBranchConditionForms() {
       Check((source.find("OpGroupNonUniformBallot") == std::string::npos),
             "structured SCC branch retained a host-subgroup reduction");
     }
+  }
+}
+
+void TestDecoderTrailingDwordLength() {
+  using namespace ShaderRecompiler;
+  // s_setreg_imm32_b32 carries a trailing literal; it must not be decoded as an instruction.
+  {
+    const uint32_t code[] = {EncodeSopk(0x15, 0, 0x0801), 0xc0610000u, EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(code, decoded);
+    Check(decoded.instructions.size() == 2 &&
+              decoded.instructions[0].opcode == Decoder::Opcode::S_SETREG_IMM32_B32 &&
+              decoded.instructions[0].word_count == 2 &&
+              decoded.instructions[0].src0.value == 0xc0610000u &&
+              decoded.instructions[1].opcode == Decoder::Opcode::S_ENDPGM,
+          "S_SETREG_IMM32_B32 did not consume its literal");
+  }
+  // An unimplemented SOP2 opcode with a literal source must still skip the literal.
+  {
+    const uint32_t code[] = {EncodeSop2(0x5f, 0, 255, 0), 0xc0610000u, EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(code, decoded);
+    Check(decoded.instructions.size() == 2 &&
+              decoded.instructions[0].opcode == Decoder::Opcode::UNSUPPORTED &&
+              decoded.instructions[0].word_count == 2 &&
+              decoded.instructions[1].opcode == Decoder::Opcode::S_ENDPGM,
+          "unsupported instruction did not consume its literal");
   }
 }
 
@@ -17541,17 +17641,19 @@ void TestFlatLoadShortD16HiAddressFields() {
             global_pair.src1.reg == 10,
         "GLOBAL D16 high-half load with SADDR off must use the VGPR pair");
 
-  // DLC is only a cache hint and stays visible; LDS, GLC and SLC on a load and the reserved
+  // GLC/SLC/DLC are cache policy on a non-atomic load and stay visible; LDS and the reserved
   // segment are not implemented and must keep failing loudly.
   const auto dlc = decode(SegGlobal, 4, 2, DlcBit);
   Check(dlc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && dlc.dlc && !dlc.glc && !dlc.slc,
         "GLOBAL D16 high-half load lost its DLC hint");
   Check(decode(SegGlobal, 0, 2, LdsBit).opcode == Decoder::Opcode::UNSUPPORTED,
         "FLAT-family D16 high-half load accepted LDS=1");
-  Check(decode(SegGlobal, 0, 2, GlcBit).opcode == Decoder::Opcode::UNSUPPORTED,
-        "FLAT-family D16 high-half load accepted GLC=1");
-  Check(decode(SegGlobal, 0, 2, SlcBit).opcode == Decoder::Opcode::UNSUPPORTED,
-        "FLAT-family D16 high-half load accepted SLC=1 on a load");
+  const auto glc = decode(SegGlobal, 0, 2, GlcBit);
+  Check(glc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && glc.glc && !glc.slc,
+        "FLAT-family D16 high-half load lost its GLC cache policy");
+  const auto slc = decode(SegGlobal, 0, 2, SlcBit);
+  Check(slc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && slc.slc && !slc.glc,
+        "FLAT-family D16 high-half load lost its SLC cache policy");
   Check(decode(SegReserved, 0, 2).opcode == Decoder::Opcode::UNSUPPORTED,
         "FLAT-family D16 high-half load accepted the reserved segment");
 }
@@ -18449,6 +18551,7 @@ int main(int argc, char **argv) {
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
+  TestNewShaderRecompilerFlatCachePolicyAndScalarSext();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();
   TestNewShaderRecompilerCfgStraightLine();
@@ -18613,6 +18716,8 @@ int main(int argc, char **argv) {
   TestCapturedBufferStoreD16XyzwDecode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
+  TestNewShaderRecompilerTrapTemporaries();
+  TestDecoderTrailingDwordLength();
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
   TestFatalCheckRetiresSpeculativeThread();
 

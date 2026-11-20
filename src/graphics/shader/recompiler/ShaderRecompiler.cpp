@@ -695,7 +695,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 
-	IR::CollectShaderInfo(ir, options.input_info);
+	IR::CollectShaderInfo(ir, options.input_info, options.host_features.buffer_int64_atomics);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

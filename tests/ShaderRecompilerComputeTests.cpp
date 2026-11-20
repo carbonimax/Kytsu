@@ -1055,8 +1055,8 @@ void AppendBufferLoadDword(std::vector<u32> *code, u32 dst_vgpr,
 }
 
 void AppendBufferLoadOpcode(std::vector<u32> *code, u32 opcode, u32 dst_vgpr,
-                            u32 address_vgpr) {
-  code->push_back(EncodeMubuf0(opcode));
+                            u32 address_vgpr, bool glc = false) {
+  code->push_back(EncodeMubuf0(opcode, 0, false, true, glc));
   code->push_back(EncodeMubuf1(dst_vgpr, 0, address_vgpr));
 }
 
@@ -28726,6 +28726,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::S_CBRANCH_EXECNZ:
   case Opcode::S_SENDMSG:
   case Opcode::S_SETREG_B32:
+  case Opcode::S_SETREG_IMM32_B32:
   case Opcode::S_SLEEP:
   case Opcode::S_TTRACEDATA:
   case Opcode::S_INST_PREFETCH:
@@ -45841,6 +45842,51 @@ TestCase BufferAtomicAndX2GlcAndExec() {
   return test;
 }
 
+// A glc BUFFER_LOAD_DWORDX2 poll must read the {flag, value} pair as one access.
+TestCase BufferLoadDwordx2GlcReadsSwapX2Whole() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferLoadDwordx2GlcReadsSwapX2Whole";
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 2, 0x00000002u);
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  AppendBufferStoreOpcode(&code, 0x50, 2, 20);
+  AppendBufferLoadOpcode(&code, 0x0d, 4, 20, true);
+  AppendStoreVgpr(&code, 4, 2);
+  AppendStoreVgpr(&code, 5, 3);
+  AppendEnd(&code);
+  test.initial = {0x00000001u, 0x0000abcdu, 0, 0};
+  test.expected = {0x00000002u, 0x12345678u, 0x00000002u, 0x12345678u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_SWAP_X2, O::BUFFER_LOAD_DWORDX2,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicLoad %ulong", "OpAtomicExchange %ulong"};
+  return test;
+}
+
+// A look-back scan publishes its {flag, value} pair with a glc BUFFER_STORE_DWORDX2, no 64-bit
+// atomic.
+TestCase BufferStoreDwordx2GlcWritesPairWhole() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferStoreDwordx2GlcWritesPairWhole";
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 2, 0x00000002u);
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  AppendBufferStoreOpcode(&code, 0x1d, 2, 20, true);
+  AppendBufferLoadOpcode(&code, 0x0d, 4, 20, true);
+  AppendStoreVgpr(&code, 4, 2);
+  AppendStoreVgpr(&code, 5, 3);
+  AppendEnd(&code);
+  test.initial = {0x00000001u, 0x0000abcdu, 0, 0};
+  test.expected = {0x00000002u, 0x12345678u, 0x00000002u, 0x12345678u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORDX2, O::BUFFER_LOAD_DWORDX2,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicStore", "OpAtomicLoad %ulong"};
+  return test;
+}
+
 TestCase BufferAtomicAddX2GlcAndExec() {
   using O = ShaderOpcode;
   TestCase test;
@@ -54795,6 +54841,8 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(BufferAtomicAndX2GlcAndExec);
+  AddCase(BufferLoadDwordx2GlcReadsSwapX2Whole);
+  AddCase(BufferStoreDwordx2GlcWritesPairWhole);
   AddCase(BufferAtomicAddX2GlcAndExec);
   AddCase(BufferAtomicUMinX2GlcAndExec);
   AddCase(ImageAtomicSignedMinMax<false>);
@@ -62291,6 +62339,8 @@ int main(int argc, char **argv) {
     }
     RunCase(&vulkan, DsAtomicReturn64());
     RunCase(&vulkan, BufferAtomicAndX2GlcAndExec());
+    RunCase(&vulkan, BufferLoadDwordx2GlcReadsSwapX2Whole());
+    RunCase(&vulkan, BufferStoreDwordx2GlcWritesPairWhole());
     RunCase(&vulkan, BufferAtomicAddX2GlcAndExec());
     RunCase(&vulkan, BufferAtomicUMinX2GlcAndExec());
     RunCase(&vulkan, ImageAtomicSignedMinMax<false>());
