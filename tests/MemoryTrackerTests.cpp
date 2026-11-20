@@ -1221,11 +1221,28 @@ void TestFullRegionGpuUnmarkBatching() {
     lock.lock();
     std::thread worker([&] { lock.unlock(); });
     worker.join();
+  } else if (std::strcmp(name, "tracking-lock-exclusion") == 0) {
+    // Not a death: exits 0 when no increment was lost under the lock.
+    Libs::Graphics::TrackingSpinLock lock;
+    uint64_t count = 0;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; t++) {
+      threads.emplace_back([&] {
+        for (int i = 0; i < 20000; i++) {
+          std::lock_guard guard(lock);
+          count++;
+        }
+      });
+    }
+    for (auto &thread : threads) {
+      thread.join();
+    }
+    std::_Exit(count == 8 * 20000 ? 0 : 1);
   }
   std::_Exit(0x7f);
 }
 
-void CheckDeathCase(const char *name) {
+void CheckDeathCase(const char *name, bool fatal = true) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
   Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -1244,7 +1261,8 @@ void CheckDeathCase(const char *name) {
   DWORD exit_code = 0;
   Check(
       GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
-          (exit_code == 321 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION),
+          (fatal ? exit_code == 321 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION
+                 : exit_code == 0),
       "MemoryTracker death path used the wrong exit");
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
@@ -1272,8 +1290,18 @@ void CheckDeathCase(const char *name) {
   Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
   const bool fatal_exit =
       WIFEXITED(status) && WEXITSTATUS(status) == (321 & 0xff);
-  Check(fatal_exit || WIFSIGNALED(status),
+  Check(fatal ? fatal_exit || WIFSIGNALED(status)
+              : WIFEXITED(status) && WEXITSTATUS(status) == 0,
         "MemoryTracker death path used the wrong exit");
+#endif
+}
+
+void SetTestEnv(const char *name, const char *value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  Check(_putenv_s(name, value != nullptr ? value : "") == 0, "_putenv_s failed");
+#else
+  Check((value != nullptr ? ::setenv(name, value, 1) : ::unsetenv(name)) == 0,
+        "setenv failed");
 #endif
 }
 
@@ -1282,6 +1310,20 @@ void TestFatalPaths() {
                            "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
     CheckDeathCase(name);
   }
+  CheckDeathCase("tracking-lock-exclusion", false);
+  // KYTY_TRACKING_LOCK is read at process start, so each mode runs in a child.
+  // Unset is mode 1 (cached thread id), run above; 0 is the off switch (OS thread id).
+  SetTestEnv("KYTY_TRACKING_LOCK", "0");
+  CheckDeathCase("recursive-tracking-lock");
+  CheckDeathCase("non-owner-tracking-unlock");
+  CheckDeathCase("tracking-lock-exclusion", false);
+  SetTestEnv("KYTY_MEMTRACK_PROF", "1"); // with the acquisition counter
+  CheckDeathCase("non-owner-tracking-unlock");
+  CheckDeathCase("tracking-lock-exclusion", false);
+  SetTestEnv("KYTY_TRACKING_LOCK", "2"); // no owner: exclusion only
+  CheckDeathCase("tracking-lock-exclusion", false);
+  SetTestEnv("KYTY_MEMTRACK_PROF", nullptr);
+  SetTestEnv("KYTY_TRACKING_LOCK", nullptr);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
