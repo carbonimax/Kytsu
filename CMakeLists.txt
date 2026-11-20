@@ -986,6 +986,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME srgb_texture
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
+	add_test(NAME resolve_inplace_new_context
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --resolve-inplace-only)
+	set_tests_properties(resolve_inplace_new_context PROPERTIES ENVIRONMENT KYTY_RESOLVE_INPLACE=1)
 	add_test(NAME msaa_storage
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME gpu_capture_replay
