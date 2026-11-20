@@ -11,9 +11,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 namespace {
+
+std::atomic<bool> g_channel_replication {[] {
+	const char* value = std::getenv("KYTY_TEXTURE_CHANNEL_REPLICATE");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}()};
 
 // Rows are channel order; columns are the number of physical components minus one. Unused
 // selectors complete each entry to a permutation so logical write masks can be inverted.
@@ -96,13 +103,25 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(const GraphicContext&   grap
 	     static_cast<uint32_t>(layout), static_cast<uint32_t>(type), static_cast<uint32_t>(order));
 }
 
+bool TextureChannelReplication() noexcept {
+	return g_channel_replication.load(std::memory_order_relaxed);
+}
+
+void SetTextureChannelReplication(bool enabled) noexcept {
+	g_channel_replication.store(enabled, std::memory_order_relaxed);
+}
+
 vk::ComponentMapping TextureGetComponentMapping(uint32_t                        swizzle,
-                                                Prospero::ColorComponentMapping host_to_storage) {
+                                                Prospero::ColorComponentMapping host_to_storage,
+                                                uint32_t component_count) {
 	constexpr std::array host_components {vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eG,
 	                                      vk::ComponentSwizzle::eB, vk::ComponentSwizzle::eA};
 	std::array<vk::ComponentSwizzle, 4> storage_components {};
 	for (uint32_t host_component = 0; host_component < host_components.size(); ++host_component) {
-		storage_components[host_to_storage.Map(host_component)] = host_components[host_component];
+		// Single- and dual-channel PS5 formats repeat their stored channels before DST_SEL.
+		const auto source = component_count == 1u || component_count == 2u
+		                        ? host_component % component_count : host_component;
+		storage_components[host_to_storage.Map(host_component)] = host_components[source];
 	}
 	const auto resolve = [&](uint32_t component) {
 		const auto selector = static_cast<Prospero::CompSwizzle>(GetDstSel(swizzle, component));

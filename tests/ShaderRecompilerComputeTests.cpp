@@ -489,9 +489,11 @@ struct TextureCacheTestAccess {
     return cache.DownloadImageMemory(id);
   }
 
-  static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
+  static void RegisterHtileMeta(TextureCache &cache, uint64_t address,
+                                uint64_t size = 0) {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
+    metadata.size = size;
     metadata.clear_mask.reset();
   }
 
@@ -7050,6 +7052,29 @@ public:
     const auto write_only_input =
         MakeInput(write_only_meta, false, true, write_only_program,
                   write_only_snapshot);
+    // The size checks are opt-in (KYTY_META_CLEAR_SIZE).
+    TextureCache::SetMetaClearSizeCheck(true);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta,
+                                              64);
+    const bool mismatched_size_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, write_only_input, command);
+    Require(name, "mismatched-size write preserved",
+            !mismatched_size_consumed &&
+                !texture_cache.IsMetaCleared(write_only_meta, 0),
+            "a reused metadata address write with a different size was consumed");
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta,
+                                              128);
+    write_only_snapshot.buffers[0].dwords[2] = 0;
+    const bool empty_write_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, write_only_input, command);
+    Require(name, "zero-size write preserved",
+            !empty_write_consumed &&
+                !texture_cache.IsMetaCleared(write_only_meta, 0),
+            "an empty metadata descriptor consumed a clear");
+    TextureCache::SetMetaClearSizeCheck(false);
+    write_only_snapshot.buffers[0].dwords[2] = 8;
     const bool write_only_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
             executor, write_only_input, command);
@@ -7546,6 +7571,66 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckTextureMetadataResize() {
+    constexpr const char *name = "TextureMetadataResize";
+    // Direct memory: the depth upload reads the guest backing, which runtime memory lacks.
+    constexpr uintptr_t base = 0x0000000239000000ull;
+    constexpr uint64_t page = 0x10000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), page, page, 0,
+                &direct_offset) == 0,
+            "metadata-resize direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, page, 0x3, 0x10,
+                                                           direct_offset, page) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "metadata-resize fixed direct-memory mapping failed");
+    context.MapMemory(base, page);
+    auto &cache = context.GetTextureCache();
+    TextureCache::SetMetaClearSizeCheck(true);
+    auto desc = MakeLinearDesc(base, sizeof(uint32_t), vk::Format::eD32Sfloat,
+        Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+    desc.type = TextureCache::BindingType::DepthTarget;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    desc.info.htile_initial_clear = false;
+    desc.info.metadata.kind = ImageMetadataKind::Htile;
+    desc.info.metadata.range = {base + 0x100, 0x80};
+    const auto id = cache.FindImage(desc);
+    (void)cache.FindDepthTarget(id, desc);
+    for (const uint64_t size : {0x40u, 0x80u}) {
+      const auto previous_size = desc.info.metadata.range.size;
+      Require(name, "initial clear", cache.ClearMeta(base + 0x100, previous_size) &&
+          cache.IsMetaCleared(base + 0x100, 0) && cache.IsMetaCleared(base + 0x100, 8191),
+          "metadata did not record the initial clear");
+      desc.info.metadata.range.size = size;
+      (void)cache.FindDepthTarget(id, desc);
+      Require(name, "range resize", !cache.IsMetaCleared(base + 0x100, 0) &&
+          !cache.IsMetaCleared(base + 0x100, 8191) &&
+          !cache.ClearMeta(base + 0x100, previous_size) && cache.ClearMeta(base + 0x100, size),
+          "resized metadata retained a clear or accepted the old range size");
+    }
+    context.UnmapMemory(base, page);
+    scheduler.Finish();
+    Require(name, "unmap direct backing", Libs::LibKernel::Memory::KernelMunmap(base, page) == 0,
+            "metadata-resize mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, page) == 0,
+            "metadata-resize allocation release failed");
+    TextureCache::SetMetaClearSizeCheck(false);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -7595,6 +7680,24 @@ public:
           MakeLinearDesc(base, sizeof(initial), vk::Format::eR8G8B8A8Srgb,
                          Prospero::BufferFormat::k8_8_8_8Srgb,
                          Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+
+      auto many_layers = sampled;
+      many_layers.info.data = {base + 0x2780000, 0x4000};
+      many_layers.info.resources.layers = 32;
+      many_layers.info.tile_mode = Prospero::TileMode::kDepth;
+      many_layers.info.mip_layout[0].size = many_layers.info.data.size;
+      many_layers.view_info.layer_count = 32;
+      const auto many_layers_id = texture_cache.FindImage(many_layers);
+      auto fewer_layers = many_layers;
+      fewer_layers.info.data.size = 0x8000;
+      fewer_layers.info.resources.layers = 2;
+      fewer_layers.info.mip_layout[0].size = fewer_layers.info.data.size;
+      fewer_layers.view_info.layer_count = 2;
+      const auto fewer_layers_id = texture_cache.FindImage(fewer_layers);
+      Require(name, "different layer layout", fewer_layers_id &&
+                  fewer_layers_id != many_layers_id &&
+                  texture_cache.GetImage(fewer_layers_id).info.data == fewer_layers.info.data,
+              "equal-address images with different layer strides shared a cache entry");
 
       auto &command = scheduler.Current();
       auto first_desc = sampled;
@@ -17295,6 +17398,8 @@ public:
 
   void CheckPackedTextureComponents() {
     constexpr const char *name = "PackedTextureComponents";
+    // The 1- and 2-channel cases need the opt-in channel replication.
+    SetTextureChannelReplication(true);
     constexpr uintptr_t base = 0x0000000204200000ull;
     constexpr uint64_t allocation_size = 0x10000;
     struct FormatCase {
@@ -17306,6 +17411,19 @@ public:
     // Packed format channels start at the least significant bit.
     // PPSA24515's blue, white, and masked black exposed the 5551 reversal.
     constexpr std::array cases{
+        FormatCase{Prospero::BufferFormat::k8UNorm,
+                   {0x4000, 0xff80, 0, 0},
+                   {{{0, 0, 0, 0}, {64, 64, 64, 64}, {128, 128, 128, 128}, {255, 255, 255, 255}}},
+                   {255, 255, 255, 255}},
+        FormatCase{Prospero::BufferFormat::k16UNorm,
+                   {0, 0x4000, 0x8000, 0xffff},
+                   {{{0, 0, 0, 0}, {16384, 16384, 16384, 16384},
+                     {32768, 32768, 32768, 32768}, {65535, 65535, 65535, 65535}}},
+                   {65535, 65535, 65535, 65535}},
+        FormatCase{Prospero::BufferFormat::k8_8UNorm,
+                   {0xff00, 0x8040, 0x4080, 0x00ff},
+                   {{{0, 255, 0, 255}, {64, 128, 64, 128}, {128, 64, 128, 64}, {255, 0, 255, 0}}},
+                   {255, 255, 255, 255}},
         FormatCase{Prospero::BufferFormat::k5_5_5_1UNorm,
                    {0x7c00, 0x7fff, 0x8000, 0x8c41},
                    {{{0, 0, 31, 0}, {31, 31, 31, 0}, {0, 0, 0, 1}, {1, 2, 3, 1}}},
@@ -17368,7 +17486,7 @@ public:
       auto &cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
-      for (const auto swizzle : {DstSel(4, 5, 6, 7), DstSel(7, 1, 4, 0)}) {
+      for (const auto swizzle : {DstSel(4, 5, 6, 7), DstSel(7, 1, 4, 0), DstSel(1, 1, 1, 7)}) {
         ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
             (static_cast<uint32_t>(format.format) << 20u) | (3u << 30u), 0,
             swizzle | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
@@ -17596,6 +17714,7 @@ public:
                 Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                     direct_offset, allocation_size) == 0,
             "packed texture backing release failed");
+    SetTextureChannelReplication(false);
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -62001,6 +62120,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageLoadDepthBits());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-components-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPackedTextureComponents();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageLoadSintUsesSignedSampledImage<false>());
@@ -62753,6 +62877,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--volume-shape-reuse-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckVolumeShapeReuse();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--metadata-resize-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureMetadataResize();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {

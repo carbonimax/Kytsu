@@ -977,6 +977,8 @@ if(BUILD_TESTING)
 	add_test(NAME gpu_capture_replay_local
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-replay-dir-only)
 	set_tests_properties(gpu_capture_replay_local PROPERTIES SKIP_REGULAR_EXPRESSION "GpuReplayDir skipped")
+	add_test(NAME texture_components
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-components-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
@@ -1008,6 +1010,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
 	add_test(NAME texture_cache_htile_clear
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
+	add_test(NAME texture_cache_metadata_resize
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --metadata-resize-only)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 

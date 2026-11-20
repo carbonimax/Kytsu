@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -451,6 +452,8 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
+	} else if (size != 0) {
+		image.MarkMaybeCpuDirty();
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(begin, size);
@@ -469,6 +472,8 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
+	} else if (size != 0) {
+		image.MarkMaybeCpuDirty();
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
@@ -937,9 +942,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (keep_both) {
 			return {merged_id};
 		}
-		// Equal pitch does not imply equal mip placement: a changed extent can move
+		// Equal pitch does not imply equal mip or layer placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
+		    (requested.resources.layers < cached.info.resources.layers &&
+		     requested.data.size > cached.info.data.size) ||
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
 		                 cached.info.mip_layout.begin(),
@@ -1008,6 +1015,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                                        requested.pixel_format)
 			            ? result_id
 			            : ImageId {}};
+		}
+		// The guest reallocated the same address as a bigger surface of the same shape. Only the
+		// extent grew, so the cached image is a corner of the requested one and expanding keeps
+		// its contents; the checks above already established an equal format and a larger size.
+		if (requested.type == cached.info.type &&
+		    requested.extent.width >= cached.info.extent.width &&
+		    requested.extent.height >= cached.info.extent.height &&
+		    requested.extent.depth >= cached.info.extent.depth) {
+			return {ExpandImage(requested, cached_id)};
 		}
 		// A volume allocation reused for a differently shaped volume. Neither extent
 		// contains the other, so the requested volume is a separate guest image.
@@ -2014,8 +2030,12 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
 		// Key by the native image base; a layered binding may start at a later slice. Clear state
-		// kept for another surface does not carry over when this HTile changes surfaces.
-		if (inserted || metadata->second.depth_address != image.info.data.address) {
+		// kept for another surface, or for an HTile of another size, does not carry over.
+		const bool size_changed =
+		    MetaClearSizeCheck() && metadata->second.size != desc.info.metadata.range.size;
+		metadata->second.size   = desc.info.metadata.range.size;
+		if (inserted || size_changed ||
+		    metadata->second.depth_address != image.info.data.address) {
 			metadata->second.clear_mask.reset();
 			if (image.info.htile_initial_clear) {
 				metadata->second.clear_mask.set();
@@ -2735,10 +2755,36 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return found->second.clear_mask.test(slice);
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+namespace {
+std::atomic<bool> g_meta_clear_size_check {[] {
+	const char* value = std::getenv("KYTY_META_CLEAR_SIZE");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}()};
+} // namespace
+
+bool TextureCache::MetaClearSizeCheck() noexcept {
+	return g_meta_clear_size_check.load(std::memory_order_relaxed);
+}
+
+void TextureCache::SetMetaClearSizeCheck(bool enabled) noexcept {
+	g_meta_clear_size_check.store(enabled, std::memory_order_relaxed);
+}
+
+bool TextureCache::ClearMeta(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	if (MetaClearSizeCheck() && size != 0 && found->second.size != 0 && size != found->second.size) {
+		// Validation aid: a refused HTile clear would show as a depth target left uncleared.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::fprintf(stderr,
+			             "TextureCache: compute clear size 0x%" PRIx64 " at 0x%016" PRIx64
+			             " does not match its metadata size 0x%" PRIx64 ", dispatched\n",
+			             size, address, found->second.size);
+		}
 		return false;
 	}
 	found->second.clear_mask.set();

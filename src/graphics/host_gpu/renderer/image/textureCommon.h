@@ -22,7 +22,12 @@ struct SurfaceFormatInfo {
 };
 
 vk::ComponentMapping   TextureGetComponentMapping(uint32_t                        swizzle,
-                                                  Prospero::ColorComponentMapping host_to_storage);
+                                                  Prospero::ColorComponentMapping host_to_storage,
+                                                  uint32_t component_count = 4);
+// KYTY_TEXTURE_CHANNEL_REPLICATE=1: sampled 1- and 2-channel views repeat their stored channels
+// before DST_SEL (component_count above); off by default, tests switch it with the setter.
+[[nodiscard]] bool     TextureChannelReplication() noexcept;
+void                   SetTextureChannelReplication(bool enabled) noexcept;
 SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(const GraphicContext&   graphics,
                                                     Prospero::ChannelLayout layout,

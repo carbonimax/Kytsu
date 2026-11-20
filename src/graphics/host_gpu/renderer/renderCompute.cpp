@@ -81,7 +81,9 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				const auto size = descriptor.GetSize();
+				if ((size != 0u || !TextureCache::MetaClearSizeCheck()) &&
+				    cache.ClearMeta(descriptor.Base48(), size)) {
 					return true;
 				}
 			}
