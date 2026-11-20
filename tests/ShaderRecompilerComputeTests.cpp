@@ -60877,6 +60877,34 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
                   static_cast<int>(0x8a6c000cu) && patched_branch == mismatched,
           "branch patch accepted or changed a different packet type");
 
+  // A dword-aligned predicate is read at its own address, not at the preceding 8-byte boundary.
+  alignas(8) std::array<uint32_t, 4> unaligned_condition{0, 1, 0, 0};
+  branch[1] = 2u | (3u << 8u);
+  branch[2] = static_cast<uint32_t>(address(&unaligned_condition[1]));
+  branch[3] = static_cast<uint32_t>(address(&unaligned_condition[1]) >> 32u);
+  selected = returned = 0;
+  Pm4Execution unaligned_execution;
+  Require(name, "dword-aligned branch predicate",
+          processor.Process(unaligned_execution, caller) == Pm4ProcessResult::Complete &&
+              selected == 11 && returned == 22,
+          "conditional IB read its predicate from the preceding 8-byte boundary");
+
+  // A zero dword pair is a type-0 packet skipped by its length, and an empty chained IB still
+  // ends its calling stream.
+  std::array<uint32_t, 11> empty_chain{};
+  const auto empty_link = indirect({}, true);
+  std::copy(empty_link.begin(), empty_link.end(), empty_chain.begin() + 2);
+  const auto chain_suffix = write(&selected, 55);
+  std::copy(chain_suffix.begin(), chain_suffix.end(), empty_chain.begin() + 6);
+  const auto call_empty_chain = indirect(empty_chain, false);
+  std::copy(call_empty_chain.begin(), call_empty_chain.end(), caller.begin());
+  selected = returned = 0;
+  Pm4Execution empty_chain_execution;
+  Require(name, "type-0 skip and empty chain",
+          processor.Process(empty_chain_execution, caller) == Pm4ProcessResult::Complete &&
+              selected == 0 && returned == 22,
+          "a type-0 packet was not skipped or an empty chain did not end its caller");
+
   // This stream exceeds native recursion capacity, while chains need one fetcher cursor.
   std::vector<std::array<uint32_t, 4>> links(65536);
   std::span<const uint32_t> target = then_commands;
