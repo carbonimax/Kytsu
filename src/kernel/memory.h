@@ -257,6 +257,8 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
+void     TestSetVmaMemoMode(int mode); // -1 = KYTY_VMA_MEMO
+uint64_t TestVmaMemoHits();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();

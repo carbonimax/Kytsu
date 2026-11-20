@@ -6,6 +6,8 @@
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/ioStats.h"
+#include "libs/aprPreopen.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -17,6 +19,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -123,6 +126,31 @@ static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	return true;
 }
 
+// On by default, KYTY_APR_PREOPEN=0 turns it off (aprPreopen.h). Leaked on purpose: workers may still be opening at
+// exit and use g_files.
+static AprPreopener* Preopener() {
+	static AprPreopener* preopener = []() -> AprPreopener* {
+		const char* value = std::getenv("KYTY_APR_PREOPEN");
+		if (value != nullptr && std::strcmp(value, "0") == 0) {
+			return nullptr;
+		}
+		return new AprPreopener(8, 4096, [](uint32_t id) {
+			std::filesystem::path host_path;
+			if (!TryGetHostPath(id, &host_path)) {
+				return false;
+			}
+			LibKernel::IoStats::Timer io(LibKernel::IoStats::Api::AprPreopen);
+			Common::File              file;
+			if (!file.Open(host_path, Common::File::Mode::Read)) {
+				return false;
+			}
+			file.Close();
+			return true;
+		});
+	}();
+	return preopener;
+}
+
 static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	std::scoped_lock lock(g_mutex);
 	if (file_id == 0 || file_id > g_files.size()) {
@@ -144,6 +172,7 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 	if (guest_path == nullptr || guest_path[0] == '\0') {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
+	LibKernel::IoStats::Timer io(LibKernel::IoStats::Api::AprResolve);
 
 	ResolvedPathInfo  info {};
 	const std::string path(guest_path);
@@ -194,6 +223,9 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	if (info.result != OK) {
 		return info.result;
+	}
+	if (auto* preopener = Preopener(); preopener != nullptr && !info.is_dir) {
+		preopener->Queue(info.file_id);
 	}
 
 	if (id != nullptr) {
@@ -1188,6 +1220,7 @@ struct Submission {
 	size_t                                   cursor = 0;
 	void*                                    result = nullptr;
 	uint32_t                                 id     = 0;
+	std::chrono::steady_clock::time_point    submitted {}; // KYTY_PERF_STATS: APR queue wait
 };
 
 static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
@@ -1260,6 +1293,14 @@ private:
 			lock.unlock();
 			int      result       = OK;
 			uint32_t error_offset = 0;
+			if (submission.cursor == 0 && LibKernel::IoStats::Enabled() &&
+			    (submission.commands.empty() ||
+			     !std::holds_alternative<CommandBufferState::WaitCommand>(submission.commands[0].data))) {
+				LibKernel::IoStats::NoteAprQueueWait(static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+				                                                         submission.submitted)
+				        .count()));
+			}
 			if (submission.cursor < submission.commands.size()) {
 				const auto& command = submission.commands[submission.cursor++];
 				result              = ExecuteCommand(command);
@@ -1316,10 +1357,19 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	if (out_submission_id != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id);
 	}
+	if (auto* preopener = AprShared::Preopener(); preopener != nullptr && !amm) {
+		for (const auto& command: state.commands) {
+			if (const auto* read = std::get_if<CommandBufferState::ReadFileCommand>(&command.data)) {
+				preopener->Queue(read->file_id);
+			}
+		}
+	}
 	static CommandEngine apr_engine(7);
 	static CommandEngine amm_engine(3);
 	(amm ? amm_engine : apr_engine)
-	    .Submit(priority, {std::move(state.commands), 0, result, id});
+	    .Submit(priority, {std::move(state.commands), 0, result, id,
+	                       LibKernel::IoStats::Enabled() ? std::chrono::steady_clock::now()
+	                                                     : std::chrono::steady_clock::time_point {}});
 	return OK;
 }
 
@@ -1355,10 +1405,17 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	}
 
 	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
-		LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
-		return LibKernel::KERNEL_ERROR_ENOENT;
+	{
+		LibKernel::IoStats::Timer io(LibKernel::IoStats::Api::AprOpen);
+		if (!file.Open(host_path, Common::File::Mode::Read)) {
+			LOGF("\tAPR read missing host file: %s\n", Common::PathToString(host_path).c_str());
+			return LibKernel::KERNEL_ERROR_ENOENT;
+		}
 	}
+	if (LibKernel::IoStats::Enabled()) {
+		LibKernel::IoStats::NoteOpenedPath(LibKernel::IoStats::Api::AprOpen, std::filesystem::hash_value(host_path));
+	}
+	LibKernel::IoStats::Timer io(LibKernel::IoStats::Api::Apr);
 	const auto file_size = file.Size();
 	if (file_offset >= file_size) {
 		file.Close();
@@ -1380,6 +1437,8 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	if (buffer.size() < buffer_size) {
 		buffer.resize(buffer_size);
 	}
+	const bool timed   = LibKernel::IoStats::Enabled();
+	uint64_t   copy_ns = 0;
 	while (*bytes_read < readable) {
 		const auto request =
 		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
@@ -1388,11 +1447,21 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		if (read == 0) {
 			break;
 		}
+		const auto copy_start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
+		if (timed) {
+			copy_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                     std::chrono::steady_clock::now() - copy_start)
+			                                     .count());
+		}
 		*bytes_read += read;
 	}
 
 	file.Close();
+	io.Done(*bytes_read);
+	if (timed) {
+		LibKernel::IoStats::Note(LibKernel::IoStats::Api::AprCopy, *bytes_read, copy_ns);
+	}
 	return OK;
 }
 
