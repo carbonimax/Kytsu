@@ -775,6 +775,10 @@ if(KYTY_NOTO_SANS_DIR)
 	target_compile_definitions(font_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
 endif()
 
+add_executable(splash_animation_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SplashAnimationTests.cpp")
+target_link_libraries(splash_animation_tests kyty_test_gtest)
+target_include_directories(splash_animation_tests PRIVATE ${inc_headers})
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
