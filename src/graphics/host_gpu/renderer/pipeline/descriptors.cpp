@@ -36,12 +36,17 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -49,6 +54,40 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// shortcut: measurement only (KYTY_PERF_STATS=1), no behaviour change; remove once the
+// depth-compare rule for color formats is decided. One line per (shader, guest format) whose
+// comparison sample ends on a color image, with the raw T# and the paired S# dword 0.
+template <typename Program, typename Snapshot>
+void NoteDepthCompareColorBind(const Program& program, const Snapshot& snapshot, uint32_t index,
+                               const Image& image) {
+	static std::mutex                                   mutex;
+	static std::set<std::pair<uint64_t, uint32_t>>      seen;
+	static uint64_t                                      binds = 0;
+	const auto& t = snapshot.images[index].dwords;
+	const auto  format = (t[1] >> 20u) & 0x1ffu;
+	std::lock_guard lock(mutex);
+	++binds;
+	if (std::has_single_bit(binds)) {
+		std::printf("PERF s4-color-seen binds=%" PRIu64 " pairs=%zu\n", binds, seen.size());
+	}
+	if (!seen.emplace(program.shader_hash, format).second) {
+		return;
+	}
+	std::string samplers;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.image == index && pair.sampler < program.info.samplers.size()) {
+			const auto& s = snapshot.samplers[program.info.samplers[pair.sampler].snapshot_index].dwords;
+			samplers += fmt::format(" s={:08x},{:08x},{:08x},{:08x}", s[0], s[1], s[2], s[3]);
+		}
+	}
+	std::printf("PERF s4-color shader=0x%016" PRIx64 " stage=%u img=%u fmt=%u host_fmt=%d "
+	            "extent=%ux%u layers=%u gpu=%d t=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x%s\n",
+	            program.shader_hash, static_cast<uint32_t>(program.stage), index, format,
+	            static_cast<int>(image.info.pixel_format), image.info.extent.width,
+	            image.info.extent.height, image.info.resources.layers, image.IsGpuModified() ? 1 : 0,
+	            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], samplers.c_str());
+}
 
 } // namespace
 
@@ -930,6 +969,12 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			}
 		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		if (binding.image_id && program.info.images[i].depth_compare && PerfStats::Enabled()) {
+			const auto& bound = m_context.GetTextureCache().GetImage(binding.image_id);
+			if (!bound.info.IsDepth()) {
+				NoteDepthCompareColorBind(program, snapshot, i, bound);
+			}
+		}
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();

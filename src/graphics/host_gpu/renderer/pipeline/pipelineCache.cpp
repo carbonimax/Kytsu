@@ -175,13 +175,19 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
 }
 
-// KYTY_SHADER_DUMP_HASH=<hex> (diagnosis, default off): dump the code and the IR of that one shader.
+// KYTY_SHADER_DUMP_HASH=<hex>[,<hex>...] (diagnosis, default off): dump the code and the IR of
+// those shaders.
 bool IsDumpedShader(uint64_t shader_hash) {
-	static const uint64_t hash = [] {
-		const char* value = std::getenv("KYTY_SHADER_DUMP_HASH");
-		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0;
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		for (const char* value = std::getenv("KYTY_SHADER_DUMP_HASH"); value != nullptr && *value != 0;) {
+			char* end = nullptr;
+			list.push_back(std::strtoull(value, &end, 16));
+			value = *end == ',' ? end + 1 : nullptr;
+		}
+		return list;
 	}();
-	return hash != 0 && hash == shader_hash;
+	return shader_hash != 0 && std::ranges::find(hashes, shader_hash) != hashes.end();
 }
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,

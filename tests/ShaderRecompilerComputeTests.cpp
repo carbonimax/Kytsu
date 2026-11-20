@@ -17915,6 +17915,149 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A comparison sample of a k8UNorm texture, a guest format with no depth view: the 4x4 PCF case
+  // of arigandores/KytyPS5 359b1c3b5. It prints every answer next to the CPU PCF (compare each
+  // texel, then the bilinear weights) and NEAREST references; `strict` requires them.
+  void CheckDepthCompareColorTexture(bool strict) {
+    constexpr const char *name = "DepthCompareColorTexture";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    struct Point {
+      float s;
+      float t;
+    };
+    constexpr std::array<Point, 8> points{{{0.375f, 0.375f}, {0.625f, 0.375f}, {0.375f, 0.625f},
+                                           {0.625f, 0.625f}, {0.5f, 0.375f}, {0.5f, 0.625f},
+                                           {0.375f, 0.5f}, {0.5f, 0.5f}}};
+    constexpr std::array<float, 2> references{0.5f, 0.213f};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "comparison texture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "comparison texture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const auto format = Prospero::BufferFormat::k8UNorm;
+    const uint32_t pitch = TileGetTexturePitch(format, 4, Prospero::TileMode::kLinear);
+    std::array<double, 16> stored{};
+    for (uint32_t y = 0; y < 4; y++) {
+      for (uint32_t x = 0; x < 4; x++) {
+        const double v = (x < 2u ? 0.20 : 0.80) + 0.01 * y;
+        const auto byte = static_cast<uint8_t>(std::lround(v * 255.0));
+        *reinterpret_cast<uint8_t *>(base + y * pitch + x) = byte;
+        stored[y * 4u + x] = byte / 255.0;
+      }
+    }
+    const auto texel = [&](int x, int y) {
+      return stored[static_cast<size_t>(std::clamp(y, 0, 3)) * 4u +
+                    static_cast<size_t>(std::clamp(x, 0, 3))];
+    };
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &resources = context;
+    auto &cache = resources.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    resources.MapMemory(base, allocation_size);
+    ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+        (static_cast<uint32_t>(format) << 20u) | (3u << 30u), 3u << 14u,
+        DstSel(4, 4, 4, 4) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+        0, 0x00700000u, 0, 0}};
+    uint32_t mismatches = 0;
+    for (const bool linear : {true, false}) {
+      const uint32_t filter = linear ? 1u : 0u;
+      // CLAMP_LAST_TEXEL on x/y/z, DEPTH_COMPARE_FUNC LESS_EQUAL.
+      ShaderSamplerResource sampler_descriptor{{2u | (2u << 3u) | (2u << 6u) | (3u << 12u), 0,
+                                                (filter << 20u) | (filter << 22u), 0}};
+      TestCase test;
+      test.name = name;
+      test.has_user_data = true;
+      test.image_descriptor_swizzle = descriptor.DstSelXYZW();
+      std::copy_n(descriptor.fields, 8, test.user_data.begin());
+      std::copy_n(sampler_descriptor.fields, 4, test.user_data.begin() + 8);
+      test.user_data[50] = static_cast<u32>(points.size() * references.size() * sizeof(uint32_t));
+      test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      std::vector<double> pcf;
+      std::vector<double> nearest;
+      for (const auto reference : references) {
+        for (const auto &point : points) {
+          AppendVMovLiteral(&test.code, 20, std::bit_cast<uint32_t>(reference));
+          AppendVMovLiteral(&test.code, 21, std::bit_cast<uint32_t>(point.s));
+          AppendVMovLiteral(&test.code, 22, std::bit_cast<uint32_t>(point.t));
+          test.code.push_back(EncodeMimg0(0x2f, 1)); // image_sample_c_lz 2D
+          test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+          AppendStoreVgpr(&test.code, 0, static_cast<uint32_t>(pcf.size()));
+          const double u = 4.0 * point.s - 0.5;
+          const double v = 4.0 * point.t - 0.5;
+          const int i0 = static_cast<int>(std::floor(u));
+          const int j0 = static_cast<int>(std::floor(v));
+          const double a = u - i0;
+          const double b = v - j0;
+          const auto pass = [&](int x, int y) { return reference <= texel(x, y) ? 1.0 : 0.0; };
+          pcf.push_back((1.0 - a) * (1.0 - b) * pass(i0, j0) + a * (1.0 - b) * pass(i0 + 1, j0) +
+                        (1.0 - a) * b * pass(i0, j0 + 1) + a * b * pass(i0 + 1, j0 + 1));
+          nearest.push_back(pass(static_cast<int>(std::floor(4.0 * point.s)),
+                                 static_cast<int>(std::floor(4.0 * point.t))));
+        }
+      }
+      AppendEnd(&test.code);
+      const auto compiled = CompileCase(test, SubgroupSize());
+      Require(name, "comparison resource", compiled.program.info.images.size() == 1 &&
+                  compiled.program.info.images[0].depth_compare,
+              "the comparison sample lost its comparison resource");
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      auto binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, compiled.program.info.images[0], value);
+      const auto view = cache.FindTexture(binding.image_id, binding.desc);
+      auto &image = cache.GetImage(binding.image_id);
+      Require(name, "color view", view != nullptr && !image.info.IsDepth(),
+              "k8UNorm comparison texture unexpectedly got a depth view");
+      scheduler.Finish();
+      auto output = CreateStorageBuffer(name, {}, pcf.size());
+      const auto sampler = context.GetSamplerCache().GetSampler(
+          sampler_descriptor, compiled.program.info.samplers[0].integer_border);
+      Image sampled;
+      sampled.view = view;
+      sampled.layout = image.backing.state.layout;
+      Dispatch(test, compiled, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      const auto answers = ReadBuffer(name, output, pcf.size());
+      for (size_t k = 0; k < pcf.size(); k++) {
+        const double got = std::bit_cast<float>(answers[k]);
+        const double want = linear ? pcf[k] : nearest[k];
+        const bool ok = std::abs(got - want) <= 1.0 / 64.0;
+        mismatches += ok ? 0u : 1u;
+        std::printf("[s4] filter=%s ref=%.3f s=%.3f t=%.3f got=%.4f pcf=%.4f nearest=%.0f %s\n",
+                    linear ? "linear" : "point", references[k / points.size()],
+                    points[k % points.size()].s, points[k % points.size()].t, got, pcf[k],
+                    nearest[k], ok ? "ok" : "DIFF");
+      }
+      DestroyBuffer(&output);
+      RenderExecutorTestAccess::ResetBindings(executor);
+    }
+    resources.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "comparison texture release failed");
+    if (strict) {
+      Require(name, "PCF answers", mismatches == 0, "a k8UNorm comparison differs from PCF");
+    }
+    std::printf("[gpu]     %-32s %s (%u differ)\n", name, mismatches == 0 ? "ok" : "report", mismatches);
+  }
+
   // PPSA11264 samples a 1x1 depth target through a 1D comparison texture at its address.
   void CheckOneDimensionalDepthAlias() {
     constexpr const char *name = "OneDimensionalDepthAlias";
@@ -62837,6 +62980,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckSamplerBorderColors();
     vulkan.CheckSamplerFilterMode();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-compare-color-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthCompareColorTexture(false);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
