@@ -177,6 +177,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static callback_func_t       g_test_before_backing_map   = nullptr;
 static callback_func_t       g_test_backing_read         = nullptr;
+static int                   g_test_sparse_copy_cache_mode = -1; // -1 = KYTY_SPARSE_COPY_CACHE
 static uint64_t              g_test_backing_bytes_zeroed = 0;
 static std::atomic<uint64_t> g_test_free_range_visits {0};
 static int                   g_test_vma_memo_mode = -1; // -1 = KYTY_VMA_MEMO
@@ -1231,6 +1232,21 @@ bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->CopySparseMemory<true>(vaddr, data, size);
+}
+
+SparseCopyStats GetSparseCopyStats() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetSparseCopyStats() : SparseCopyStats {};
+}
+
+void ReportSparseCopyCache() {
+	const auto s = GetSparseCopyStats();
+	if (s.mode == 0) {
+		return;
+	}
+	// Totals since start, so the last line covers the whole session.
+	std::printf("PERF sparsecopy total: mode=%d checked=%" PRIu64 " locked=%" PRIu64 " stale_bytes=%" PRIu64
+	            " stale_maps=%" PRIu64 " bumps_maps=%" PRIu64 " bumps_bytes=%" PRIu64 "\n",
+	            s.mode, s.checked, s.locked, s.stale_bytes, s.stale_maps, s.map_bumps, s.byte_bumps);
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {
@@ -2895,6 +2911,10 @@ void TestBeforeNextBackingMap(callback_func_t callback) {
 
 void TestSetBackingReadCallback(callback_func_t callback) {
 	g_test_backing_read = callback;
+}
+
+void TestSetSparseCopyCacheMode(int mode) {
+	g_test_sparse_copy_cache_mode = mode;
 }
 
 void TestSetVmaMemoMode(int mode) {

@@ -75,6 +75,17 @@ struct BackingReadCache {
 };
 static thread_local BackingReadCache t_backing_read_cache;
 
+// Backing mappings of a thread's recent sparse copies (GuestAddressSpace::CopySparseMemory). Kept
+// apart from t_backing_read_cache so the CP thread's SRT walks and its buffer uploads do not evict
+// each other's mapping.
+struct SparseCopyCache {
+	static constexpr uint32_t Ways = 4;
+	BackingReadCache          entries[Ways];
+	uint64_t                  map_bumps[Ways] {}; // m_map_bumps at the fill (mode 2 stale-miss cause)
+	uint32_t                  next = 0;
+};
+static thread_local SparseCopyCache t_sparse_copy_cache;
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -169,7 +180,7 @@ public:
 
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(false);
 		std::memset(m_backing_base + backing_offset, 0, size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		g_test_backing_bytes_zeroed += size;
@@ -179,7 +190,7 @@ public:
 	void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(false);
 		const auto*     source = static_cast<const uint8_t*>(data);
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
@@ -292,6 +303,117 @@ public:
 			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
 		                },
 		                gap);
+		if (SparseCopyCacheMode() != 0) {
+			// Remember the mapping when it holds the whole range. Writers bump the generation
+			// under the exclusive lock, so it is stable here.
+			auto next = m_maps.upper_bound(vaddr);
+			if (next != m_maps.begin()) {
+				const auto& entry = std::prev(next)->second;
+				if (vaddr - entry.vaddr < entry.size && size <= entry.size - (vaddr - entry.vaddr)) {
+					auto&             cache = t_sparse_copy_cache;
+					BackingReadCache* found = nullptr;
+					for (auto& slot: cache.entries) {
+						if (slot.store == this && slot.vaddr == entry.vaddr) {
+							found = &slot;
+						}
+					}
+					auto& slot =
+					    found != nullptr ? *found : cache.entries[cache.next++ % SparseCopyCache::Ways];
+					slot.store          = this;
+					slot.generation     = m_map_generation.load(std::memory_order_relaxed);
+					slot.vaddr          = entry.vaddr;
+					slot.size           = entry.size;
+					slot.backing_offset = entry.backing_offset;
+					cache.map_bumps[&slot - cache.entries] = m_map_bumps.load(std::memory_order_relaxed);
+				}
+			}
+		}
+	}
+
+	// KYTY_SPARSE_COPY_CACHE: 0 (default) always takes the locks, 1 copies a range that lies inside
+	// one recently used backing mapping without any lock (TryCopyCached), 2 also re-checks every
+	// lock-free copy's translation under the locks and exits on a difference. Read once, at the
+	// first copy. With 1 or 2, a copy that misses the cache takes one address-space lock, not two.
+	static int SparseCopyCacheMode() {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_sparse_copy_cache_mode >= 0) {
+			return g_test_sparse_copy_cache_mode;
+		}
+#endif
+		static const int mode = [] {
+			const char* value = std::getenv("KYTY_SPARSE_COPY_CACHE");
+			const int   m     = value == nullptr ? 0 : static_cast<int>(std::strtol(value, nullptr, 10));
+			if (m != 0) {
+				std::printf("KYTY_SPARSE_COPY_CACHE=%d: lock-free sparse guest copies\n", m);
+				std::fflush(stdout);
+			}
+			return m;
+		}();
+		return mode;
+	}
+
+	// Lock-free copy for GuestAddressSpace::CopySparseMemory. Same seqlock as
+	// TryReadBackingCached, over the thread's sparse-copy mappings. On success, *generation and
+	// *backing_offset tell what the copy was validated against (for the mode 2 check). In mode 2,
+	// a miss on a slot that covers the range sets *stale: 1 if only byte writes (WriteBacking,
+	// ZeroRange) bumped the generation since its fill, 2 if a mapping change did.
+	bool TryCopyCached(uint64_t vaddr, void* data, uint64_t size, uint64_t* generation,
+	                   uint64_t* backing_offset, int* stale) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr) {
+			return false;
+		}
+#endif
+		const auto& cache       = t_sparse_copy_cache;
+		const auto  stale_cause = [&](uint32_t way) {
+			if (SparseCopyCacheMode() == 2) {
+				*stale = m_map_bumps.load(std::memory_order_relaxed) == cache.map_bumps[way] ? 1 : 2;
+			}
+		};
+		for (uint32_t way = 0; way < SparseCopyCache::Ways; ++way) {
+			const auto& slot = cache.entries[way];
+			if (slot.store != this || vaddr < slot.vaddr || size > slot.size ||
+			    vaddr - slot.vaddr > slot.size - size) {
+				continue;
+			}
+			const auto current = m_map_generation.load(std::memory_order_acquire);
+			const auto offset  = slot.backing_offset + (vaddr - slot.vaddr);
+			// The slot was a store mapping at this generation, so the offset is inside the store.
+			if (current != slot.generation) {
+				stale_cause(way);
+				continue;
+			}
+			std::memcpy(data, m_backing_base + offset, size);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (m_map_generation.load(std::memory_order_relaxed) != current) {
+				stale_cause(way);
+				return false;
+			}
+			*generation     = current;
+			*backing_offset = offset;
+			return true;
+		}
+		return false;
+	}
+
+	// Mode 2 check of a lock-free copy: 1 if the mapping still translates the range to
+	// backing_offset, 0 if not, 2 if a writer ran since (nothing left to check: the copy was
+	// validated before it).
+	int CheckCopyTranslation(uint64_t vaddr, uint64_t size, uint64_t generation,
+	                         uint64_t backing_offset) {
+		std::shared_lock lock(m_mutex);
+		if (m_map_generation.load(std::memory_order_relaxed) != generation) {
+			return 2;
+		}
+		auto next = m_maps.upper_bound(vaddr);
+		if (next == m_maps.begin()) {
+			return 0;
+		}
+		const auto& entry = std::prev(next)->second;
+		return vaddr - entry.vaddr < entry.size && size <= entry.size - (vaddr - entry.vaddr) &&
+		               entry.backing_offset + (vaddr - entry.vaddr) == backing_offset
+		           ? 1
+		           : 0;
 	}
 
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -301,10 +423,10 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(true);
 #else
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(true);
 		if (!MapView(vaddr, size, backing_offset, mode, failure_reason)) {
 			return false;
 		}
@@ -319,7 +441,7 @@ public:
 		std::vector<MapEntry> targets;
 		{
 			std::lock_guard lock(m_mutex);
-			BumpMapGeneration();
+			BumpMapGeneration(true);
 			auto            current = vaddr;
 			while (current < end) {
 				const auto* entry = FindContainingUnlocked(current);
@@ -347,7 +469,7 @@ public:
 		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size));
 
 		std::lock_guard lock(m_mutex);
-		BumpMapGeneration();
+		BumpMapGeneration(true);
 		RemoveMappingsUnlocked(vaddr, size);
 #endif
 		return true;
@@ -358,7 +480,7 @@ public:
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
-			BumpMapGeneration();
+			BumpMapGeneration(true);
 			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
 		}
 		const uint64_t left_size  = vaddr - old.vaddr;
@@ -567,7 +689,24 @@ private:
 		return enabled;
 	}
 
-	void BumpMapGeneration() { m_map_generation.fetch_add(1, std::memory_order_release); }
+	// The fence keeps the writer's later stores (mapping changes, ZeroRange/WriteBacking bytes)
+	// after the bump for lock-free readers on weakly ordered hosts (seqlock writer side).
+	// maps: an m_maps change (false: a locked byte write). Counted per kind with the cache on.
+	void BumpMapGeneration(bool maps) {
+		m_map_generation.fetch_add(1, std::memory_order_release);
+		std::atomic_thread_fence(std::memory_order_release);
+		if (SparseCopyCacheMode() != 0) {
+			(maps ? m_map_bumps : m_byte_bumps).fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+
+public:
+	void BumpCounts(uint64_t* maps, uint64_t* bytes) const {
+		*maps  = m_map_bumps.load(std::memory_order_relaxed);
+		*bytes = m_byte_bumps.load(std::memory_order_relaxed);
+	}
+
+private:
 
 	bool TryReadBackingCached(uint64_t vaddr, void* data, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -623,6 +762,8 @@ private:
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
 	std::atomic<uint64_t>        m_map_generation {0};
+	std::atomic<uint64_t>        m_map_bumps {0};  // KYTY_SPARSE_COPY_CACHE != 0 only
+	std::atomic<uint64_t>        m_byte_bumps {0}; // KYTY_SPARSE_COPY_CACHE != 0 only
 };
 
 class GuestAddressSpace {
@@ -679,13 +820,30 @@ public:
 	}
 
 	[[nodiscard]] bool Owns(uint64_t vaddr, uint64_t size) {
+		std::shared_lock lock(m_mutex);
+		return OwnsUnlocked(vaddr, size);
+	}
+
+	// m_owned is only written by ReserveGuestRegions, from the constructor: it needs no lock.
+	[[nodiscard]] bool OwnsUnlocked(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return vaddr >= range.first && vaddr + size <= range.first + range.second;
 		});
+	}
+
+	// Nothing (all zero) with KYTY_SPARSE_COPY_CACHE off.
+	[[nodiscard]] SparseCopyStats GetSparseCopyStats() const {
+		SparseCopyStats stats {};
+		stats.mode        = GuestBackingStore::SparseCopyCacheMode();
+		stats.checked     = m_sparse_checked.load(std::memory_order_relaxed);
+		stats.locked      = m_sparse_locked.load(std::memory_order_relaxed);
+		stats.stale_bytes = m_sparse_stale_bytes.load(std::memory_order_relaxed);
+		stats.stale_maps  = m_sparse_stale_maps.load(std::memory_order_relaxed);
+		m_backing->BumpCounts(&stats.map_bumps, &stats.byte_bumps);
+		return stats;
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -750,7 +908,64 @@ public:
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
-		if (data == nullptr || !Owns(vaddr, size)) {
+		// Lock-free path (KYTY_SPARSE_COPY_CACHE, off by default). Invariants it relies on:
+		// - Memory safety: the copy only dereferences the store's writable alias
+		//   [m_backing_base, +m_size), never a guest view. The alias is mapped once by the store's
+		//   constructor, never protected, resized or unmapped before ~GuestBackingStore, and the
+		//   locked path reads the same bytes. A slot only covers alias bytes the locked path
+		//   dereferenced for that same entry, so a stale slot can only read other alias bytes,
+		//   never freed or unmapped memory, whatever guest munmap or mmap does to the views.
+		// - Slots are keyed by `this`. Requirement: one store per process (Memory::Initialize),
+		//   and Memory::Shutdown destroys it only after every thread that copies has stopped.
+		// - Translation: every m_maps change and every locked byte write (store MapFixed, Unmap,
+		//   UnmapOne, ZeroRange, WriteBacking) bumps the 64-bit generation first, inside the same
+		//   exclusive section of the store lock. Slot generations are only captured under the shared
+		//   lock, when no writer is inside, so one bump per writer is enough (no odd/even): a copy
+		//   that read the slot's generation before and after it ran entirely before the next writer
+		//   acted, at a valid translation. Otherwise it is discarded and redone under the locks.
+		// - What can unmap or remap a range meanwhile: UnmapBacking and MapBacking (guest munmap,
+		//   mmap, MAP_FIXED over a view) go through those store calls. The Windows partial unmap
+		//   bumps at extract and at each survivor's MapFixed; the survivors' new entries refill the
+		//   cache on their next locked copy. Commit and ReleaseCommitted touch only free or
+		//   Private ranges. Protect and ProtectTransient may change a backing view's host
+		//   protection, but never m_maps or the alias, so they need no bump: the copy does not
+		//   go through the view.
+		// - A range inside one backing view is owned (MapBacking consumes owned free ranges only)
+		//   and holds no Private mapping (the two types are disjoint), so skipping Owns and
+		//   OverlapsPrivateUnlocked returns what the locked path returns. Mode 2 checks this.
+		// - Bytes: the locks never guarded them. Guest CPU stores and tracker protections take no
+		//   lock, and the alias ignores view protections, so a racing guest store is unordered with
+		//   the copy in both paths. Tracker protect-then-copy stays program order on this thread.
+		// Each thread (CP thread, #69 back thread) has its own slots; only the generation is shared,
+		// so any map change or WriteBacking anywhere invalidates every thread's slots.
+		if (data != nullptr && size != 0 && UINT64_MAX - vaddr >= size &&
+		    GuestBackingStore::SparseCopyCacheMode() != 0) {
+			uint64_t generation     = 0;
+			uint64_t backing_offset = 0;
+			int      stale          = 0;
+			if (m_backing->TryCopyCached(vaddr, data, size, &generation, &backing_offset, &stale)) {
+				if (GuestBackingStore::SparseCopyCacheMode() == 2) {
+					// Same lock order as the locked path: address space, then backing store.
+					EXIT_IF(!Owns(vaddr, size));
+					std::shared_lock lock(m_mutex);
+					const auto check = m_backing->CheckCopyTranslation(vaddr, size, generation,
+					                                                   backing_offset);
+					EXIT_IF(check == 0 || (check == 1 && OverlapsPrivateUnlocked(vaddr, size)));
+					m_sparse_checked.fetch_add(1, std::memory_order_relaxed);
+				}
+				return true;
+			}
+			if (GuestBackingStore::SparseCopyCacheMode() == 2) {
+				m_sparse_locked.fetch_add(1, std::memory_order_relaxed);
+				if (stale != 0) {
+					(stale == 1 ? m_sparse_stale_bytes : m_sparse_stale_maps).fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		}
+		// With the cache on, a miss also skips the lock Owns takes (m_owned is constant).
+		if (data == nullptr || !(GuestBackingStore::SparseCopyCacheMode() != 0
+		                             ? OwnsUnlocked(vaddr, size)
+		                             : Owns(vaddr, size))) {
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
@@ -1337,4 +1552,8 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
+	std::atomic<uint64_t>                      m_sparse_checked {0}; // KYTY_SPARSE_COPY_CACHE=2 only
+	std::atomic<uint64_t>                      m_sparse_locked {0};
+	std::atomic<uint64_t>                      m_sparse_stale_bytes {0}; // part of locked, mode 2 only
+	std::atomic<uint64_t>                      m_sparse_stale_maps {0};
 };
