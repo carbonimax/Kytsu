@@ -788,8 +788,20 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 	const LateRead::Scope late_read(LateRead::Site::Vertex);
 	for (auto& range: merged_ranges) {
 		// PPSA20298
+		// A vertex buffer the game names before the region is backed is not an error: on the
+		// hardware an unbacked range reads zero and drops writes, so binding nothing reproduces it.
 		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		    Libs::LibKernel::Memory::TryClampRangeSize(range.base_address, range.RequestedSize());
+		if (size == 0) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("PreparedVertexBuffers: vertex buffer range outside mapped memory: "
+				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     range.base_address, range.RequestedSize());
+			}
+			range.acquired_end = range.base_address;
+			continue;
+		}
 		range.acquired_end = range.base_address + size;
 		std::tie(range.buffer, range.offset) = cache.ObtainBuffer(range.base_address, size, false);
 	}
@@ -800,7 +812,14 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
 		const auto  size   = sizes[i];
-		if (size == 0) {
+		// A slot in a merged range with nothing mapped at its base binds nothing, like size 0.
+		const bool unbacked = std::any_of(
+		    merged_ranges.begin(), merged_ranges.begin() + merged_count,
+		    [&](const VertexBufferRange& value) {
+			    return value.acquired_end == value.base_address &&
+			           vertex.addr >= value.base_address && vertex.addr < value.requested_end;
+		    });
+		if (size == 0 || unbacked) {
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
 			}

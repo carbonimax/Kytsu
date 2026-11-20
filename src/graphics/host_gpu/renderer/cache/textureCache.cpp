@@ -85,7 +85,9 @@ uint32_t ImageChurnOpt() {
 	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
 	                           : desc.view_info.format;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
-	if (cmask ? code == 0 : code == 0x20) {
+	// PS5 DCC fast clears to the CB_COLOR_CLEAR_WORD value fill the keys with 0x10, not the
+	// GFX10 0x20.
+	if (cmask ? code == 0 : (code == 0x20 || code == 0x10)) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
@@ -304,11 +306,24 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	m_download_images.erase(id);
-	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
-		// Only the last image to acquire an HTile range releases its clear state.
-		const auto metadata = m_surface_metas.find(image.info.metadata.range.address);
-		if (metadata != m_surface_metas.end() && metadata->second.owner == id) {
-			m_surface_metas.erase(metadata);
+	if (image.info.IsDepth() && !image.depth_id) {
+		// HTile clear state belongs to the guest depth surface, not to one native image: a title
+		// alternates D32 and D32S8 bindings with separate HTiles and clears each while the other
+		// is bound. Keep the state while another HTile depth image of the surface remains; a
+		// non-depth replacement still drops it. Entries another surface rebound are its own.
+		const auto surface  = image.info.data.address;
+		bool       retained = false;
+		for (const auto other: FindImagesInRegion(surface, image.info.data.size)) {
+			const auto* owner = m_slot_images.try_get(other);
+			retained |= other != id && owner != nullptr && owner->registered && !owner->depth_id &&
+			            owner->info.IsDepth() &&
+			            owner->info.metadata.kind == ImageMetadataKind::Htile &&
+			            owner->info.data.address == surface;
+		}
+		if (!retained) {
+			std::erase_if(m_surface_metas, [&](const auto& metadata) {
+				return metadata.second.depth_address == surface;
+			});
 		}
 	}
 	UnregisterImage(id);
@@ -675,6 +690,26 @@ void TextureCache::CopyImageThroughBuffer(ImageId destination_id, ImageId source
 	                                m_tiler);
 }
 
+void TextureCache::CopyStencil(ImageId destination_id, ImageId source_id) {
+	auto&      source            = m_slot_images[source_id];
+	const auto source_stencil_id = FindStencilPlane(source, source.info.stencil);
+	// Without a bound stencil plane, guest memory is current.
+	if (!source_stencil_id) {
+		return;
+	}
+	RefreshImage(source_stencil_id);
+	auto& destination                = m_slot_images[destination_id];
+	destination.stencil_subresources = source.stencil_subresources;
+	const auto stencil_id            = AssociateStencil(destination_id, source.info.stencil);
+	// The copy covers only the source extent; the rest comes from guest memory.
+	RefreshImage(stencil_id);
+	destination.CopyImage(source, true);
+	if (m_slot_images[source_stencil_id].IsGpuModified()) {
+		TrackImage(stencil_id);
+		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
+}
+
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
 	RefreshCopySource(source_id);
@@ -737,6 +772,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.pitch == cached.info.pitch &&
 	    (requested.resources == cached.info.resources || retain_cached_layout) &&
 	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
+	// A padded pitch lets a larger depth target match a smaller one at the same address.
+	const bool grown_depth_target = binding == BindingType::DepthTarget &&
+	                                (requested.extent.width > cached.info.extent.width ||
+	                                 requested.extent.height > cached.info.extent.height);
 	bool recreate = cached.info.resources < requested.resources ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
@@ -749,6 +788,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			// The render area follows the requested extent, so the attachment must cover it.
+			recreate |= grown_depth_target;
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
@@ -782,7 +823,19 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
 		if (copy_supported) {
+			if (grown_depth_target) {
+				// The copy covers only the cached extent and marks the replacement current, so
+				// upload the rest from guest memory first.
+				RefreshImage(replacement_id);
+			}
 			CopyImage(replacement_id, cached_id);
+			// Draws write stencil into the depth image only; it is lost when the image is freed.
+			if (binding == BindingType::DepthTarget && cached.info.IsDepth() &&
+			    cached.info.HasStencil() && requested.HasStencil() &&
+			    requested.stencil == cached.info.stencil &&
+			    cached.backing.format == replacement.backing.format) {
+				CopyStencil(replacement_id, cached_id);
+			}
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
 			           "TextureCache: unsupported cross-format multisample depth copy\n");
@@ -910,14 +963,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
 			return {ExpandImage(requested, cached_id)};
 		}
-		// Volume depth is not an array-layer count. A larger depth can retain the
-		// same block-slice layout while requiring a larger native image.
+		// Volume depth is not an array-layer count. A larger depth, or a larger width
+		// within the same pitch, can retain the same block-slice layout while requiring
+		// a larger native image.
+		const bool volume_contains_cached = requested.type == cached.info.type &&
+		                                    requested.resources == cached.info.resources &&
+		                                    requested.extent.width >= cached.info.extent.width &&
+		                                    requested.extent.height >= cached.info.extent.height &&
+		                                    requested.extent.depth >= cached.info.extent.depth;
 		if ((requested.IsVolume() || cached.info.IsVolume()) &&
 		    (requested.data.size == cached.info.data.size ||
-		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
-		      requested.extent.width == cached.info.extent.width &&
-		      requested.extent.height == cached.info.extent.height &&
-		      requested.extent.depth > cached.info.extent.depth))) {
+		     (volume_contains_cached && requested.data.size > cached.info.data.size))) {
 			if (KeepBeside(cached, requested, binding)) {
 				return {merged_id};
 			}
@@ -956,15 +1012,25 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
+		// A volume allocation reused for a differently shaped volume. Neither extent
+		// contains the other, so the requested volume is a separate guest image.
+		if (requested.IsVolume() && cached.info.IsVolume()) {
+			if (safe_to_delete) {
+				FreeImage(cached_id);
+			}
+			return {merged_id};
+		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
 		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
+		     " type=%u/%u tile=%u/%u extent=%ux%ux%u/%ux%ux%u pitch=%u\n",
 		     requested.data.address, requested.resources.levels, requested.resources.layers,
 		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
 		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		     static_cast<uint32_t>(cached.info.tile_mode), requested.extent.width,
+		     requested.extent.height, requested.extent.depth, cached.info.extent.width,
+		     cached.info.extent.height, cached.info.extent.depth, requested.pitch);
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);
@@ -1047,7 +1113,17 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (destination.backing.samples != 1 || info.resources.layers == 0 ||
 	    info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
-		EXIT("TextureCache: invalid depth upload\n");
+		EXIT("TextureCache: invalid depth upload: stencil=%u addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64
+		     " format=%u elem_bytes=%u bytes_per_block=%u tile=%u extent=%ux%ux%u pitch=%u "
+		     "levels=%u layers=%u samples=%u backing_samples=%u\n",
+		     image.depth_id ? 1u : 0u, info.data.address, info.data.size,
+		     static_cast<uint32_t>(info.guest_format),
+		     static_cast<uint32_t>(Prospero::NumBytesPerElement(info.guest_format)),
+		     static_cast<uint32_t>(info.bytes_per_block), static_cast<uint32_t>(info.tile_mode),
+		     info.extent.width, info.extent.height, info.extent.depth, info.pitch,
+		     info.resources.levels, info.resources.layers, info.samples,
+		     destination.backing.samples);
 	}
 	const auto layers          = info.resources.layers;
 	const auto full_slice_size = info.LinearLayout().slice_stride;
@@ -1283,6 +1359,14 @@ TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, c
 			result.check = check;
 			return result;
 		}
+		const bool expand = desc.type != BindingType::VideoOut;
+		// KYTY_TC_LOCK_ORDER: the write binding below waits for priority operations, which deliver
+		// labels through m_lock. Wait for them here, without m_lock.
+		if (expand && TcLockOrder()) [[unlikely]] {
+			if (const auto tick = m_buffer_cache.WritePublishTick(viewed.address, viewed.size)) {
+				m_scheduler.WaitPriorityOperations(tick);
+			}
+		}
 		{
 			std::scoped_lock lock {m_lock};
 			auto&            image = m_slot_images[id];
@@ -1296,11 +1380,12 @@ TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, c
 			    (m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
 			     vk::FormatFeatureFlagBits::eColorAttachment) &&
 			    (desc.info.metadata.compression == VideoOutCompression::Uncompressed ||
-			     native_current)) {
+			     native_current) &&
+			    // Still pending (not expected, see WritePublishTick): read the metadata instead.
+			    !(expand && TcLockOrder() && m_buffer_cache.WritePublishTick(viewed.address, viewed.size) != 0)) {
 				// The GPU selects each slice's clear, so the CPU never waits for the metadata.
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorMetadataChecks);
 				InitializeImage(id);
-				const bool expand = desc.type != BindingType::VideoOut;
 				const auto [buffer, offset] =
 				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
 				const auto predicates = m_tiler.CheckColorClear(
@@ -1508,6 +1593,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 	const auto memo_mode           = memo != nullptr ? FindImageMemoMode() : 0u;
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
+	if (TcLockOrder()) [[unlikely]] {
+		WaitAliasPublishes(desc.info.data);
+	}
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
@@ -1679,6 +1767,38 @@ uint32_t TextureCache::KeptColorClears(std::span<const KeptFind> finds) {
 		}
 	}
 	return keep;
+}
+
+// KYTY_TC_LOCK_ORDER: BcAlias::Publish binds alias images for writing under m_lock, which waits
+// for priority operations, and those deliver labels through m_lock. Wait first, without m_lock,
+// for the publications over the description and its candidates: the only ranges Publish binds.
+// None appears during the search (see BufferCache::WritePublishTick).
+void TextureCache::WaitAliasPublishes(GuestRange range) {
+	while (m_buffer_cache.WritePublishTick(0, UINT64_MAX) != 0) {
+		uint64_t tick = 0;
+		{
+			std::scoped_lock lock {m_lock};
+			auto       begin = range.address;
+			auto       end   = range.End();
+			const auto add   = [&](const GuestRange& data) {
+				begin = std::min(begin, data.address);
+				end   = std::max(end, data.End());
+			};
+			for (const auto id: FindImageCandidates(range.address, range.size)) {
+				const auto& image = m_slot_images[id];
+				add(image.info.data);
+				// A search can resolve to the plane associated with a candidate.
+				if (image.depth_id) {
+					add(m_slot_images[image.depth_id].info.data);
+				}
+			}
+			tick = m_buffer_cache.WritePublishTick(begin, end - begin);
+		}
+		if (tick == 0) {
+			return;
+		}
+		m_scheduler.WaitPriorityOperations(tick);
+	}
 }
 
 // The search of FindImage, under m_lock. Returns an empty id when an image heap must wait for
@@ -1940,10 +2060,15 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
-		if (inserted && image.info.htile_initial_clear) {
-			metadata->second.clear_mask.set();
+		// Key by the native image base; a layered binding may start at a later slice. Clear state
+		// kept for another surface does not carry over when this HTile changes surfaces.
+		if (inserted || metadata->second.depth_address != image.info.data.address) {
+			metadata->second.clear_mask.reset();
+			if (image.info.htile_initial_clear) {
+				metadata->second.clear_mask.set();
+			}
+			metadata->second.depth_address = image.info.data.address;
 		}
-		metadata->second.owner = id;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);

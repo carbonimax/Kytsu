@@ -162,8 +162,9 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
-		// The depth image that last acquired this HTile range.
-		ImageId owner;
+		// Guest depth surface last bound with this HTile. One surface can use several HTile
+		// allocations, such as depth-only and depth-stencil variants.
+		uint64_t depth_address = 0;
 	};
 
 	struct OverlapResult {
@@ -349,11 +350,13 @@ private:
 	void               CopyImage(ImageId destination, ImageId source);
 	// The depth image's stencil plane record covering exactly range, or none.
 	[[nodiscard]] ImageId FindStencilPlane(const Image& depth, GuestRange range) const;
+	void                  CopyStencil(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 	ImageId FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,
 	                        FindImageMemo* memo);
+	void    WaitAliasPublishes(GuestRange range);
 
 	// `staging`: a mapped download buffer of at least the image size, used instead of the reusable one.
 	// `capture` (GPU capture publish): also stencil associations and compressed video-out images.
@@ -362,6 +365,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	// KYTY_TC_LOCK_ORDER: never wait for priority operations under m_lock (they take it to deliver labels).
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
