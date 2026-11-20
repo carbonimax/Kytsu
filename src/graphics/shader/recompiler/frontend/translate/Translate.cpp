@@ -129,6 +129,12 @@ std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 // a lane the host does not run never clears its bit, and a waterfall loop waiting for EXEC to
 // empty would spin forever (tessellation vertex shaders on a 32-lane host).
 std::array<IR::U32, 2> Translator::PresentMask() {
+	// Wave32 keeps the words as written: EXEC_HI is a plain SGPR there, and a partial wave32
+	// reads back the EXEC_LO it wrote (ScalarOrn2SaveexecB32 cases). Only wave64 is masked.
+	if (program.wave_size != 64u) {
+		const auto all = IR::U32(IR::Value(~0u));
+		return {all, all};
+	}
 	if (program.stage == ShaderType::Pixel) {
 		const auto mask = ir.Emit(IR::ValueOpcode::LiveMask);
 		return {ir.CompositeExtract(mask, 0),
