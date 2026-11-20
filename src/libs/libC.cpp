@@ -24,9 +24,11 @@
 #include <ctime>
 #include <fmt/format.h>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -62,16 +64,32 @@ static int                g_argc = 0;
 static const char* const* g_argv = nullptr;
 static const char* const* g_envp = nullptr;
 static std::mutex g_environment_mutex;
-static std::unordered_map<std::string, std::string> g_environment;
+// Values live in non-throwing buffers: the Clang build has no exceptions, so a guest value too
+// large for memory must fail with ENOMEM instead of aborting the emulator.
+// shortcut: the key string and the map node still allocate with throwing new; both are small,
+// make them non-throwing too if a guest ever exhausts memory with names.
+static std::unordered_map<std::string, std::unique_ptr<char[]>> g_environment;
+
+static std::unique_ptr<char[]> CopyEnvironmentValue(std::string_view value) {
+	std::unique_ptr<char[]> copy(new (std::nothrow) char[value.size() + 1]);
+	if (copy != nullptr) {
+		std::memcpy(copy.get(), value.data(), value.size());
+		copy[value.size()] = '\0';
+	}
+	return copy;
+}
 
 static void InitializeEnvironment(const char* const* envp) {
 	std::lock_guard lock(g_environment_mutex);
 	g_environment.clear();
 	for (const char* const* entry = envp; entry != nullptr && *entry != nullptr; ++entry) {
-		const std::string variable(*entry);
+		const std::string_view variable(*entry);
 		const auto equals = variable.find('=');
-		if (equals != std::string::npos && equals != 0) {
-			g_environment.try_emplace(variable.substr(0, equals), variable.substr(equals + 1));
+		if (equals != std::string_view::npos && equals != 0) {
+			auto value = CopyEnvironmentValue(variable.substr(equals + 1));
+			if (value != nullptr) {
+				g_environment.try_emplace(std::string(variable.substr(0, equals)), std::move(value));
+			}
 		}
 	}
 }
@@ -83,18 +101,26 @@ static char* GetGuestEnvironmentVariable(const char* name) {
 
 	std::lock_guard lock(g_environment_mutex);
 	const auto variable = g_environment.find(name);
-	return variable == g_environment.end() ? nullptr : const_cast<char*>(variable->second.c_str());
+	return variable == g_environment.end() ? nullptr : variable->second.get();
 }
 
-static int SetGuestEnvironmentVariable(const char* name, const char* value, int overwrite) {
+// Returns false when the value cannot be copied (out of memory).
+static bool SetGuestEnvironmentVariable(const char* name, const char* value, int overwrite) {
 	std::lock_guard lock(g_environment_mutex);
 	auto variable = g_environment.find(name);
-	if (variable == g_environment.end()) {
-		g_environment.emplace(name, value);
-	} else if (overwrite != 0) {
-		variable->second = value;
+	if (variable != g_environment.end() && overwrite == 0) {
+		return true;
 	}
-	return 0;
+	auto copy = CopyEnvironmentValue(value);
+	if (copy == nullptr) {
+		return false;
+	}
+	if (variable == g_environment.end()) {
+		g_environment.emplace(name, std::move(copy));
+	} else {
+		variable->second = std::move(copy);
+	}
+	return true;
 }
 
 int GetArgc() {
@@ -361,12 +387,11 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 	}
 
 	// Keep guest changes separate from the emulator process environment.
-	try {
-		return SetGuestEnvironmentVariable(name, value, overwrite);
-	} catch (const std::bad_alloc&) {
+	if (!SetGuestEnvironmentVariable(name, value, overwrite)) {
 		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
 		return -1;
 	}
+	return 0;
 }
 
 static KYTY_SYSV_ABI int64_t libc_time(int64_t* timer) {
