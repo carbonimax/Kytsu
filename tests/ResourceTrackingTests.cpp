@@ -4819,6 +4819,105 @@ void TestCompactScalarImageTable() {
                "compact table accepted an unproved selector or inconsistent descriptor width");
 }
 
+void TestBitScanScalarImageSelector() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto make = [](bool guarded, bool wrapping) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *body = fixture.AddBlock();
+    auto *done = fixture.AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(done);
+    body->AddBranch(done);
+    const auto mask = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    entry->condition =
+        guarded ? fixture.Emit(ValueOpcode::INotEqual32, {mask, Value(0u)})
+                : Value(true);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body,
+                         .false_block = done};
+    const auto material =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    const auto table =
+        fixture.Address(fixture.UserData(4), fixture.UserData(5));
+    fixture.block = body;
+    const auto index = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const auto offset = fixture.Emit(
+        ValueOpcode::IMul32, {index, Value(wrapping ? 0x80000000u : 208u)});
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    scalar.offset = 4u;
+    const auto key =
+        fixture.Emit(ValueOpcode::ReadConstBuffer, {material, offset},
+                     fixture.AddMemory(scalar, 0x10));
+    const auto record =
+        fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      scalar.kind = ResourceKind::ScalarAddress;
+      scalar.offset = word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, record, Value(0u), Value(true)},
+                                 fixture.AddMemory(scalar, 0x20));
+    }
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+                 {fixture.Image(words),
+                  fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
+                  fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(sample, 0x30));
+    fixture.PlanAndTrack();
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make(true, false);
+  const auto &indirect =
+      *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+  Check(indirect.key_count == Value(32u) &&
+            indirect.selector_first == Value(0u) && indirect.selector &&
+            indirect.selector->stride == 208u,
+        "nonzero bit scan did not bound the scalar material records");
+  CheckFatal([&] { make(false, false); }, "not a valid runtime value",
+             "zero bit scan sentinel was treated as a bounded material index");
+  CheckFatal(
+      [&] { make(true, true); }, "not a valid runtime value",
+      "wrapped multiplication was treated as a finite unwrapped record domain");
+  LinearTestMemory memory;
+  memory.words[1] = 1u;
+  memory.words[208u / 4u + 1u] = 2u;
+  for (uint32_t key = 0; key < 3u; ++key) {
+    const auto word = (0x1000u + key * 32u) / 4u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] =
+        static_cast<uint32_t>(
+            Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+        << 20u;
+    memory.words[word + 3u] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+         << 28u);
+  }
+  std::array<uint32_t, 6> user_data{0x1000u, 0u, 216u, 0u, 0x2000u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  memory.fail_address = memory.base + 216u;
+  FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+  const SrtRuntime runtime{.user_data = user_data,
+      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 3u &&
+            snapshot.images[0].dwords[0] == 0x100u &&
+            snapshot.images[1].dwords[0] == 0x101u &&
+            snapshot.images[2].dwords[0] == 0x102u,
+        "bounded material selector lost the OOB zero key or read beyond V# "
+        "bounds");
+}
+
 void TestScalarBufferSelectorDomain() {
   const auto make_plan = [](bool active = true, bool sparse = false, bool uniformize_first = false) {
     Fixture fixture;
@@ -7578,6 +7677,29 @@ void TestGpuSelectedBufferRecords() {
               "affine descriptor read escaped writable-alias capture");
       }
     }
+    const auto first = (table_offset + aligned_bias + 160u) / 4u;
+    const auto format_word = memory.words[first + 3u];
+    for (uint32_t format = 78u; format < 128u; ++format) {
+      memory.words[first + 3u] = (format << 12u) | DstSel(4, 5, 6, 1);
+      Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + 7u,
+            "reserved V# format aborted affine table discovery or became a resource");
+      const auto mapping = specialization.buffers[roots[0]].indirect_mapping_offset;
+      Check(snapshot.flattened_srt[mapping] == 4u &&
+                snapshot.flattened_srt[mapping + 1u] == 0u &&
+                snapshot.flattened_srt[mapping + 2u] == 1u &&
+                snapshot.flattened_srt[mapping + 4u] == 3u,
+            "reserved V# candidate changed wrapped-key mapping for valid descriptors");
+    }
+    memory.words[first + 1u] = 16u << 16u;
+    for (uint32_t format = 1u; format <= 77u; ++format) {
+      memory.words[first + 3u] = (format << 12u) | DstSel(4, 5, 6, 1);
+      Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + 8u &&
+                specialization.buffers[plan.info.buffers.size()].descriptor_format ==
+                    static_cast<Prospero::BufferFormat>(format),
+            "valid V# format was filtered or lost during table refresh");
+    }
+    memory.words[first + 1u] = 8u << 16u;
+    memory.words[first + 3u] = format_word;
     // The trailing V# has only three readable DWORDs; its missing format word is zero.
     const auto tail = (table_offset + aligned_bias + 416u) / 4u;
     memory.words[tail] = 0x300000u;
@@ -8874,6 +8996,154 @@ void TestFiniteInlineSampler() {
   }
   CheckFatal([&] { adjusted.PlanAndTrack(); }, "not a valid runtime value",
              "finite sampler planning accepted a shared SampleAdjust handle");
+}
+
+void TestImageTableBitScanSentinel() {
+  Fixture fixture;
+  const auto mask = fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(uint32_t(StageInputKind::LocalInvocationIndex)), Value(0u)});
+  const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+  const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(32u)});
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = word * 4u;
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {table, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x12cu));
+  }
+  const auto image = fixture.Image(words, 0x170u);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+      {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x170u));
+  fixture.PlanAndTrack();
+  const auto source = fixture.program.info.images[0].source;
+  const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+  Check(indirect && indirect->selector_first == Value(UINT32_MAX) &&
+            indirect->key_count == Value(33u) && indirect->table_offset == 32u &&
+            indirect->table_stride == 32u && image.Instruction()->Arg(0) == key,
+        "image table bit scan lost its zero-input sentinel or GPU key");
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  LinearTestMemory memory;
+  for (uint32_t record = 0; record < 33u; ++record) {
+    memory.words[record * 8u] = 0x100u + record;
+    memory.words[record * 8u + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[record * 8u + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  const std::array<uint32_t, 2> user_data{0x1000u, 0u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 33u && memory.descriptor_reads == 33u,
+        "bit scan table did not capture its complete descriptor domain");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 33u,
+        "bit scan mapping lost a candidate");
+  for (uint32_t entry = 0; entry < 33u; ++entry) {
+    const auto expected_key = entry == 32u ? UINT32_MAX : entry;
+    const auto ordinal = snapshot.flattened_srt[mapping + 2u + entry * 2u];
+    Check(snapshot.flattened_srt[mapping + 1u + entry * 2u] == expected_key &&
+              snapshot.images[ordinal].dwords[0] == 0x100u + uint32_t(expected_key + 1u),
+          "bit scan sentinel did not wrap to descriptor zero or changed a bit position");
+  }
+}
+
+void TestNestedStructuredSamplerPhi() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // Builds a two-level structured merge selecting between memory-resident S# records.
+  // The condition source distinguishes a wave-uniform selection from a lane-varying one.
+  const auto build = [](bool uniform) {
+    auto fixture = std::make_unique<Fixture>(ShaderType::Pixel);
+    auto *entry = fixture->block;
+    auto *inner_branch = fixture->AddBlock();
+    auto *inner_tail = fixture->AddBlock();
+    auto *inner_merge = fixture->AddBlock();
+    auto *other = fixture->AddBlock();
+    auto *merge = fixture->AddBlock();
+    entry->AddBranch(inner_branch);
+    entry->AddBranch(other);
+    inner_branch->AddBranch(inner_tail);
+    inner_branch->AddBranch(inner_merge);
+    inner_tail->AddBranch(inner_merge);
+    inner_merge->AddBranch(merge);
+    other->AddBranch(merge);
+    const auto condition = [&](uint32_t index) {
+      const auto lhs = uniform ? fixture->UserData(index)
+                               : fixture->Emit(ValueOpcode::LaneId);
+      return fixture->Emit(ValueOpcode::IEqual32, {lhs, Value(0u)});
+    };
+    entry->condition = condition(0);
+    inner_branch->condition = condition(1);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = inner_branch, .false_block = other,
+                         .merge_block = merge};
+    inner_branch->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                                .true_block = inner_tail, .false_block = inner_merge,
+                                .merge_block = inner_merge};
+    inner_tail->terminator = {.kind = CFG::TerminatorKind::Branch,
+                              .true_block = inner_merge};
+    inner_merge->terminator = {.kind = CFG::TerminatorKind::Branch,
+                               .true_block = merge};
+    other->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    merge->terminator.kind = CFG::TerminatorKind::Return;
+
+    // Memory-resident S# words: the direct path cannot unify the differing constant-buffer
+    // offsets, so only a value-level Select lowering can describe this selection.
+    const auto base = fixture->Buffer({fixture->UserData(2), fixture->UserData(3),
+                                       Value(0u), Value(0u)});
+    const auto load = [&](Block *block, uint32_t offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarBuffer;
+      memory.offset = offset;
+      return fixture->Emit(ValueOpcode::ReadConstBuffer, {base, Value(0u)},
+                           fixture->AddMemory(memory, pc), block);
+    };
+    const auto inner_low = load(inner_tail, 0u, 0x4c8u);
+    const auto inner_high = load(inner_branch, 16u, 0x480u);
+    const auto outer_other = load(other, 32u, 0x470u);
+    auto &inner = inner_merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    inner.AddPhiOperand(inner_tail, inner_low);
+    inner.AddPhiOperand(inner_branch, inner_high);
+    auto &outer = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    outer.AddPhiOperand(inner_merge, Value(&inner));
+    outer.AddPhiOperand(other, outer_other);
+    fixture->block = merge;
+    const auto sampler = fixture->Sampler({Value(&outer), Value(0u), Value(0u), Value(0u)});
+    const auto image = fixture->Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                       Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture->Emit(ValueOpcode::ImageSampleRaw,
+                  {image, sampler, fixture->ImageAddress(), Value(true)},
+                  fixture->AddMemory(sample, 0x1dd0u));
+    return fixture;
+  };
+
+  auto fixture = build(true);
+  fixture->PlanAndTrack();
+  const auto root = fixture->program.memory_info[0].sampler;
+  const auto source = fixture->program.info.samplers[root].source;
+  const auto &descriptor = fixture->program.descriptor_sources[source];
+  const auto *dword0 = descriptor.dwords[0].ResolveInstruction();
+  Check(dword0 != nullptr && dword0->GetOpcode() == ValueOpcode::SelectU32,
+        "nested uniform sampler selection was not lowered into a Select");
+  Check(!descriptor.indirect_descriptor.has_value(),
+        "nested uniform sampler selection should not need a GPU-selected descriptor");
+
+  auto varying = build(false);
+  CheckFatal([&] { varying->PlanAndTrack(); }, "not a valid runtime value",
+             "nested lane-varying sampler selection was accepted");
 }
 
 void TestFiniteImageBitScanSentinel() {
@@ -10248,6 +10518,7 @@ int main(int argc, char **argv) {
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("compact scalar image table", TestCompactScalarImageTable);
     Run("scalar buffer selector domain", TestScalarBufferSelectorDomain);
+    Run("bit scan scalar image selector", TestBitScanScalarImageSelector);
     Run("private LDS forwarding", TestPrivateLdsForwarding);
     Run("counted row image selector", TestCountedRowImageSelector);
     Run("shared append selector bounds", TestSharedAppendSelectorBounds);
@@ -10272,7 +10543,9 @@ int main(int argc, char **argv) {
     Run("packed descriptor waterfall", TestPackedDescriptorWaterfall);
     Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
+    Run("nested structured sampler phi", TestNestedStructuredSamplerPhi);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
+    Run("image table bit scan sentinel", TestImageTableBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("loop-exit atomic binds carried buffer", TestLoopExitAtomicBindsCarriedBuffer);
