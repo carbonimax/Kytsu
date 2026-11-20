@@ -362,6 +362,8 @@ struct Shader {
 };
 
 struct ShaderMappedData {
+	static constexpr uint32_t MaxInputSemantics = 32;
+
 	Prospero::ShaderBinaryType type {};
 	ShaderUserData* user_data           = nullptr;
 	ShaderSemantic* input_semantics     = nullptr;
@@ -373,6 +375,7 @@ struct ShaderMappedData {
 	const ShaderRegister* sh_registers     = nullptr;
 	uint32_t              num_cx_registers = 0;
 	uint32_t              num_sh_registers = 0;
+	std::array<ShaderSemantic, MaxInputSemantics> input_semantics_snapshot {};
 };
 
 void ShaderInit();

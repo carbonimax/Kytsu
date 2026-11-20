@@ -84,6 +84,11 @@ struct MemoryInfo {
 		       !typed && !formatted && data_bits == 32u;
 	}
 
+	[[nodiscard]] bool IsCoherentBufferPairStore(ValueOpcode opcode) const {
+		return kind == ResourceKind::Buffer && opcode == ValueOpcode::StoreBufferU32x2 &&
+		       coherent && !typed && !formatted && data_bits == 32u;
+	}
+
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
@@ -503,6 +508,7 @@ struct Bindings {
 	uint64_t descriptor_mask = 0;
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
+	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -538,6 +544,7 @@ struct ShaderInfo {
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
 	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
+	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
@@ -556,6 +563,7 @@ struct ShaderInfo {
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;
 	bool                            bvh_stack                     = false;
+	bool                            ray_query                     = false;
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;
@@ -622,9 +630,17 @@ struct DescriptorSource {
 
 			bool operator==(const PointerTable& other) const = default;
 		};
+		// The selector reads a 64-bit pointer from its record. Each hop loads the next 64-bit
+		// pointer at that byte offset; the descriptor is read at table_offset of the last one.
+		struct PointerChain {
+			std::vector<uint32_t> hops;
+
+			bool operator==(const PointerChain& other) const = default;
+		};
 		std::optional<SelectorRead> selector;
 		std::optional<uint32_t> table_maximum;
 		std::optional<PointerTable> pointer_table;
+		std::optional<PointerChain> chain;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;
@@ -642,6 +658,8 @@ struct DescriptorSource {
 		// range.
 		Value                 selector_first;
 		Value    selector_mask;
+		// Negative selector values never reach the resource (a dominating key >= 0 test).
+		bool                  selector_nonnegative = false;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectDescriptor& other) const = default;

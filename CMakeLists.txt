@@ -492,6 +492,10 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(apr_preopen_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AprPreopenTests.cpp")
+target_link_libraries(apr_preopen_tests PRIVATE common)
+target_include_directories(apr_preopen_tests PRIVATE ${inc_headers})
+
 add_executable(driver_cache_policy_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DriverCachePolicyTests.cpp")
 target_link_libraries(driver_cache_policy_tests PRIVATE common)
 target_include_directories(driver_cache_policy_tests PRIVATE ${inc_headers})
@@ -547,6 +551,11 @@ add_executable(async_pipeline_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AsyncPipelinePolicyTests.cpp"
 )
 target_include_directories(async_pipeline_policy_tests PRIVATE ${inc_headers})
+
+add_executable(tess_pretranslate_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TessPretranslatePolicyTests.cpp"
+)
+target_include_directories(tess_pretranslate_policy_tests PRIVATE ${inc_headers})
 
 add_executable(staging_memory_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/StagingMemoryPolicyTests.cpp"
@@ -697,6 +706,8 @@ add_executable(rtc_tests EXCLUDE_FROM_ALL
 target_link_libraries(rtc_tests common kyty_test_gtest)
 target_include_directories(rtc_tests PRIVATE ${inc_headers})
 
+add_kyty_full_emulator_test(ajm_instance_tests "${KYTY_TESTS_DIR}/AjmInstanceTests.cpp")
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
@@ -722,6 +733,16 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
+
+add_executable(libc_stdio_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LibcStdioTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libcStdio.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+)
+target_link_libraries(libc_stdio_tests common fmt::fmt)
+target_include_directories(libc_stdio_tests PRIVATE ${inc_headers})
+
+add_kyty_full_emulator_test(libc_registration_tests "${KYTY_TESTS_DIR}/LibcRegistrationTests.cpp")
 
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
@@ -843,6 +864,7 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME driver_cache_policy COMMAND $<TARGET_FILE:driver_cache_policy_tests>)
+	add_test(NAME apr_preopen COMMAND $<TARGET_FILE:apr_preopen_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
@@ -861,6 +883,7 @@ if(BUILD_TESTING)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)
+	add_test(NAME tess_pretranslate_policy COMMAND $<TARGET_FILE:tess_pretranslate_policy_tests>)
 	add_test(NAME staging_memory_policy COMMAND $<TARGET_FILE:staging_memory_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
@@ -871,10 +894,14 @@ if(BUILD_TESTING)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
+	add_test(NAME libc_stdio COMMAND $<TARGET_FILE:libc_stdio_tests>)
+	set_tests_properties(libc_stdio PROPERTIES TIMEOUT 60)
+	add_test(NAME libc_registration COMMAND $<TARGET_FILE:libc_registration_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME ajm_resample COMMAND $<TARGET_FILE:ajm_resample_tests>)
+	add_test(NAME ajm_instance COMMAND $<TARGET_FILE:ajm_instance_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
@@ -897,6 +924,10 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_negative_offset COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only negative-offset)
 	add_test(NAME shader_recompiler_div_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only div-f32)
 	add_test(NAME shader_recompiler_ds_minmax COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only ds-minmax)
+	add_test(NAME shader_recompiler_hw_rcp COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only rcp)
+	add_test(NAME shader_recompiler_f16_store_rtz COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-float16-store-only)
+	set_tests_properties(shader_recompiler_f16_store_rtz PROPERTIES ENVIRONMENT KYTY_F16_STORE_RTZ=1)
+	add_test(NAME shader_recompiler_hw_sincos COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hw-table-only sincos)
 	add_test(NAME shader_recompiler_helper_quad
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-append-helper-quad-only)
 	add_test(NAME shader_recompiler_tessellation
@@ -923,6 +954,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
+	add_test(NAME graphics_depth_attachment_feedback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-depth-resource-only)
 	add_test(NAME shader_store
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-store-only)
 	add_test(NAME shader_store_key
@@ -973,7 +1006,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME gpu_capture_replay
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-only)
-	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); skipped where it is unset.
+	add_test(NAME gpu_capture_replay_loop
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-loop-only)
+	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); where it is unset, generated synthetic
+	# captures (a replayable one and one with an unmappable range) take the same file path.
 	add_test(NAME gpu_capture_replay_local
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-replay-dir-only)
 	set_tests_properties(gpu_capture_replay_local PROPERTIES SKIP_REGULAR_EXPRESSION "GpuReplayDir skipped")
@@ -1033,6 +1069,7 @@ if(BUILD_TESTING)
 		page_manager_tests
 		build_flags_tests
 		driver_cache_policy_tests
+		apr_preopen_tests
 		archive_file_tests
 		trophy_system_tests
 		avplayer_file_tests
@@ -1049,16 +1086,20 @@ if(BUILD_TESTING)
 		aliased_color_pass_policy_tests
 		dispatch_chain_policy_tests
 		async_pipeline_policy_tests
+		tess_pretranslate_policy_tests
 		staging_memory_policy_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
+		libc_stdio_tests
+		libc_registration_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests
 		ajm_resample_tests
+		ajm_instance_tests
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests
@@ -1174,6 +1215,13 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+	if(BUILD_TESTING)
+		add_test(NAME launcher_settings COMMAND $<TARGET_FILE:launcher_settings_tests>)
+		# Windows: Qt's DLLs are not next to the test.
+		set_tests_properties(launcher_settings PROPERTIES
+		                     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
+		add_dependencies(kyty_tests launcher_settings_tests)
+	endif()
 
 	if(LINUX)
 		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)

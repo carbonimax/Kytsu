@@ -735,6 +735,21 @@ void BufferCache::WaitPendingPublishes(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// Only the GPU thread queues main-queue publications (SendCommandSync commands run after
+// CpPipeline::Drain), so on that thread a 0 stays 0 until it queues one itself. Side publications
+// are left out: the faulting thread runs them without the texture cache lock.
+uint64_t BufferCache::WritePublishTick(uint64_t vaddr, uint64_t size) {
+	uint64_t        tick = 0;
+	std::lock_guard lock(m_pending_mutex);
+	for (const auto& pending: m_pending_publishes) {
+		// A write to an imported buffer can demote it, which waits over the buffer's whole range.
+		if (!pending.side && (m_import || (pending.begin < vaddr + size && vaddr < pending.end))) {
+			tick = std::max(tick, pending.tick);
+		}
+	}
+	return tick;
+}
+
 void BufferCache::NoteBufferWrite(uint64_t vaddr, uint64_t size, bool cpu_upload) {
 	if ((m_readback_queue == nullptr && !m_import) || size == 0) {
 		return;
@@ -891,6 +906,23 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+// A download can reach past the guest mapping (unmapped holes after a VMA): only the mapped
+// prefix is written back, and a prefix without host backing is skipped.
+static void WriteDownloadBacking(uint64_t guest, const uint8_t* host, uint64_t size) {
+	const auto writable = Libs::LibKernel::Memory::TryClampRangeSize(guest, size);
+	if (writable == 0) {
+		LOGF("BufferCache: skipped GPU download into unmapped guest addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     guest, size);
+		return;
+	}
+	if (!Libs::LibKernel::Memory::TryWriteBacking(guest, host, writable)) {
+		LOGF("BufferCache: skipped GPU download write without host backing addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     guest, writable);
+	}
+}
+
 std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(Buffer&  buffer,
                                                                               uint64_t vaddr,
                                                                               uint64_t size,
@@ -940,8 +972,8 @@ std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(B
 				auto& ring = m_readback_queue->Ring();
 				ring.Invalidate(offset, Common::AlignUp(total_size, 256));
 				for (const auto& copy: copies) {
-					Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-					                                      mapped + (copy.dstOffset - offset), copy.size);
+					WriteDownloadBacking(buffer_address + copy.srcOffset,
+					                     mapped + (copy.dstOffset - offset), copy.size);
 				}
 				m_readback_queue->Release(seq);
 				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
@@ -1080,8 +1112,8 @@ void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> co
 	publish_out = [mapped, offset, total_size, buffer_address, download = &download, copies = std::move(copies)] {
 		download->Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			WriteDownloadBacking(buffer_address + copy.srcOffset, mapped + (copy.dstOffset - offset),
+			                     copy.size);
 		}
 	};
 }
@@ -1097,6 +1129,38 @@ static int ReprotectBatchMode() {
 	return mode;
 }
 
+// KYTY_STREAM_HOST_CACHED (default 1, 0 = old ring): the per-draw stream ring (ObtainBuffer copies,
+// flattened SRTs, shader data, index data) in cached host memory instead of device-local host-visible
+// (ReBAR) memory. Write-combined stores stall the memory accesses after them; cached ones do not, and
+// the GPU reads the ring over the bus. Idea and first measure: BryanKAdams (a25a2b97b).
+static bool StreamHostCached(const GraphicContext& graphics) {
+	const char* value = std::getenv("KYTY_STREAM_HOST_CACHED");
+	if (value != nullptr && std::strtol(value, nullptr, 10) == 0) {
+		return false;
+	}
+	constexpr vk::MemoryPropertyFlags cached =
+	    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached;
+	const auto& memory = graphics.physical_device_memory_properties;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+		if ((memory.memoryTypes[i].propertyFlags & cached) == cached) {
+			return true;
+		}
+	}
+	std::printf("BufferCache: KYTY_STREAM_HOST_CACHED: no host-cached memory type, stream ring "
+	            "kept in its default memory\n");
+	std::fflush(stdout);
+	return false;
+}
+
+// KYTY_AB_FLAG=stream_host_cached: the forced-off arm copies into m_stream_default. Each ring waits
+// for its own in-flight ranges, so switching between frames is safe. The tiler keeps the ring it
+// got at startup. With KYTY_STREAM_HOST_CACHED=0 (or no host-cached type) no second ring is made and
+// both arms use the default ring.
+StreamBuffer& BufferCache::StreamRing() noexcept {
+	return m_stream_default != nullptr && PerfStats::AbOff("stream_host_cached") ? *m_stream_default
+	                                                                              : m_stream_buffer;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -1105,7 +1169,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+      m_stream_host_cached(StreamHostCached(graphics)),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, m_stream_host_cached),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
@@ -1120,12 +1185,25 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, m_graphics.null_descriptor_enabled ? MemoryUsage::DeviceLocal : MemoryUsage::Stream, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
+	// Bound in place of a missing guest buffer, so a read must see zeros.
 	if (!m_graphics.null_descriptor_enabled) {
 		auto& buffer = GetBuffer(null_id);
 		std::memset(buffer.Mapped().data(), 0, static_cast<size_t>(buffer.Size()));
 		buffer.Flush(0, buffer.Size());
+	} else {
+		auto& buffer = GetBuffer(null_id);
+		buffer.Fill(0, buffer.Size(), 0);
 	}
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	if (const char* ab = std::getenv("KYTY_AB_FLAG");
+	    m_stream_host_cached && ab != nullptr && std::strcmp(ab, "stream_host_cached") == 0) {
+		m_stream_default =
+		    std::make_unique<StreamBuffer>(graphics, scheduler, MemoryUsage::Stream, 64 * MiB);
+		// Vulkan memory property bits: 1 device-local, 2 host-visible, 4 coherent, 8 cached.
+		std::printf("BufferCache: stream_host_cached A/B: ring memory 0x%x, default ring memory 0x%x\n",
+		            m_stream_buffer.MemoryProperties(), m_stream_default->MemoryProperties());
+		std::fflush(stdout);
+	}
 	if (graphics.readback_queue != nullptr && AsyncFaultReadbacks()) {
 		m_readback_queue = std::make_unique<ReadbackQueue>(graphics, scheduler);
 	}
@@ -1198,8 +1276,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			// Cache buffers cover whole tracker pages, so this range has nothing to download.
+		// A write releases the GPU's pages and claims them for the CPU in one critical section.
+		// As two calls, a buffer synchronization on another thread could mark a page GPU-dirty in
+		// between, and the CPU claim exits on "CPU dirty state conflicts with GPU dirty state".
+		// The guest writes these bytes, so what the GPU wrote there is superseded.
+		const auto take_for_cpu = [&] {
 			const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 			{
 				std::lock_guard ranges_lock(m_gpu_ranges_mutex);
@@ -1207,16 +1288,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			m_memory_tracker.ReleaseUnownedRegion(vaddr, size);
 			QueueBdaSync(vaddr, size);
+		};
+		if (is_write && !IsRegionRegistered(vaddr, size)) {
+			// Cache buffers cover whole tracker pages, so this range has nothing to download.
+			take_for_cpu();
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		if (DownloadBufferMemory<false>(buffer, vaddr, size) && !is_write) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			QueueBdaSync(vaddr, size);
+			take_for_cpu();
 		}
 	});
 }
@@ -1233,12 +1316,12 @@ bool BufferCache::AsyncFaultReadbacks() {
 
 namespace {
 
-// KYTY_READBACK_WINDOW_KIB (default 256, rounded down to a power of two, at most 64 MiB; 0
+// KYTY_READBACK_WINDOW_KIB (default 4096, rounded down to a power of two, at most 64 MiB; 0
 // restores page-sized readbacks): bytes published around a guest memory fault.
 uint64_t ReadbackWindowBytes() {
 	static const uint64_t bytes = [] {
 		const char* value = std::getenv("KYTY_READBACK_WINDOW_KIB");
-		const auto  kib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull;
+		const auto  kib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 4096ull;
 		const auto  size  = std::bit_floor(std::min<uint64_t>(kib, 64ull * 1024ull) * 1024ull);
 		return std::max<uint64_t>(size, TRACKER_PAGE_SIZE);
 	}();
@@ -2884,17 +2967,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		auto& stream          = StreamRing();
+		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
 			(void)EopAtGpu::OverlayPending(vaddr, mapped, size);
-			m_stream_buffer.Commit();
+			stream.Commit();
 			if (LateRead::Enabled() && !m_import && !LateRead::NetOnly()) [[unlikely]] {
 				LateRead::Bind(vaddr, size, LateRead::PathStream);
 			}
-			return {&m_stream_buffer, offset};
+			return {&stream, offset};
 		}
 	}
 
@@ -2973,8 +3057,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
-		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
-			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		// Private mappings are copied and backing holes read as zeros, like buffer uploads; a range
+		// outside the guest address space reads as zeros too.
+		if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+			std::memset(mapped, 0, static_cast<size_t>(size));
 		}
 	});
 }
@@ -3148,6 +3234,10 @@ void BufferCache::RunGarbageCollector() {
 	size_t                retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
+		// The memory tracker cannot hold address 0.
+		if (buffer.CpuAddress() == 0) {
+			return false;
+		}
 		WaitPendingPublishes(buffer.CpuAddress(), buffer.Size());
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");

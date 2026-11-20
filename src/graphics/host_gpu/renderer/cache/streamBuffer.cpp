@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/deviceFault.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -78,14 +79,15 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
-               bool prefer_device)
+               bool prefer_device, bool host_cached)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
-	AllocateDevice(graphics, usage, cpu_address, flags, size, prefer_device);
+	AllocateDevice(graphics, usage, cpu_address, flags, size, prefer_device, host_cached);
 }
 
 void Buffer::AllocateDevice(GraphicContext& graphics, MemoryUsage usage, uint64_t cpu_address,
-                            vk::BufferUsageFlags flags, uint64_t size, bool prefer_device) {
+                            vk::BufferUsageFlags flags, uint64_t size, bool prefer_device,
+                            bool host_cached) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -102,20 +104,44 @@ void Buffer::AllocateDevice(GraphicContext& graphics, MemoryUsage usage, uint64_
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
+	// host_cached: CPU writes stay in the CPU caches (random host access selects cached memory)
+	// instead of going to write-combined memory; the GPU reads them over the bus.
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
-	allocation_info.usage =
-	    prefer_device ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : AllocationUsage(usage);
-	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
-	                                     ? VkMemoryPropertyFlags {}
-	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+	    (host_cached ? VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+	                 : AllocationFlags(usage));
+	allocation_info.usage = host_cached     ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST
+	                        : prefer_device ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+	                                        : AllocationUsage(usage);
+	allocation_info.preferredFlags =
+	    usage == MemoryUsage::DeviceLocal ? VkMemoryPropertyFlags {}
+	    : host_cached ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT
+	                  : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	auto              result        = static_cast<vk::Result>(
+	    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+	                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
 	if (result != vk::Result::eSuccess) {
+		LOGF("vmaCreateBuffer failed: result=%s, usage=%u, size=%" PRIu64
+		     ", flags=0x%x; retrying without the allocator budget constraint\n",
+		     vk::to_string(result).c_str(), static_cast<uint32_t>(usage), size,
+		     static_cast<uint32_t>(allocation_info.flags));
+		graphics.LogMemoryBudget();
+
+		allocation_info.flags = AllocationFlags(usage);
+		native_buffer         = VK_NULL_HANDLE;
+		m_allocation          = nullptr;
+		allocation_result     = {};
+		result                = static_cast<vk::Result>(
+		    vmaCreateBuffer(graphics.allocator,
+		                    static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		                    &native_buffer, &m_allocation, &allocation_result));
+	}
+	if (result != vk::Result::eSuccess) {
+		LOGF("vmaCreateBuffer retry failed: result=%s, usage=%u, size=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), static_cast<uint32_t>(usage), size);
 		graphics.LogMemoryBudget();
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -137,12 +163,13 @@ void Buffer::AllocateDevice(GraphicContext& graphics, MemoryUsage usage, uint64_
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
-	if (prefer_device) {
+	if (prefer_device || host_cached) {
 		const auto type = allocation_result.memoryType;
 		const auto heap = graphics.physical_device_memory_properties.memoryTypes[type].heapIndex;
-		std::printf("StreamBuffer: Resizable BAR staging ring %" PRIu64
+		std::printf("StreamBuffer: %s ring %" PRIu64
 		            " MiB in memory type %u (flags 0x%x) heap %u (%" PRIu64 " MiB)\n",
-		            size >> 20u, type, properties, heap,
+		            host_cached ? "host-cached stream" : "Resizable BAR staging", size >> 20u, type,
+		            properties, heap,
 		            uint64_t {graphics.physical_device_memory_properties.memoryHeaps[heap].size} >> 20u);
 		std::fflush(stdout);
 	}
@@ -200,7 +227,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 		if (imported.owned) {
 			graphics.device.freeMemory(imported.memory);
 		}
-		AllocateDevice(graphics, MemoryUsage::DeviceLocal, cpu_address, flags, size, false);
+		AllocateDevice(graphics, MemoryUsage::DeviceLocal, cpu_address, flags, size, false, false);
 		return;
 	}
 	m_import_memory = imported.memory;
@@ -243,6 +270,14 @@ Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
+}
+
+uint32_t Buffer::MemoryProperties() const noexcept {
+	VkMemoryPropertyFlags properties = 0;
+	if (m_allocation != nullptr) {
+		vmaGetAllocationMemoryProperties(m_graphics->allocator, m_allocation, &properties);
+	}
+	return properties;
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {
@@ -331,10 +366,10 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
+                           uint64_t size, bool host_cached)
     : Buffer(graphics, scheduler, usage, 0,
              AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size,
-             usage == MemoryUsage::Upload && StagingInDevice(graphics)),
+             usage == MemoryUsage::Upload && StagingInDevice(graphics), host_cached),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

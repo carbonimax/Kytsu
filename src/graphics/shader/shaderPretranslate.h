@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/tessPretranslatePolicy.h"
 
 #include <cstdint>
 #include <span>
@@ -28,9 +29,18 @@
 // registration). A fatal check during a speculative translation drops that shader: its worker is
 // retired without unwinding (Common::SetFatalRetiresThread) and replaced; after 8 retired workers,
 // pretranslation stops for the session.
+//
+// KYTY_TESS_PRETRANSLATE=1 (default off; acts with KYTY_ASYNC_TESS, on by default): a tessellation
+// draw whose LS, HS or DS program has never been translated is skipped while these workers translate
+// the missing stages with the draw's own inputs (the tessellation layout needs the LS/HS pair and the
+// VGT registers, so they are not predicted at registration like pixel programs). The next draw takes
+// the translations and only emits SPIR-V on the draw thread. Tessellation jobs go before the pixel
+// ones; with KYTY_SHADER_PRETRANSLATE=0 the pool runs 2 workers for them.
 namespace Libs::Graphics::ShaderPretranslate {
 
 [[nodiscard]] bool Enabled() noexcept;
+[[nodiscard]] bool TessEnabled() noexcept;
+// KYTY_SHADER_PRETRANSLATE_VERIFY=1, with either kind of pretranslation.
 [[nodiscard]] bool VerifyEnabled() noexcept;
 
 // Guest thread registering the shader (ShaderMapUserData); `data` register pointers are valid.
@@ -46,9 +56,22 @@ void OnShaderRegistered(uint64_t address, uint64_t hash, const ShaderMappedData&
 void Remember(uint64_t hash, std::span<const uint32_t> key, std::span<const uint32_t> code,
               const ShaderPixelInputInfo& info, uint32_t user_data_count);
 
+// GPU thread, on a LS, HS or DS miss without a program entry (KYTY_TESS_PRETRANSLATE). `key`: the
+// program cache key words; `options`: the draw thread's finished options for `info`. Ready: `out`
+// is the translation of `code`. Pending or Queue: skip the draw. Inline: translate it there.
+// `peek`: a later stage of a draw already skipped (TessPretranslatePeek): only queues a new key.
+[[nodiscard]] TessPretranslateTake TakeTess(uint64_t hash, std::span<const uint32_t> key,
+                                            std::span<const uint32_t> code,
+                                            const ShaderRecompiler::CompileOptions& options,
+                                            const ShaderVertexInputInfo&            info,
+                                            ShaderRecompiler::TranslateResult& out, bool peek);
+
+// A taken LS, HS or DS translation writes memory: its draw was skipped meanwhile ("PERF tesspre writes").
+void NoteTessWrites() noexcept;
+
 void NoteVerify(bool equal) noexcept;
 
-// "PERF pretranslate" line, printed with the PERF report.
+// "PERF pretranslate" and "PERF tesspre" lines, printed with the PERF report.
 void Report();
 
 } // namespace Libs::Graphics::ShaderPretranslate

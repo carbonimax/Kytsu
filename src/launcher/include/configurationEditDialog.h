@@ -5,6 +5,7 @@
 #include <QString>
 #include <QStringList>
 class QByteArray;
+class QCheckBox;
 class QGroupBox;
 class QLineEdit;
 class QListWidget;
@@ -35,6 +36,8 @@ public:
 	static void ReadSettings(QSettings& s);
 
 	void                      SetGlobalSettings(const QStringList& dirs, const QString& addons_dir);
+	void                      SetShowLatestActivity(bool show);
+	[[nodiscard]] bool        GetShowLatestActivity() const;
 	[[nodiscard]] QString     GetAddonsDirectory() const;
 	[[nodiscard]] QStringList GetGameDirectories() const;
 
@@ -49,6 +52,7 @@ private:
 	QGroupBox*                   m_game_dirs_group        = nullptr;
 	QListWidget*                 m_game_dirs_list         = nullptr;
 	QLineEdit*                   m_addons_dir_edit        = nullptr;
+	QCheckBox*                   m_show_activity_check    = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
 	bool                         m_global_settings        = false;
 	bool                         m_geometry_restored      = false;

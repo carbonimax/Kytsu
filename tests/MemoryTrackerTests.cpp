@@ -308,6 +308,50 @@ void TestRangeSet() {
         "range set subtraction did not preserve both exact tails");
 }
 
+void TestRangeSetMergesMatchReference() {
+  constexpr uint64_t Units = 512;
+  constexpr uint64_t Base = 0x40000;
+  RangeSet ranges;
+  std::vector<bool> reference(Units, false);
+  uint64_t state = 0x2545f4914f6cdd1dull;
+  const auto next = [&state] {
+    state ^= state << 13u;
+    state ^= state >> 7u;
+    state ^= state << 17u;
+    return state;
+  };
+  for (int step = 0; step < 20000; step++) {
+    const uint64_t begin = next() % Units;
+    const uint64_t size = 1 + next() % std::min<uint64_t>(24, Units - begin);
+    const bool add = next() % 4 != 0;
+    if (add) {
+      ranges.Add(Base + begin, size);
+    } else {
+      ranges.Subtract(Base + begin, size);
+    }
+    for (uint64_t unit = begin; unit < begin + size; unit++) {
+      reference[unit] = add;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> expected;
+    for (uint64_t unit = 0; unit < Units; unit++) {
+      if (!reference[unit]) {
+        continue;
+      }
+      if (!expected.empty() && expected.back().second == Base + unit) {
+        expected.back().second++;
+      } else {
+        expected.emplace_back(Base + unit, Base + unit + 1);
+      }
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> actual;
+    ranges.ForEach([&](uint64_t start, uint64_t end) {
+      actual.emplace_back(start, end);
+    });
+    Check(actual == expected,
+          "range set add/subtract did not match the coalesced reference");
+  }
+}
+
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
@@ -406,6 +450,73 @@ void TestCpuDirtyUpload() {
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "explicit CPU dirtiness did not release write protection");
   tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  Release(memory);
+}
+
+// KYTY_MEM_IMPORT_WATCH: the CPU-dirty hook sees each run of pages that turns CPU-modified, while the
+// pages are still write-protected, and nothing for pages already CPU-modified.
+struct CpuDirtyCall {
+  uint64_t vaddr = 0, size = 0;
+  bool protected_at_call = false;
+};
+std::vector<CpuDirtyCall> g_cpu_dirty_calls;
+
+void RecordCpuDirty(uint64_t vaddr, uint64_t size) {
+  g_cpu_dirty_calls.push_back({vaddr, size, Protection(reinterpret_cast<const void *>(vaddr)) == PAGE_READONLY});
+}
+
+void TestCpuDirtyHook() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(!tracker.IsRegionCpuModified(address, page_size * 4) && Protection(memory) == PAGE_READONLY,
+        "upload did not leave the pages clean and protected");
+  g_cpu_dirty_calls.clear();
+  Libs::Graphics::g_cpu_dirty_hook = RecordCpuDirty;
+  tracker.MarkRegionAsCpuModified(address + page_size + 16, 32);
+  const auto first = g_cpu_dirty_calls;
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  const auto second = std::vector<CpuDirtyCall>(g_cpu_dirty_calls.begin() + static_cast<ptrdiff_t>(first.size()),
+                                                g_cpu_dirty_calls.end());
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  const auto calls = g_cpu_dirty_calls.size();
+  Libs::Graphics::g_cpu_dirty_hook = nullptr;
+  // Only the first call is checked for protection: with host pages larger than tracker pages, a later
+  // run can share a host page made writable by the first.
+  Check(first.size() == 1 && first[0].vaddr == address + page_size && first[0].size == page_size &&
+            first[0].protected_at_call,
+        "the hook did not see the dirtied page before its protection was lifted");
+  Check(second.size() == 2 && second[0].vaddr == address && second[0].size == page_size &&
+            second[1].vaddr == address + page_size * 2 && second[1].size == page_size * 2,
+        "the hook did not see exactly the runs of pages that changed");
+  Check(calls == first.size() + second.size(), "the hook saw pages that were already CPU-modified");
+  Release(memory);
+}
+
+// KYTY_PROTECT_COALESCE defers the re-protection of read-only uploads to the flush; the write-watch
+// arming at bind (may_defer = false) protects at once, or a guest write before the flush goes unseen.
+// Runs of 4 tracker pages, so a 16 KiB host page never mixes the two cases.
+void TestUploadWithoutDeferral() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto run = Libs::Graphics::TRACKER_PAGE_SIZE * 4;
+  auto *memory = Allocate(8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  PageManager::BeginDeferredProtect();
+  tracker.ForEachUploadRange(address, run, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  const bool deferred = IsWritable(memory);
+  tracker.ForEachUploadRange(
+      address + run, run, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {}, false);
+  const bool immediate = Protection(memory + run) == PAGE_READONLY;
+  PageManager::EndDeferredProtect();
+  Check(deferred, "a deferrable read-only upload protected its pages before the flush");
+  Check(immediate, "an upload that may not defer left its pages writable until the flush");
+  Check(Protection(memory) == PAGE_READONLY, "ending the deferral did not protect the deferred pages");
+  tracker.MarkRegionAsCpuModified(address, run * 2);
   Release(memory);
 }
 
@@ -1154,11 +1265,28 @@ void TestFullRegionGpuUnmarkBatching() {
     lock.lock();
     std::thread worker([&] { lock.unlock(); });
     worker.join();
+  } else if (std::strcmp(name, "tracking-lock-exclusion") == 0) {
+    // Not a death: exits 0 when no increment was lost under the lock.
+    Libs::Graphics::TrackingSpinLock lock;
+    uint64_t count = 0;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; t++) {
+      threads.emplace_back([&] {
+        for (int i = 0; i < 20000; i++) {
+          std::lock_guard guard(lock);
+          count++;
+        }
+      });
+    }
+    for (auto &thread : threads) {
+      thread.join();
+    }
+    std::_Exit(count == 8 * 20000 ? 0 : 1);
   }
   std::_Exit(0x7f);
 }
 
-void CheckDeathCase(const char *name) {
+void CheckDeathCase(const char *name, bool fatal = true) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
   Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -1177,7 +1305,8 @@ void CheckDeathCase(const char *name) {
   DWORD exit_code = 0;
   Check(
       GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
-          (exit_code == 321 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION),
+          (fatal ? exit_code == 321 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION
+                 : exit_code == 0),
       "MemoryTracker death path used the wrong exit");
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
@@ -1205,8 +1334,18 @@ void CheckDeathCase(const char *name) {
   Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
   const bool fatal_exit =
       WIFEXITED(status) && WEXITSTATUS(status) == (321 & 0xff);
-  Check(fatal_exit || WIFSIGNALED(status),
+  Check(fatal ? fatal_exit || WIFSIGNALED(status)
+              : WIFEXITED(status) && WEXITSTATUS(status) == 0,
         "MemoryTracker death path used the wrong exit");
+#endif
+}
+
+void SetTestEnv(const char *name, const char *value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  Check(_putenv_s(name, value != nullptr ? value : "") == 0, "_putenv_s failed");
+#else
+  Check((value != nullptr ? ::setenv(name, value, 1) : ::unsetenv(name)) == 0,
+        "setenv failed");
 #endif
 }
 
@@ -1215,6 +1354,20 @@ void TestFatalPaths() {
                            "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
     CheckDeathCase(name);
   }
+  CheckDeathCase("tracking-lock-exclusion", false);
+  // KYTY_TRACKING_LOCK is read at process start, so each mode runs in a child.
+  // Unset is mode 1 (cached thread id), run above; 0 is the off switch (OS thread id).
+  SetTestEnv("KYTY_TRACKING_LOCK", "0");
+  CheckDeathCase("recursive-tracking-lock");
+  CheckDeathCase("non-owner-tracking-unlock");
+  CheckDeathCase("tracking-lock-exclusion", false);
+  SetTestEnv("KYTY_MEMTRACK_PROF", "1"); // with the acquisition counter
+  CheckDeathCase("non-owner-tracking-unlock");
+  CheckDeathCase("tracking-lock-exclusion", false);
+  SetTestEnv("KYTY_TRACKING_LOCK", "2"); // no owner: exclusion only
+  CheckDeathCase("tracking-lock-exclusion", false);
+  SetTestEnv("KYTY_MEMTRACK_PROF", nullptr);
+  SetTestEnv("KYTY_TRACKING_LOCK", nullptr);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -1404,9 +1557,12 @@ int main(int argc, char **argv) {
 #endif
   TestGuestRange();
   TestRangeSet();
+  TestRangeSetMergesMatchReference();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuDirtyHook();
+  TestUploadWithoutDeferral();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();

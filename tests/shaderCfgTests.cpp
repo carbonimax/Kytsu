@@ -1327,7 +1327,7 @@ void TestRebasedTextureMipViews() {
   auto view = make_view(4, 0);
   Check(view.data.address == 0x5032b23800 && view.mip_layout[0].pitch == 32 &&
             view.mip_layout[0].height == 16 &&
-            view.mip_layout[0].linear_pitch == 32 && view.LinearSize() == 0x1000,
+            view.LinearLayout().mips[0].pitch == 32 && view.LinearSize() == 0x1000,
         "captured 16x16 view changed its padded tiling or linear transfer size");
   view.data.address += 0x800;
   Check(view.MipOf(chain) == -1, "tail view accepted the following mip's address");
@@ -1778,6 +1778,14 @@ void TestNewShaderRecompilerSMovB32() {
   };
 
   auto options = MakeCompileOptions(ShaderType::Compute);
+  // The stores use s[48:51], not the default s[0:3] fixture descriptor.
+  // A zero-stride mode-0 descriptor discards stores by the guest contract.
+  std::array<uint32_t, 64> user_data{};
+  user_data[48] = 0x4000u;
+  user_data[49] = 4u << 16u;
+  user_data[50] = 4u;
+  user_data[51] = 3u << 28u;
+  options.user_data = user_data;
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
@@ -2439,6 +2447,27 @@ void TestNewShaderRecompilerScalarVectorAlu() {
         "SPIR-V binary does not contain OpSelect");
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerTrapTemporaries() {
+  // A title uses trap temporaries (TTMP3 is scalar operand code 0x6f on RDNA) as
+  // scratch scalar registers. They decode into the slots at their operand codes.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),          // s0 = 1
+      EncodeSop2(0x00, 111, 0, 129),  // s_add_u32 ttmp3, s0, 1
+      EncodeSop2(0x00, 2, 111, 1),    // s_add_u32 s2, ttmp3, s1
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("S_ADD_U32 ttmp3, s0, 1") != std::string::npos),
+        "new decoder did not decode TTMP destination");
+  Check((result.decoded_dump.find("S_ADD_U32 s2, ttmp3, s1") != std::string::npos),
+        "new decoder did not decode TTMP source");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -7759,8 +7788,13 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeBindingSizeOnly() {
   user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
   options.user_data = user_data;
   result = RecompileForTest(shader, options);
-  Check((DisassembleSpirvBinary(result.spirv).find("PackHalf2x16") !=
-         std::string::npos),
+  // KYTY_F16_STORE_RTZ=1 encodes in integers instead; 31744 = 0x7c00, the f16 infinity.
+  const char *rtz = std::getenv("KYTY_F16_STORE_RTZ");
+  const auto half_source = DisassembleSpirvBinary(result.spirv);
+  Check(rtz != nullptr && rtz[0] == '1'
+            ? half_source.find("PackHalf2x16") == std::string::npos &&
+                  half_source.find("%uint_31744") != std::string::npos
+            : half_source.find("PackHalf2x16") != std::string::npos,
         "formatted half-float store did not convert F32 to F16");
   CheckSpirvBinaryValidates(result.spirv);
 }
@@ -7848,6 +7882,43 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
         "SPIR-V binary does not contain OpShiftLeftLogical");
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+// A FLAT load carrying only the DLC cache hint, and s_sext_i32_i16 into vcc_lo.
+void TestNewShaderRecompilerFlatCachePolicyAndScalarSext() {
+  const uint32_t shader[] = {
+      0xdc341000u, 0x007d0004u,          // flat_load_dwordx2 v[0:1], v[4:5] dlc
+      EncodeFlat0(0x0c, 2, 0) | (1u << 16u),
+      EncodeFlat1(2, 0x7d, 0, 4),        // global_load_dword v2, v[4:5], off glc
+      0xbeea1a0bu,                       // s_sext_i32_i16 vcc_lo, s11
+      EncodeSop1(0x19, 3, 1),            // s_sext_i32_i8 s3, s1
+      EncodeVop1(0x01, 6, 3),            // v_mov_b32 v6, s3
+      EncodeVop1(0x01, 7, 106),          // v_mov_b32 v7, vcc_lo
+      // Results go to LDS: writable FLAT/GLOBAL needs GPU ownership tracking here.
+      EncodeDs0(0x0d, 0),  EncodeDs1(0, 6, 8), // ds_write_b32 v8, v6
+      EncodeDs0(0x0d, 4),  EncodeDs1(0, 7, 8), // ds_write_b32 v8, v7 offset:4
+      EncodeDs0(0x4d, 8),  EncodeDs1(0, 0, 8), // ds_write_b64 v8, v[0:1] offset:8
+      EncodeDs0(0x0d, 16), EncodeDs1(0, 2, 8), // ds_write_b32 v8, v2 offset:16
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("unsupported") == std::string::npos,
+        "FLAT cache-policy bits or S_SEXT were still refused");
+  Check(result.decoded_dump.find("S_SEXT_I32_I16 vcc_lo, s11") != std::string::npos,
+        "new decoder did not decode S_SEXT_I32_I16");
+  Check(result.decoded_dump.find("S_SEXT_I32_I8 s3, s1") != std::string::npos,
+        "new decoder did not decode S_SEXT_I32_I8");
+  Check(result.ir_dump.find("BitFieldSExtract %2, 0x00000000, 0x00000010") != std::string::npos,
+        "S_SEXT_I32_I16 did not lower to a 16-bit sign extract");
+  Check(result.ir_dump.find("BitFieldSExtract %1, 0x00000000, 0x00000008") != std::string::npos,
+        "S_SEXT_I32_I8 did not lower to an 8-bit sign extract");
+  Check(SpirvContainsOpcode(result.spirv, 202),
+        "SPIR-V binary does not contain OpBitFieldSExtract for S_SEXT");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -11209,6 +11280,21 @@ void TestOptionalShaderHostFeatures() {
   Check(supported.spirv == limited.spirv,
         "unused optional host features changed the shader");
   CheckSpirvBinaryValidates(limited.spirv);
+  // buffer_store_dwordx2 v[2:3], off, s[0:3], 0 glc: one 64-bit store with host 64-bit buffer
+  // atomics, two word stores (and no Int64Atomics) without them.
+  const uint32_t pair_store_shader[] = {0xe0744000u, 0x80000200u, EncodeSopp(0x01)};
+  options.host_features = {true, true};
+  const auto wide_store = RecompileForTest(pair_store_shader, options);
+  CheckSpirvBinaryValidates(wide_store.spirv);
+  Check(SpirvContainsCapability(wide_store.spirv, 12u) &&
+            DisassembleSpirvBinary(wide_store.spirv).find("OpAtomicStore") != std::string::npos,
+        "glc DWORDX2 store was not one 64-bit store with host support");
+  options.host_features.buffer_int64_atomics = false;
+  const auto split_store = RecompileForTest(pair_store_shader, options);
+  CheckSpirvBinaryValidates(split_store.spirv);
+  Check(!SpirvContainsCapability(split_store.spirv, 12u) &&
+            DisassembleSpirvBinary(split_store.spirv).find("OpAtomicStore") == std::string::npos,
+        "glc DWORDX2 store needed 64-bit buffer atomics without host support");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   const uint32_t atomic_shader[] = {0xe1680018u, 0x80000000u, EncodeSopp(0x01)};
   options.host_features = {true, false};
@@ -11268,6 +11354,33 @@ void TestNewShaderRecompilerBranchConditionForms() {
       Check((source.find("OpGroupNonUniformBallot") == std::string::npos),
             "structured SCC branch retained a host-subgroup reduction");
     }
+  }
+}
+
+void TestDecoderTrailingDwordLength() {
+  using namespace ShaderRecompiler;
+  // s_setreg_imm32_b32 carries a trailing literal; it must not be decoded as an instruction.
+  {
+    const uint32_t code[] = {EncodeSopk(0x15, 0, 0x0801), 0xc0610000u, EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(code, decoded);
+    Check(decoded.instructions.size() == 2 &&
+              decoded.instructions[0].opcode == Decoder::Opcode::S_SETREG_IMM32_B32 &&
+              decoded.instructions[0].word_count == 2 &&
+              decoded.instructions[0].src0.value == 0xc0610000u &&
+              decoded.instructions[1].opcode == Decoder::Opcode::S_ENDPGM,
+          "S_SETREG_IMM32_B32 did not consume its literal");
+  }
+  // An unimplemented SOP2 opcode with a literal source must still skip the literal.
+  {
+    const uint32_t code[] = {EncodeSop2(0x5f, 0, 255, 0), 0xc0610000u, EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(code, decoded);
+    Check(decoded.instructions.size() == 2 &&
+              decoded.instructions[0].opcode == Decoder::Opcode::UNSUPPORTED &&
+              decoded.instructions[0].word_count == 2 &&
+              decoded.instructions[1].opcode == Decoder::Opcode::S_ENDPGM,
+          "unsupported instruction did not consume its literal");
   }
 }
 
@@ -11708,6 +11821,77 @@ void TestNewShaderRecompilerSetpcLongBranch() {
             jump->terminator.true_block == target->id,
         "S_GETPC/S_ADD/S_ADDC long jump through VCC missed its target");
   CheckSpirvBinaryValidates(RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute)).spirv);
+}
+
+void TestPlainSetpcThroughS6DecodesFollowingCode() {
+  using namespace ShaderRecompiler::Decoder;
+  // Only a merged-stage front half stops at s6; plain code continues.
+  const uint32_t shader[] = {
+      EncodeSop1(0x1f, 6, 0),      // s_getpc_b64 s[6:7]
+      EncodeSop2(0x00, 6, 6, 140), // s_add_u32 s6, s6, 12
+      EncodeSop1(0x20, 0, 6),      // s_setpc_b64 s[6:7]
+      EncodeSMovB32(0, 129),       0xbf810000u,
+  };
+
+  Program program;
+  DecodeProgram(shader, program);
+  Check(program.instructions.size() == 5u &&
+            program.instructions[2].opcode == Opcode::S_SETPC_B64 &&
+            program.instructions[2].src0.kind == OperandKind::Sgpr &&
+            program.instructions[2].src0.reg == 6u &&
+            program.instructions.back().opcode == Opcode::S_ENDPGM,
+        "plain s_setpc_b64 s6 stopped decoding the code after it");
+  const auto front_half = DecodeFrontProgram(shader);
+  Check(front_half.instructions.size() == 3u,
+        "front half decode did not stop at s_setpc_b64 s6");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("s_endpgm") != std::string::npos,
+        "plain s_setpc_b64 s6 lost the code after it");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestFrontHalfDecodeStopsAtHandoff() {
+  using namespace ShaderRecompiler::Decoder;
+  // A dumped merged-stage front half: s_setpc_b64 s6 at word 103, then padding and
+  // the "sl00" metadata tag at word 112, whose low byte is not a scalar source operand.
+  const uint32_t code[] = {
+      0xbfa00003u, 0x8f6a9003u, 0x94fe6ac1u, 0xbf880062u, 0xd7650007u, 0x000100c1u, 0xf4040607u,
+      0xfa000000u, 0xbf8cc07fu, 0x8f6b8419u, 0x93eaff19u, 0x0001001au, 0x876bff6bu, 0x000001f0u,
+      0xbf066a80u, 0xf4080406u, 0xd6000000u, 0xbe8e03ffu, 0x022c0204u, 0xbe8f03ffu, 0x0fac03acu,
+      0x8594807eu, 0x9396ff19u, 0x00070007u, 0x93ebff19u, 0x00020005u, 0x8f6a8c16u, 0x98ebff6bu,
+      0x000c0000u, 0xbf8cc07fu, 0x8717ff13u, 0xfff80000u, 0xd5010006u, 0x00520b08u, 0x88146a17u,
+      0x94ea6b0eu, 0x9399ff19u, 0x000c000eu, 0x886a6a14u, 0xbf068016u, 0xd7660009u, 0x00020ec1u,
+      0x85136a13u, 0x8f6b8418u, 0x93eaff18u, 0x0001001au, 0x876bff6bu, 0x000001f0u, 0xbf066a80u,
+      0xf4080506u, 0xd6000000u, 0x858c807eu, 0x939aff18u, 0x00070007u, 0x93ebff18u, 0x00020005u,
+      0xbf8cc07fu, 0x871bff17u, 0xfff80000u, 0x8f6a8c1au, 0x98ebff6bu, 0x000c0000u, 0x881b6a1bu,
+      0x94ea6b0eu, 0xe0042000u, 0x19040606u, 0xd501000au, 0x00320b08u, 0x886b6a1bu, 0x9398ff18u,
+      0x000c000eu, 0x93eaff03u, 0x00040018u, 0xbf06801au, 0xd7460005u, 0x04250c6au, 0x85176b17u,
+      0xf4280704u, 0xfa000010u, 0xe0042000u, 0x1805090au, 0xf4201a84u, 0xfa000000u, 0x160a0a9cu,
+      0xbf8cc07fu, 0x4a10106au, 0x7e160280u, 0x7e1802f2u, 0xd8340018u, 0x00000805u, 0xd8380504u,
+      0x000c0b05u, 0xbf8c3f71u, 0xd5410007u, 0x007c3b07u, 0xd5410006u, 0x00783906u, 0xd8380100u,
+      0x00070605u, 0xbf8c3f70u, 0xd8380302u, 0x000a0905u, 0xbf8cc07fu, 0xbe802006u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0x00000000u, 0x00000000u, 0x00000000u,
+      0x30306c73u, 0x000000cdu, 0x000000e8u, 0x00000000u, 0x00102961u, 0x10204900u, 0x10254024u,
+      0x00001041u, 0x100401a6u, 0x40401009u, 0x10462042u, 0x104c104bu, 0x104e104du, 0x1079606fu,
+      0x1085107au, 0x006e0000u, 0x10255700u, 0x0f650000u, 0x22102120u, 0x00402420u, 0x200f6500u,
+      0x40241021u, 0x0f640000u, 0x24102120u, 0x45000040u, 0x00004024u, 0x2b10294du, 0x44000010u,
+      0x00004024u, 0xe00da0c1u, 0x88181000u, 0xd2f2c70fu, 0x00208574u, 0x818f6f04u, 0x85680080u,
+      0x15010901u, 0x8a04018au, 0x63030801u, 0x819e018fu, 0x97150080u, 0x81a81001u, 0x03200080u,
+      0x00019e10u, 0x0501a810u, 0x8518285au, 0x01b05101u, 0x01971017u, 0x0201b546u, 0x01ac0000u,
+      0xbc01ac41u, 0xc43e2001u, 0x01ca2001u, 0x01c40100u, 0xa80b0001u, 0x0404a946u, 0x8a801174u,
+      0xa32040a0u, 0x01c5d985u, 0x00000000u, 0x00000000u, 0x65726162u, 0x746f6f66u, 0xa287d836u,
+      0x00000000u, 0x00000001u, 0x000001b4u, 0x00000000u, 0x000000e8u, 0xa89d1c6eu, 0x18b642a3u,
+      0x00000000u, 0x00000000u,
+  };
+  Check(code[112] == 0x30306c73u, "front half fixture lost its metadata tag");
+  const auto program = DecodeFrontProgram(code);
+  const auto &last = program.instructions.back();
+  Check(last.opcode == Opcode::S_SETPC_B64 && last.src0.kind == OperandKind::Sgpr &&
+            last.src0.reg == 6u && last.pc == 103u * 4u && last.word_count == 1u,
+        "front half decode did not stop at its stage hand-off");
 }
 
 void TestFusedShaderHandoffPreservesRegisters() {
@@ -14898,10 +15082,10 @@ void TestRenderTargetReverseExportMapping() {
         Prospero::ColorMappingGr, Prospero::ColorMappingArbg}},
       {Prospero::ChannelLayout::k5_6_5,
        Prospero::ChannelType::kUNorm,
-       vk::Format::eB5G6R5UnormPack16,
+       vk::Format::eR5G6B5UnormPack16,
        2,
-       {Prospero::ColorMappingRgba, Prospero::ColorMappingRgab,
-        Prospero::ColorMappingBgra, Prospero::ColorMappingAgbr}},
+       {Prospero::ColorMappingBgra, Prospero::ColorMappingAgbr,
+        Prospero::ColorMappingRgba, Prospero::ColorMappingRgab}},
       {Prospero::ChannelLayout::k11_11_10,
        Prospero::ChannelType::kUNorm,
        vk::Format::eR32Uint,
@@ -16083,7 +16267,11 @@ void TestGpuProducedWritableDescriptor() {
       EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 0),
       EncodeSopp(0x01),
   };
-  const std::array<uint32_t, 4> user_data{0u, 0u, 0x00315000u, 3u};
+  const FakeGuestAddressSpace address_space;
+  const uint32_t table_low = 0x00315000u;
+  const uint64_t table = address_space.AddressWithLowWord(table_low);
+  const auto table_high = static_cast<uint32_t>(table >> 32u);
+  const std::array<uint32_t, 4> user_data{0u, 0u, table_low, table_high};
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
   auto translated = ShaderRecompiler::TranslateProgram(shader, options);
@@ -16092,16 +16280,17 @@ void TestGpuProducedWritableDescriptor() {
             !plan.capture_specialization_reads && plan.srt_reads.size() == 3,
         "native GPU-built writable descriptor acquired an unnecessary alias proof");
   struct Reads {
+    uint64_t table = 0;
     std::array<uint32_t, 3> header{0x26c0u, 0u, 151u};
     uint32_t count = 0;
-  } reads;
+  } reads{.table = table};
   FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
         auto &reads = *static_cast<Reads *>(data);
         uint32_t index = 0;
-        switch (address) {
-        case 0x300315028ull: index = 0u; break;
-        case 0x30031502cull: index = 1u; break;
-        case 0x300315074ull: index = 2u; break;
+        switch (address - reads.table) {
+        case 0x28u: index = 0u; break;
+        case 0x2cu: index = 1u; break;
+        case 0x74u: index = 2u; break;
         default: return false;
         }
         ++reads.count;
@@ -16122,10 +16311,11 @@ void TestGpuProducedWritableDescriptor() {
               snapshot.specialization_reads.empty() && reads.count == reads_expected,
           "GPU-produced descriptor lost current scalar data or repeated its reads");
   };
-  check(0x003176c0u, 0x00800003u, 151u, 3u);
+  const uint32_t stride_128 = 0x00800000u;
+  check(0x003176c0u, stride_128 | table_high, 151u, 3u);
   const auto previous_specialization = specialization;
   reads.header = {0xffd00000u, 0u, 302u}; // Exercise the low-address carry on refresh.
-  check(0x00015000u, 0x00800004u, 302u, 6u);
+  check(0x00015000u, stride_128 | (table_high + 1u), 302u, 6u);
   Check(specialization == previous_specialization,
         "GPU-updated address or record count created a shader permutation");
 }
@@ -17451,17 +17641,19 @@ void TestFlatLoadShortD16HiAddressFields() {
             global_pair.src1.reg == 10,
         "GLOBAL D16 high-half load with SADDR off must use the VGPR pair");
 
-  // DLC is only a cache hint and stays visible; LDS, GLC and SLC on a load and the reserved
+  // GLC/SLC/DLC are cache policy on a non-atomic load and stay visible; LDS and the reserved
   // segment are not implemented and must keep failing loudly.
   const auto dlc = decode(SegGlobal, 4, 2, DlcBit);
   Check(dlc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && dlc.dlc && !dlc.glc && !dlc.slc,
         "GLOBAL D16 high-half load lost its DLC hint");
   Check(decode(SegGlobal, 0, 2, LdsBit).opcode == Decoder::Opcode::UNSUPPORTED,
         "FLAT-family D16 high-half load accepted LDS=1");
-  Check(decode(SegGlobal, 0, 2, GlcBit).opcode == Decoder::Opcode::UNSUPPORTED,
-        "FLAT-family D16 high-half load accepted GLC=1");
-  Check(decode(SegGlobal, 0, 2, SlcBit).opcode == Decoder::Opcode::UNSUPPORTED,
-        "FLAT-family D16 high-half load accepted SLC=1 on a load");
+  const auto glc = decode(SegGlobal, 0, 2, GlcBit);
+  Check(glc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && glc.glc && !glc.slc,
+        "FLAT-family D16 high-half load lost its GLC cache policy");
+  const auto slc = decode(SegGlobal, 0, 2, SlcBit);
+  Check(slc.opcode == Decoder::Opcode::FLAT_LOAD_SHORT_D16_HI && slc.slc && !slc.glc,
+        "FLAT-family D16 high-half load lost its SLC cache policy");
   Check(decode(SegReserved, 0, 2).opcode == Decoder::Opcode::UNSUPPORTED,
         "FLAT-family D16 high-half load accepted the reserved segment");
 }
@@ -18359,6 +18551,7 @@ int main(int argc, char **argv) {
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
+  TestNewShaderRecompilerFlatCachePolicyAndScalarSext();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();
   TestNewShaderRecompilerCfgStraightLine();
@@ -18437,6 +18630,8 @@ int main(int argc, char **argv) {
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestScalarLeafCallSites();
+  TestPlainSetpcThroughS6DecodesFollowingCode();
+  TestFrontHalfDecodeStopsAtHandoff();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
@@ -18521,6 +18716,8 @@ int main(int argc, char **argv) {
   TestCapturedBufferStoreD16XyzwDecode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
+  TestNewShaderRecompilerTrapTemporaries();
+  TestDecoderTrailingDwordLength();
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
   TestFatalCheckRetiresSpeculativeThread();
 

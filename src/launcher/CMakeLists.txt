@@ -46,6 +46,21 @@ add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
 target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
+if(CLANG AND NOT KYTY_CLANG_CL)
+	target_compile_options(launcher_game_views_tests PRIVATE -frtti) # The tile delegate uses dynamic_cast.
+endif()
+if(TARGET kyty_tests)
+	add_dependencies(kyty_tests launcher_game_views_tests)
+endif()
+if(BUILD_TESTING)
+	add_test(NAME launcher_game_views COMMAND launcher_game_views_tests)
+	if(WIN32)
+		# Qt's DLLs may not be next to the test yet. Once windeployqt has copied them, Qt looks for
+		# plugins there, and it deploys qwindows but not the offscreen plugin the test needs.
+		set_tests_properties(launcher_game_views PROPERTIES
+			ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin;QT_PLUGIN_PATH=set:${Qt6_DIR}/../../../plugins")
+	endif()
+endif()
 
 add_executable(launcher_presets_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LauncherPresetsTests.cpp"
@@ -79,6 +94,19 @@ add_custom_command(TARGET launcher POST_BUILD
 		"${launcher_presets_dir}/presets.json"
 	VERBATIM)
 install(FILES presets.json DESTINATION "${launcher_presets_install}")
+
+# Registered in the root CMakeLists.txt (launcher_settings).
+add_executable(launcher_settings_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherSettingsTests.cpp"
+	include/configuration.h
+	src/configuration.cpp
+)
+target_link_libraries(launcher_settings_tests Qt6::Gui common)
+target_include_directories(launcher_settings_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_settings_tests PROPERTIES AUTOMOC ON)
+if (CLANG AND NOT KYTY_CLANG_CL)
+	target_compile_options(launcher_settings_tests PRIVATE -frtti)
+endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")

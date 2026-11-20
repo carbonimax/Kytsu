@@ -54,7 +54,8 @@ public:
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
 	void TransformColor(Result input, Result output, ColorTransform transform, bool to_host);
-	// Color-clear keys are multiples of 0x20, so key >> 5 selects one of these slots.
+	// Color-clear keys are multiples of 0x20, so key >> 5 selects one of these slots; the PS5
+	// register-clear key 0x10 shares slot 1 with 0x20.
 	static constexpr uint32_t ColorClearSlots = 8;
 	// metadata spans `slices` equal runs `stride` bytes apart. Returns the buffer whose dword
 	// slice * ColorClearSlots + (key >> 5) is set when every byte of that run equals a key whose
@@ -80,7 +81,6 @@ private:
 		uint32_t slice_bytes;
 		uint32_t tiled_slice_bytes;
 		uint32_t blocks_per_row;
-		uint32_t surface_z;
 		uint32_t tail_x;
 		uint32_t tail_y;
 		uint32_t num_texels;

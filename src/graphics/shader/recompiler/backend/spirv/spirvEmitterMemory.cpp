@@ -175,11 +175,12 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	const auto bit =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
-	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	// Atomic: lanes faulting on different pages of one 32-page word would lose bits to a
+	// load/or/store race.
+	const auto old = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), old, FaultElementPointer(state, word),
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
@@ -211,6 +212,15 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 		}
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
+		// A coherent poll in a guest loop: atomic, as in LoadWordInBounds. shortcut: the shared
+		// load_indirect_buffer_* functions are emitted outside any block and keep Volatile; key
+		// them on the loop if a guest loop polls through a GPU-selected descriptor.
+		if (coherent && EmittingInGuestLoop(state)) {
+			state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer,
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+			return value;
+		}
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
 		                          spv::MemoryAccessAlignedMask |
 		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
@@ -382,10 +392,12 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
 }
 
-// A GLC 32-bit load in a multi-wave workgroup is an OpAtomicLoad (LoadWordInBounds).
+// A GLC 32-bit load in a multi-wave workgroup or in a guest loop is an OpAtomicLoad
+// (LoadWordInBounds).
 bool IsAtomicWordLoad(const EmitterState& state, const MemoryResourceAccess& resource) {
 	return (resource.memory_access & spv::MemoryAccessVolatileMask) != 0 &&
-	       resource.element_bits == 32u && !WorkgroupIsSingleWave(state);
+	       resource.element_bits == 32u &&
+	       (!WorkgroupIsSingleWave(state) || EmittingInGuestLoop(state));
 }
 
 // min(index, max(length, 1) - 1): an element inside the descriptor range, also of a null binding
@@ -487,10 +499,10 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	if ((resource.memory_access & spv::MemoryAccessVolatileMask) != 0 &&
-	    resource.element_bits == 32u && !WorkgroupIsSingleWave(ctx.state)) {
+	if (IsAtomicWordLoad(ctx.state, resource)) {
 		// A GLC load reads memory each time it runs; a guest spin loop polls with one. Without a
 		// barrier in the loop, amdvlk hoists a Volatile buffer load out of it, so use an atomic.
+		// Single-wave workgroups too: they poll words that other workgroups publish.
 		ctx.state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(ctx.state), value, pointer,
 		                              ConstantU32(ctx.state, spv::ScopeDevice),
 		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone));
@@ -1268,15 +1280,58 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 				StoreFormattedPrepared(ctx, inst, selected, resource, info, composite, components);
 				return;
 			}
-			for (uint32_t component = 0; component < components; component++) {
-				auto data = composite;
-				if (components != 1u) {
-					data = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite,
-					                          component);
+			const auto store_words = [&]() {
+				for (uint32_t component = 0; component < components; component++) {
+					auto data = composite;
+					if (components != 1u) {
+						data = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data,
+						                          composite, component);
+					}
+					StoreWordPrepared(ctx, inst, RebaseRawComponent(selected, component), resource,
+					                  data);
 				}
-				StoreWordPrepared(ctx, inst, RebaseRawComponent(selected, component), resource, data);
+			};
+			// A coherent DWORDX2 is one 64-bit access: look-back scans publish {flag, value}.
+			if (!selected.IsCoherentBufferPairStore(inst.GetOpcode()) ||
+			    state.storage_buffers[3].variable == 0 || resource.object_pointer == 0u) {
+				store_words();
+				return;
 			}
+			const auto u32           = TypeU32(state);
+			const auto u64           = TypeU64(state);
+			const auto byte_address  = ByteAddress(ctx, inst, selected, resource.byte_offset);
+			const auto wide_resource = PrepareStorageBufferResourceAccess(
+			    state, selected, state.storage_buffers[3],
+			    resource.non_uniform ? resource.descriptor_index : 0u);
+			const auto index =
+			    Binary(state, spv::OpShiftRightLogical, u32, byte_address, ConstantU32(state, 3u));
+			const auto whole = Binary(
+			    state, spv::OpLogicalAnd, TypeBool(state),
+			    Binary(state, spv::OpIEqual, TypeBool(state),
+			           Binary(state, spv::OpBitwiseAnd, u32, byte_address, ConstantU32(state, 7u)),
+			           ConstantU32(state, 0u)),
+			    EmitMemoryElementInBounds(state, wide_resource, index));
+			EmitIfCondition(state, whole, [&]() {
+				std::array<uint32_t, 2> words {};
+				for (uint32_t c = 0; c < 2; c++) {
+					words[c] = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, u32, words[c], composite, c);
+				}
+				const auto value = Binary(
+				    state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, words[0]),
+				    Binary(state, spv::OpShiftLeftLogical, u64,
+				           Unary(state, spv::OpUConvert, u64, words[1]), ConstantU32(state, 32u)));
+				const auto pointer = EmitStorageBufferElementPointer(
+				    state, wide_resource, index, TypeStorageBufferElementPointer(state, 64));
+				state.builder.AddFunction(
+				    spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice),
+				    ConstantU32(state, spv::MemorySemanticsReleaseMask |
+				                           spv::MemorySemanticsUniformMemoryMask),
+				    value);
+			});
+			EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), whole),
+			                store_words);
 		});
 	});
 }
