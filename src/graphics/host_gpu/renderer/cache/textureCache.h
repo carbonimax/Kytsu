@@ -352,6 +352,7 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 	ImageId FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,
 	                        FindImageMemo* memo);
+	void    WaitAliasPublishes(GuestRange range);
 
 	// `staging`: a mapped download buffer of at least the image size, used instead of the reusable one.
 	// `capture` (GPU capture publish): also stencil associations and compressed video-out images.
@@ -360,6 +361,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	// KYTY_TC_LOCK_ORDER: never wait for priority operations under m_lock (they take it to deliver labels).
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;

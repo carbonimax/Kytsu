@@ -735,6 +735,21 @@ void BufferCache::WaitPendingPublishes(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// Only the GPU thread queues main-queue publications (SendCommandSync commands run after
+// CpPipeline::Drain), so on that thread a 0 stays 0 until it queues one itself. Side publications
+// are left out: the faulting thread runs them without the texture cache lock.
+uint64_t BufferCache::WritePublishTick(uint64_t vaddr, uint64_t size) {
+	uint64_t        tick = 0;
+	std::lock_guard lock(m_pending_mutex);
+	for (const auto& pending: m_pending_publishes) {
+		// A write to an imported buffer can demote it, which waits over the buffer's whole range.
+		if (!pending.side && (m_import || (pending.begin < vaddr + size && vaddr < pending.end))) {
+			tick = std::max(tick, pending.tick);
+		}
+	}
+	return tick;
+}
+
 void BufferCache::NoteBufferWrite(uint64_t vaddr, uint64_t size, bool cpu_upload) {
 	if ((m_readback_queue == nullptr && !m_import) || size == 0) {
 		return;
