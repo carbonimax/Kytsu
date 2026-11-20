@@ -72,6 +72,8 @@ constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT  = 0x9F;
 /* Custom codes. Implemented via IT_NOP */
 
 constexpr uint32_t R_ZERO           = 0x00;
+// Fork: resets of GPU captures taken before the async reset became a user data marker
+// (replayed only).
 constexpr uint32_t R_DISPATCH_RESET = 0x09;
 constexpr uint32_t R_PUSH_MARKER    = 0x0B;
 constexpr uint32_t R_POP_MARKER     = 0x0C;
