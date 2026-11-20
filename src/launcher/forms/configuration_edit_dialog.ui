@@ -181,8 +181,8 @@
             </item>
             <item row="8" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
-              <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
-              <property name="text"><string>Enable tessellation support (experimental)</string></property>
+              <property name="toolTip"><string>Draw tessellated geometry. On by default; turn it off to skip patch draws.</string></property>
+              <property name="text"><string>Enable tessellation support</string></property>
              </widget>
             </item>
             <item row="9" column="1">
@@ -213,6 +213,12 @@
              <widget class="QCheckBox" name="checkBox_recommended_options">
               <property name="toolTip"><string>Add the recommended environment variables and arguments for this game from presets.json next to the launcher, or from the file in KYTY_PRESETS. Your own settings and environment variables win.</string></property>
               <property name="text"><string>Use recommended options</string></property>
+             </widget>
+            </item>
+            <item row="14" column="1">
+             <widget class="QCheckBox" name="checkBox_native_rt">
+              <property name="toolTip"><string>Use native RT on the GPU.</string></property>
+              <property name="text"><string>Native ray tracing (experimental)</string></property>
              </widget>
             </item>
            </layout>

@@ -159,6 +159,8 @@ struct DrawRenderState {
 	// (vertex_info[0].indirect_draw).
 	ShaderIndirectOffsets                indirect_offsets;
 	uint32_t                             indirect_count = 0;
+	// Output (KYTY_TESS_PRETRANSLATE): skipped while workers translate its tessellation stages.
+	bool                                 tess_deferred  = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -196,8 +198,11 @@ public:
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	// `single_sample` selects the pixel permutation; `aliased` merges aliased color targets.
+	// `may_defer_tess`: a first lookup whose caller skips a draw left without a vertex program
+	// (KYTY_TESS_PRETRANSLATE, state.tess_deferred).
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state,
-	                         bool single_sample = false, const AliasedColorTargets* aliased = nullptr);
+	                         bool single_sample = false, const AliasedColorTargets* aliased = nullptr,
+	                         bool may_defer_tess = false);
 	// An empty program skips the dispatch.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                ShaderComputeInputInfo&      input_info);
@@ -214,6 +219,9 @@ public:
 	// draw whose pipeline is missing may be skipped while the workers create it (SkipMissing), for
 	// ASYNC_PIPELINE_SKIP_FRAMES guest frames at most; then it waits like any miss.
 	[[nodiscard]] bool AsyncEnabled() const { return m_async; }
+	// KYTY_ASYNC_TESS (default on with async pipelines, =0 off): tessellation draws skipped until
+	// created, no cap, depth-only ones too.
+	[[nodiscard]] bool AsyncTess() const { return m_async_tess; }
 	// The created pipeline, or nullptr (missing: SkipMissing or GetGraphicsPipeline).
 	Pipeline* FindGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                               std::span<const RenderColorInfo> colors, bool depth_feedback);
@@ -308,6 +316,7 @@ private:
 	                              m_pending;
 	std::unique_ptr<ParallelPool> m_pool;
 	bool                          m_async = false;
+	bool                          m_async_tess = false; // KYTY_ASYNC_TESS (default on, =0 off): no skip cap for tessellation
 	std::atomic<uint64_t>         m_frame {0};
 	PrefetchHook                  m_prefetch_hook    = nullptr;
 	void*                         m_prefetch_context = nullptr;
@@ -326,6 +335,8 @@ private:
 	PendingPipeline* StartPending(const GraphicsPipelineKey& key, const DrawRenderState& state, bool first);
 	// KYTY_COMPILE_LOG: a skipped key's age and queue position (A/Q/X lines).
 	void LogSkip(PendingPipeline& job, bool may_skip);
+	// KYTY_ASYNC_TESS: a tessellation key, skipped without cap and queued after the capped ones.
+	[[nodiscard]] bool AsyncUncapped(const PendingPipeline& job) const;
 	// The pipeline of a pending key: created inline if no worker took it yet, else waited for.
 	void TakePending(PendingPipeline& job);
 	// Loads the shader store: its modules, then its pipelines, created on several threads.
