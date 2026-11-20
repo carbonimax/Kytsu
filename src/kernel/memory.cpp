@@ -256,16 +256,18 @@ static int VmaMemoMode() {
 		return g_test_vma_memo_mode;
 	}
 #endif
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_VMA_MEMO");
 		const int   m = value == nullptr ? 1 : static_cast<int>(std::strtol(value, nullptr, 10));
-		if (value != nullptr) {
-			std::printf("KYTY_VMA_MEMO=%d: per-thread range lookup memo %s\n", m,
-			            m != 0 ? "on" : "off");
+		// Two threads may make the first call at once: the flag keeps the log line single.
+		static std::atomic<bool> logged {false};
+		if (value != nullptr && !logged.exchange(true)) {
+			std::printf("KYTY_VMA_MEMO=%d: per-thread range lookup memo %s\n", m, m != 0 ? "on" : "off");
 			std::fflush(stdout);
 		}
 		return m;
-	}();
+	}));
 	return mode;
 }
 
@@ -590,10 +592,11 @@ private:
 
 	static int MemoMode() {
 		// The flag name is compared once, so both A/B arms pay the same per-lookup cost.
-		static const bool driven = [] {
+		static std::atomic<int64_t> driven_once {Common::OnceUnset};
+		const auto driven = static_cast<bool>(Common::Once(driven_once, [] {
 			const char* flag = std::getenv("KYTY_AB_FLAG");
 			return flag != nullptr && std::strcmp(flag, "vma_memo") == 0;
-		}();
+		}));
 		const int mode = VmaMemoMode();
 		return mode != 0 && driven && Libs::Graphics::PerfStats::AbArmOff() ? 0 : mode;
 	}
