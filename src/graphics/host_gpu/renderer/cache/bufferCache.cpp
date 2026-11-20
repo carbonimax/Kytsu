@@ -1233,12 +1233,12 @@ bool BufferCache::AsyncFaultReadbacks() {
 
 namespace {
 
-// KYTY_READBACK_WINDOW_KIB (default 256, rounded down to a power of two, at most 64 MiB; 0
+// KYTY_READBACK_WINDOW_KIB (default 4096, rounded down to a power of two, at most 64 MiB; 0
 // restores page-sized readbacks): bytes published around a guest memory fault.
 uint64_t ReadbackWindowBytes() {
 	static const uint64_t bytes = [] {
 		const char* value = std::getenv("KYTY_READBACK_WINDOW_KIB");
-		const auto  kib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull;
+		const auto  kib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 4096ull;
 		const auto  size  = std::bit_floor(std::min<uint64_t>(kib, 64ull * 1024ull) * 1024ull);
 		return std::max<uint64_t>(size, TRACKER_PAGE_SIZE);
 	}();
