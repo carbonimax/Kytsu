@@ -26829,7 +26829,48 @@ private:
                                                   physical_devices.data()),
               "vkEnumeratePhysicalDevices");
 
+    // A driver can report a feature without advertising the extension that provides it, and
+    // vkCreateDevice then fails, so in strict Full mode a device also has to list every base
+    // extension requested below (relaxed mode drops the missing ones instead).
+    constexpr std::array full_extensions{
+        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
+        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+        VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+        VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+        VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+        VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
+        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    const auto missing_extension = [&](vk::PhysicalDevice physical) -> const char * {
+      u32 extension_count = 0;
+      RequireVk("VulkanHarness", "dispatch",
+                physical.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr),
+                "vkEnumerateDeviceExtensionProperties");
+      std::vector<vk::ExtensionProperties> extensions(extension_count);
+      RequireVk("VulkanHarness", "dispatch",
+                physical.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                            extensions.data()),
+                "vkEnumerateDeviceExtensionProperties");
+      extensions.resize(extension_count);
+      for (const char *required : full_extensions) {
+        if (std::ranges::none_of(extensions, [required](const vk::ExtensionProperties &extension) {
+              return std::strcmp(extension.extensionName, required) == 0;
+            })) {
+          return required;
+        }
+      }
+      return nullptr;
+    };
+
     for (auto physical : physical_devices) {
+      if (full && !relaxed) {
+        if (const char *missing = missing_extension(physical)) {
+          std::printf("[host]    %s lacks %s, skipped\n",
+                      physical.getProperties().deviceName.data(), missing);
+          continue;
+        }
+      }
       u32 queue_count = 0;
       physical.getQueueFamilyProperties(&queue_count, nullptr);
       std::vector<vk::QueueFamilyProperties> queues(queue_count);
@@ -27235,16 +27276,7 @@ private:
     device_features.depthBounds = m_rasterization_supported;
     device_features.fragmentStoresAndAtomics = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
-    std::vector<const char *> device_extensions{
-        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
-        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
-        VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-        VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-        VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
-        VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
-        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    std::vector<const char *> device_extensions(full_extensions.begin(), full_extensions.end());
     if (m_conditional_rendering_enabled) {
       device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
     }

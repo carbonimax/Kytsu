@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -22,12 +23,28 @@ struct Stream {
 	SDL_AudioDeviceID           device     = 0;
 	uint64_t                    next_check = 0;
 	std::vector<float>          buffer;
+	std::array<uint16_t, 2>     rumble {};
+	uint64_t                    rumble_sent = 0;
 };
 
 namespace {
 
 constexpr int      FRAME_BYTES  = 4 * sizeof(float);
 constexpr uint32_t MAX_QUEUE_MS = 80;
+// Haptic audio below this peak is texture a rumble motor cannot render; it only buzzes.
+// Applied only with KYTY_PAD_RUMBLE_FLOOR=1 (off by default: every level reaches the motors).
+constexpr float    RUMBLE_HAPTIC_FLOOR = 0.05f;
+bool RumbleFloorEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PAD_RUMBLE_FLOOR");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// Rumble is a blocking HID write on some pads; resend unchanged motors only before they expire.
+constexpr uint32_t RUMBLE_DURATION_MS = 100;
+constexpr uint32_t RUMBLE_REFRESH_MS  = 50;
+constexpr uint32_t RUMBLE_INTERVAL_MS = 16;
 Common::Mutex      g_mutex;
 int                g_controller      = -1;
 int                g_haptics_streams = 0;
@@ -342,15 +359,27 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 				peak[ch] = std::max(peak[ch], std::fabs(value));
 			}
 		}
-		const auto to_motor = [](float v) {
+		// gain already carries the vibration intensity setting (audio.cpp).
+		const auto to_motor = [floor = RumbleFloorEnabled() ? RUMBLE_HAPTIC_FLOOR : 0.0f](float v) {
+			if (v < floor) return uint16_t {0};
 			return static_cast<uint16_t>(std::clamp(v * 2.0f, 0.0f, 1.0f) * 65535.0f);
 		};
-		SDL_LockJoysticks();
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
-		    pad != nullptr) {
-			(void) SDL_RumbleGamepad(pad, to_motor(peak[0]), to_motor(peak[1]), 100);
+		const std::array<uint16_t, 2> rumble {to_motor(peak[0]), to_motor(peak[1])};
+		const auto now = SDL_GetTicks();
+		const bool idle = rumble[0] == 0 && rumble[1] == 0;
+		const auto elapsed = now - stream->rumble_sent;
+		// Stopping is sent at once; level changes are rate limited to one write per interval.
+		if ((rumble != stream->rumble && (idle || elapsed >= RUMBLE_INTERVAL_MS)) ||
+		    (!idle && elapsed >= RUMBLE_REFRESH_MS)) {
+			SDL_LockJoysticks();
+			if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
+			    pad != nullptr) {
+				(void) SDL_RumbleGamepad(pad, rumble[0], rumble[1], RUMBLE_DURATION_MS);
+			}
+			SDL_UnlockJoysticks();
+			stream->rumble      = rumble;
+			stream->rumble_sent = now;
 		}
-		SDL_UnlockJoysticks();
 		return static_cast<uint64_t>(frames) * 1000000 / stream->freq;
 	}
 	const bool wireless = IsWireless(controller);
