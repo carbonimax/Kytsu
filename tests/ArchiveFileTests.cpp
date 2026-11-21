@@ -281,6 +281,172 @@ void CheckGuestReads(const std::filesystem::path &directory, const std::filesyst
 #endif
 }
 
+// Builds a small raw exFAT volume the way a formatter lays it out: 512-byte sectors and clusters,
+// FAT at sector 1, cluster heap at sector 2, root directory in cluster 2 with the volume label,
+// bitmap and up-case entries first and a deleted entry before the files.
+std::vector<uint8_t> MakeExfatImage(uint32_t fragment_next) {
+  constexpr uint32_t Clusters = 12;
+  std::vector<uint8_t> image((2 + Clusters) * 512, 0);
+  const auto put = [&](size_t offset, uint64_t value, unsigned bytes) {
+    for (unsigned i = 0; i < bytes; ++i) image[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  };
+  std::memcpy(image.data() + 3, "EXFAT   ", 8);
+  put(72, 2 + Clusters, 8); // Volume length in sectors.
+  put(80, 1, 4);            // FAT offset.
+  put(84, 1, 4);            // FAT length.
+  put(88, 2, 4);            // Cluster heap offset.
+  put(92, Clusters, 4);
+  put(96, 2, 4);            // Root directory cluster.
+  put(104, 0x0100, 2);      // Revision 1.0.
+  image[108] = 9;           // 512-byte sectors.
+  image[109] = 0;           // One sector per cluster.
+  image[110] = 1;           // One FAT.
+  put(510, 0xaa55, 2);
+  const auto cluster = [](uint32_t index) { return size_t(2 + index - 2) * 512; };
+  const auto fat = [&](uint32_t index, uint32_t next) { put(512 + index * 4, next, 4); };
+  fat(0, 0xfffffff8);
+  fat(1, 0xffffffff);
+  fat(2, 11); // The root directory spans clusters 2 and 11.
+  fat(11, 0xffffffff);
+  fat(6, 8);
+  fat(8, fragment_next);
+  fat(9, 0xffffffff);
+
+  const auto add = [&](size_t& offset, std::u16string_view name, bool directory, uint32_t first,
+                       uint64_t length, uint64_t valid, bool contiguous, uint8_t type = 0x85) {
+    const size_t names = (name.size() + 14) / 15;
+    image[offset] = type;
+    image[offset + 1] = static_cast<uint8_t>(1 + names);
+    put(offset + 4, directory ? 0x10 : 0x20, 2);
+    const size_t stream = offset + 32;
+    image[stream] = type == 0x85 ? 0xc0 : 0x40;
+    image[stream + 1] = static_cast<uint8_t>(0x01 | (contiguous ? 0x02 : 0));
+    image[stream + 3] = static_cast<uint8_t>(name.size());
+    put(stream + 8, valid, 8);
+    put(stream + 20, first, 4);
+    put(stream + 24, length, 8);
+    for (size_t part = 0; part < names; ++part) {
+      const size_t entry = stream + 32 * (part + 1);
+      image[entry] = type == 0x85 ? 0xc1 : 0x41;
+      for (size_t k = 0; k < 15 && part * 15 + k < name.size(); ++k) {
+        put(entry + 2 + k * 2, name[part * 15 + k], 2);
+      }
+    }
+    offset += 32 * (2 + names);
+  };
+  size_t root = cluster(2);
+  image[root] = 0x83; // Volume label.
+  image[root + 32] = 0x81; // Allocation bitmap.
+  put(root + 32 + 20, 12, 4);
+  put(root + 32 + 24, 2, 8);
+  image[root + 64] = 0x82; // Up-case table.
+  root += 96;
+  add(root, u"gone.bin", false, 4, 11, 11, true, 0x05);
+  add(root, u"eboot.bin", false, 4, 11, 11, true);
+  add(root, u"sce_sys", true, 3, 512, 512, true);
+  add(root, u"fragmented-member-name.bin", false, 6, 1300, 1100, false);
+  root = cluster(11); // Cluster 2 is full (512 bytes of entries).
+  add(root, u"データ.bin", false, 10, 4, 4, true);
+  size_t sce_sys = cluster(3);
+  add(sce_sys, u"param.json", false, 5, 15, 15, true);
+  std::memcpy(image.data() + cluster(4), "ELF fixture", 11);
+  std::memcpy(image.data() + cluster(5), "{\"title\":\"ex\"}", 15);
+  std::memset(image.data() + cluster(7), 0xee, 512); // Not in the fragmented chain.
+  for (uint32_t i = 0; i < 1300; ++i) {
+    const uint32_t index = i / 512;
+    const uint32_t at = static_cast<uint32_t>(cluster(index == 0 ? 6 : index == 1 ? 8 : 9)) + i % 512;
+    image[at] = i < 1100 ? static_cast<uint8_t>(i * 7 + 3) : 0x5a; // Past valid length: must read 0.
+  }
+  std::memcpy(image.data() + cluster(10), "data", 4);
+  return image;
+}
+
+void CheckExfatImage(const std::filesystem::path &directory) {
+  const auto write = [&](const char *name, const std::vector<uint8_t> &bytes) {
+    const auto path = directory / name;
+    WriteHostFile(path, bytes.data(), bytes.size());
+    return path;
+  };
+  const auto good = MakeExfatImage(9);
+  const auto image = write("image.exfat", good);
+  const auto root = Common::MakeArchivePath(image);
+  Check(Common::IsSupportedArchive(image) && Common::IsSupportedArchive("GAME.EXFAT"),
+        "exFAT images are a supported archive format");
+  Check(Common::File::IsDirectoryExisting(root) &&
+            Common::File::IsFileExisting(root / "EBOOT.BIN") &&
+            Common::File::IsDirectoryExisting(root / "sce_sys") &&
+            Common::File::IsFileExisting(root / "sce_sys/param.json") &&
+            !Common::File::IsFileExisting(root / "gone.bin") &&
+            !Common::File::IsFileExisting(root / "../image.exfat"),
+        "exFAT lookup is case insensitive, skips deleted entries and rejects traversal");
+  const auto entries = Common::File::GetDirEntries(root);
+  const auto has = [&](std::string_view name, bool is_file) {
+    return std::ranges::any_of(entries, [&](const auto &entry) {
+      return entry.name == name && entry.is_file == is_file;
+    });
+  };
+  Check(entries.size() == 4 && has("eboot.bin", true) && has("sce_sys", false) &&
+            has("fragmented-member-name.bin", true) &&
+            has("\xe3\x83\x87\xe3\x83\xbc\xe3\x82\xbf.bin", true),
+        "exFAT root lists files, folders, long and UTF-16 names only");
+
+  Common::File fragmented(root / "fragmented-member-name.bin", Common::File::Mode::Read);
+  Check(!fragmented.IsInvalid() && fragmented.Size() == 1300, "open fragmented exFAT file");
+  std::vector<uint8_t> data(1400, 0xcd);
+  uint32_t got = 0;
+  fragmented.Read(data.data(), static_cast<uint32_t>(data.size()), &got);
+  bool same = got == 1300;
+  for (uint32_t i = 0; same && i < 1300; ++i) {
+    same = data[i] == (i < 1100 ? static_cast<uint8_t>(i * 7 + 3) : 0);
+  }
+  Check(same, "exFAT read follows the FAT chain and zero-fills past the valid length");
+  Check(fragmented.Seek(500), "seek in fragmented exFAT file");
+  fragmented.Read(data.data(), 30, &got);
+  Check(got == 30 && data[0] == static_cast<uint8_t>(500 * 7 + 3) &&
+            data[29] == static_cast<uint8_t>(529 * 7 + 3),
+        "exFAT read crosses a cluster boundary");
+  Common::File unicode(root / Common::PathFromUtf8("\xe3\x83\x87\xe3\x83\xbc\xe3\x82\xbf.bin"),
+                       Common::File::Mode::Read);
+  const auto unicode_data = unicode.ReadWholeBuffer();
+  Common::File param(root / "sce_sys/param.json", Common::File::Mode::Read);
+  const auto param_data = param.ReadWholeBuffer();
+  Check(unicode_data.size() == 4 && std::memcmp(unicode_data.data(), "data", 4) == 0 &&
+            param_data.size() == 15 && std::memcmp(param_data.data(), "{\"title\":\"ex\"}", 15) == 0,
+        "read exFAT files by UTF-8 name and in a subfolder");
+  Common::File writable;
+  Check(!writable.Open(root / "eboot.bin", Common::File::Mode::ReadWrite),
+        "exFAT members are read-only");
+
+  auto bad_boot = good;
+  bad_boot[3] = 'N';
+  const auto bad_boot_root = Common::MakeArchivePath(write("bad-boot.exfat", bad_boot));
+  auto bad_geometry = good;
+  bad_geometry[92] = 200; // More clusters than the volume holds.
+  const auto bad_geometry_root = Common::MakeArchivePath(write("bad-geometry.exfat", bad_geometry));
+  const auto broken_chain_root =
+      Common::MakeArchivePath(write("broken-chain.exfat", MakeExfatImage(0)));
+  Check(!Common::File::IsFileExisting(bad_boot_root / "eboot.bin") &&
+            !Common::File::IsFileExisting(bad_geometry_root / "eboot.bin") &&
+            Common::File::IsFileExisting(broken_chain_root / "eboot.bin") &&
+            !Common::File::IsFileExisting(broken_chain_root / "fragmented-member-name.bin"),
+        "exFAT rejects a bad boot sector, bad geometry and a broken cluster chain");
+
+  // The UTF-16 name of the root entry in cluster 11 starts at byte 66 of that cluster.
+  constexpr size_t UnicodeName = 11 * 512 + 66;
+  auto lone_surrogate = good;
+  lone_surrogate[UnicodeName] = 0x00;
+  lone_surrogate[UnicodeName + 1] = 0xd8; // High surrogate followed by a plain unit.
+  auto trailing_surrogate = good;
+  trailing_surrogate[UnicodeName + 12] = 0xff;
+  trailing_surrogate[UnicodeName + 13] = 0xdb; // High surrogate as the last unit.
+  Check(!Common::File::IsFileExisting(
+            Common::MakeArchivePath(write("lone-surrogate.exfat", lone_surrogate)) / "eboot.bin") &&
+            !Common::File::IsFileExisting(
+                Common::MakeArchivePath(write("trailing-surrogate.exfat", trailing_surrogate)) /
+                "eboot.bin"),
+        "exFAT rejects a directory with a malformed UTF-16 name");
+}
+
 } // namespace
 
 int main() {
@@ -494,6 +660,7 @@ int main() {
         "reopening after the final reader closes sees replacement contents");
 
   CheckPackArchive(temporary.Path(), payload);
+  CheckExfatImage(temporary.Path());
 
   std::printf("ArchiveFileTests: all cases passed\n");
   return 0;

@@ -204,6 +204,16 @@ RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format
 	return image.conversion_format == Prospero::BufferFormat::k16UInt;
 }
 
+// A depth compare through a k32UInt T# (a title binds a 4x4 k32UInt
+// texture to a shadow compare) samples the texel bits as a 32-bit float depth: the host compares
+// against a D32Sfloat copy of the same memory, like a k32Float T#.
+[[nodiscard]] constexpr Prospero::BufferFormat CompareFormat(const ImageResource&   image,
+                                                             Prospero::BufferFormat format) {
+	return image.depth_compare && format == Prospero::BufferFormat::k32UInt
+	           ? Prospero::BufferFormat::k32Float
+	           : format;
+}
+
 struct SamplerResource {
 	static constexpr uint32_t NoIndirectSampler = UINT32_MAX;
 
@@ -535,7 +545,7 @@ struct Bindings {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
-	static constexpr uint32_t MaxImages       = 64;
+	static constexpr uint32_t MaxImages       = 128;
 	static constexpr uint32_t MaxSamplers     = 32;
 
 	std::vector<BufferResource>      buffers;

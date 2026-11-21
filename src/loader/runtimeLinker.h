@@ -204,6 +204,10 @@ uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, uint16_t phnum);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();
+bool TestRelocationSkipsNoneEntries();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool TestDebugPrintOnGuestStack();
+#endif
 #endif
 
 } // namespace Loader

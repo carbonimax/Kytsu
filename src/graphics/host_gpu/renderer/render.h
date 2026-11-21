@@ -267,7 +267,7 @@ struct Request;
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context): m_context(context) { DropTextureDescMemos(); }
 	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
@@ -286,6 +286,12 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// KYTY_RESOLVE_INPLACE (descriptors.cpp): a program resource's binding from the description memo.
+	[[nodiscard]] bool ResolveKeptTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                                      const ShaderRecompiler::IR::DescriptorValue& value,
+	                                      TextureBinding& out, bool verify);
+	// Every thread drops its texture description memo before its next lookup (descriptors.cpp).
+	static void DropTextureDescMemos() noexcept;
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.

@@ -2,6 +2,7 @@
 
 #include "controllerPreview.h"
 #include "dualsenseWidget.h"
+#include "inputIcons.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -11,6 +12,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHash>
+#include <QIcon>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
@@ -515,7 +517,17 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 			button->setMinimumWidth(190);
 			button->setContextMenuPolicy(Qt::CustomContextMenu);
 			button->setAccessibleName(tr(SECTION_TITLES[section]) + QStringLiteral(" / ") + label);
-			rows->addWidget(name, row, 0);
+			if (const auto icon = InputIcons::Icon(InputIcons::PadControlAlias(id)); !icon.isNull()) {
+				auto* glyph = new QLabel(group);
+				glyph->setPixmap(icon.pixmap(QSize(24, 24), devicePixelRatioF()));
+				auto* cell = new QHBoxLayout;
+				cell->setSpacing(6);
+				cell->addWidget(glyph);
+				cell->addWidget(name, 1);
+				rows->addLayout(cell, row, 0);
+			} else {
+				rows->addWidget(name, row, 0);
+			}
 			rows->addWidget(button, row, 1);
 			++row;
 			(pad ? m_pad_buttons : m_buttons).insert(id, button);
@@ -687,6 +699,7 @@ void InputMappingDialog::UpdateButtons() {
 		const auto binding = m_bindings.value(item.key());
 		const auto label   = binding.isEmpty() ? tr("None") : binding;
 		button->setText(QString(label).replace(QLatin1Char('&'), QLatin1String("&&")));
+		button->setIcon(InputIcons::Icon(InputIcons::HostInputAlias(binding)));
 		button->setToolTip(
 		    tr("%1: %2. Click to change, right-click to clear.").arg(button->accessibleName(), label));
 	}

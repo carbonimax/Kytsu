@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/refreshProf.h"
+#include "common/onceValue.h"
 
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "kernel/memory.h"
@@ -149,7 +150,10 @@ void MaybeReport(State& s) {
 } // namespace
 
 bool Enabled() noexcept {
-	static const bool enabled = EnvU32("KYTY_REFRESH_PROF", 0) != 0;
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
+		return EnvU32("KYTY_REFRESH_PROF", 0) != 0;
+	}));
 	return enabled;
 }
 
@@ -169,7 +173,10 @@ void NoteDefer(uint64_t bytes, bool first) noexcept {
 }
 
 uint32_t SkipSameMode() noexcept {
-	static const uint32_t mode = std::min(EnvU32("KYTY_REFRESH_SKIP_SAME", 1), 2u);
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<uint32_t>(Common::Once(mode_once, [] {
+		return std::min(EnvU32("KYTY_REFRESH_SKIP_SAME", 1), 2u);
+	}));
 	return mode;
 }
 
