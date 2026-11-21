@@ -8529,7 +8529,6 @@ public:
         desc.type = BindingType::DepthTarget;
         desc.info.pitch = grown_depth_pitch;
         desc.info.mip_layout[0].pitch = grown_depth_pitch;
-        desc.info.mip_layout[0].linear_pitch = grown_depth_pitch;
         desc.view_info.format = vk::Format::eD32Sfloat;
         desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
         desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
@@ -12800,6 +12799,78 @@ public:
     Require(name, "release",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "sRGB allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // KYTY_RESOLVE_INPLACE knows a program texture by its address. One program, at one address, binds
+  // the same T# in two render contexts in a row, its resource changed in between: r128 takes the
+  // view's last level as max mip (1 level) instead of the T# max mip (2 levels). The second context
+  // must not bind the description the first one kept for that address.
+  void CheckResolveInplaceNewContext() {
+    constexpr const char *name = "ResolveInplaceNewContext";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "texture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "texture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+        (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) | (1u << 30u), 1u << 14u,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+            (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+        0, 0x00700000u | (1u << 4u), 0, 0}}; // Last level 0, max mip 1.
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.stage = ShaderType::Pixel;
+    program.info.images.resize(1);
+    auto &resource = program.info.images[0];
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.read = true;
+    ShaderRecompiler::IR::ResourceSnapshot snapshot;
+    snapshot.images.resize(1);
+    snapshot.images[0].dword_count = 8;
+    std::copy_n(descriptor.fields, 8, snapshot.images[0].dwords.begin());
+    const ShaderStageRuntime runtime{&program, &snapshot};
+    for (const bool r128 : {false, true}) {
+      resource.r128 = r128;
+      const uint32_t expected_levels = r128 ? 1u : 2u;
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &executor = context.GetRenderExecutor();
+      // The first bind keeps the description, the second binds it in place.
+      for (int bind = 0; bind < 2; bind++) {
+        PreparedBindings prepared;
+        executor.PrepareBindings(runtime, prepared);
+        Require(name, "mip levels",
+                prepared.images.size() == 1 && prepared.images[0].image_id &&
+                    prepared.images[0].desc.info.resources.levels == expected_levels,
+                "a texture kept by an earlier render context was bound in a new one");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "texture mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "texture allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -18147,6 +18218,93 @@ public:
     check_layout(false, DstSel(4, 4, 4, 4));
     check_layout(false, DstSel(4, 4, 4, 1));
     check_layout(true, DstSel(4, 0, 0, 1));
+    // A title compares against a k32UInt T# (its
+    // words 1-3: 4x4 2D, 64 KiB tiling): the texel bits are compared as a float
+    // depth through a D32 copy. Every word of the tiled block holds the bits of
+    // 0.4f, so the result does not depend on the swizzle.
+    {
+      constexpr float stored = 0.4f;
+      std::memset(mapped, 0, allocation_size);
+      const auto bits = std::bit_cast<uint32_t>(stored);
+      for (uint32_t offset = 0; offset < 0x10000u; offset += sizeof(bits)) {
+        std::memcpy(static_cast<uint8_t *>(mapped) + offset, &bits,
+                    sizeof(bits));
+      }
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+      ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+                                        0xc1400000u, 0x0000c000u, 0x90900004u,
+                                        0, 0x00700000u, 0, 0}};
+      ShaderSamplerResource sampler_descriptor{{1u << 12u, 0, 1u << 24u, 0}};
+      TestCase test;
+      test.name = name;
+      test.has_user_data = true;
+      test.image_descriptor_swizzle = descriptor.DstSelXYZW();
+      std::copy_n(descriptor.fields, 8, test.user_data.begin());
+      std::copy_n(sampler_descriptor.fields, 4, test.user_data.begin() + 8);
+      std::vector<float> compared(references.begin(), references.end());
+      compared.push_back(stored); // equal: the LESS compare fails
+      test.user_data[50] = compared.size() * sizeof(uint32_t);
+      test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      test.required_spirv = {"OpImageSampleDrefExplicitLod"};
+      for (const auto reference : compared) {
+        AppendVMovLiteral(&test.code, 20, std::bit_cast<uint32_t>(reference));
+        AppendVMovLiteral(&test.code, 21, std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&test.code, 22, std::bit_cast<uint32_t>(0.5f));
+        test.code.push_back(EncodeMimg0(0x2f, 1, 0, false, 1));
+        test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+        AppendStoreVgpr(&test.code, 0,
+                        static_cast<uint32_t>(test.expected.size()));
+        test.expected.push_back(reference < stored ? 0x3f800000u : 0u);
+      }
+      AppendEnd(&test.code);
+      const auto compiled = CompileCase(test, SubgroupSize());
+      Require(
+          name, "k32UInt comparison resource",
+          compiled.program.info.images.size() == 1 &&
+              compiled.program.info.images[0].depth_compare &&
+              compiled.program.info.images[0].numeric_class ==
+                  Prospero::TextureNumericClass::Float,
+          "a k32UInt comparison was not specialized as a float depth compare");
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      auto binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, compiled.program.info.images[0], value);
+      const auto view = cache.FindTexture(binding.image_id, binding.desc);
+      auto &image = cache.GetImage(binding.image_id);
+      Require(
+          name, "k32UInt depth backing",
+          view != nullptr &&
+              image.info.pixel_format == vk::Format::eD32Sfloat &&
+              image.info.guest_format == Prospero::BufferFormat::k32Float,
+          "a k32UInt comparison texture did not get a D32 copy of its bits");
+      scheduler.Finish();
+      auto output = CreateStorageBuffer(name, {}, test.expected.size());
+      const auto sampler = context.GetSamplerCache().GetSampler(
+          sampler_descriptor, compiled.program.info.samplers[0].integer_border);
+      Image sampled;
+      sampled.view = view;
+      sampled.layout = image.backing.state.layout;
+      Dispatch(test, compiled, output, nullptr, &sampled, nullptr, nullptr,
+               sampler);
+      Require(name, "k32UInt comparisons",
+              ReadBuffer(name, output, test.expected.size()) == test.expected,
+              "a k32UInt comparison did not compare the texel bits as a float "
+              "depth");
+      DestroyBuffer(&output);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
     for (const u32 wave : {32u, 64u}) {
       TestCase test;
       test.name = wave == 32u ? "ImageGatherCompareLod32" : "ImageGatherCompareLod64";
@@ -18473,13 +18631,7 @@ public:
       const auto same_placement = [](const ImageInfo &left, const ImageInfo &right) {
         return left.pitch == right.pitch &&
                std::equal(left.mip_layout.begin(), left.mip_layout.end(),
-                          right.mip_layout.begin(),
-                          [](const ImageMipInfo &a, const ImageMipInfo &b) {
-                            return a.offset == b.offset && a.size == b.size &&
-                                   a.pitch == b.pitch && a.height == b.height &&
-                                   a.tail_x == b.tail_x && a.tail_y == b.tail_y &&
-                                   a.surface_z == b.surface_z;
-                          });
+                          right.mip_layout.begin());
       };
 
       auto cached_desc = volume(base, {4, 8, 8});
@@ -62924,6 +63076,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageSampleSrgb8_8<1>());
     RunCase(&vulkan, ImageSampleSrgb8_8<2>());
     vulkan.CheckSampledSrgbViews();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--resolve-inplace-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResolveInplaceNewContext();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-capture-replay-only") == 0) {

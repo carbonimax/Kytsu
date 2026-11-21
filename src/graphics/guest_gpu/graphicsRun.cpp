@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -509,7 +510,8 @@ int GuestGpu::GetFrameNum() const {
 // Default: every queue when fault readbacks are asynchronous. With synchronous readbacks the
 // guest threads wait far longer on faults when compute runs earlier (in one title -30 % frames).
 static uint64_t ComputePreemptMask() {
-	static const uint64_t mask = [] {
+	static std::atomic<int64_t> mask_once {Common::OnceUnset};
+	const auto mask = static_cast<uint64_t>(Common::Once(mask_once, [] {
 		const char* value = std::getenv("KYTY_COMPUTE_PREEMPT");
 		if (value == nullptr) {
 			return BufferCache::AsyncFaultReadbacks() ? ~uint64_t {0} : uint64_t {0};
@@ -529,7 +531,7 @@ static uint64_t ComputePreemptMask() {
 			p = (*end == ',') ? end + 1 : end;
 		}
 		return result;
-	}();
+	}));
 	return mask;
 }
 
@@ -1696,10 +1698,11 @@ void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 // buffer owns that GPU-modified page, write the label like WRITE_DATA does: into the backing
 // and into the cached buffer at this point of the command stream.
 static bool GpuOwnedEopLabelEnabled() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_GPU_OWNED_EOP_LABEL");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	return enabled;
 }
 

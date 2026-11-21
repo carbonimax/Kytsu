@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -644,6 +645,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
 	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
+	m_buffer_set_epoch++;
 	if constexpr (insert) {
 		m_buffers.emplace(buffer.CpuAddress(), id);
 		m_total_used_memory += buffer.Size();
@@ -1121,11 +1123,12 @@ void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> co
 // KYTY_REPROTECT_BATCH: 1 (default, also when unset) = on, 0 = off, 2 = on with checks; other
 // values = off.
 static int ReprotectBatchMode() {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_REPROTECT_BATCH");
 		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
 		return v == 1 || v == 2 ? static_cast<int>(v) : 0;
-	}();
+	}));
 	return mode;
 }
 
@@ -1305,12 +1308,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 bool BufferCache::AsyncFaultReadbacks() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_ASYNC_READBACK");
 		// Default on; KYTY_ASYNC_READBACK=0 restores synchronous readbacks (and, by default, turns
 		// compute preemption and the readback queue off with them).
 		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
-	}();
+	}));
 	return enabled;
 }
 
@@ -1349,7 +1353,8 @@ int Watch() {
 // imported buffers samples one batch in KYTY_MEM_IMPORT_NET (default 16, 0 = off), or every batch with
 // KYTY_MEM_IMPORT_WATCH.
 int SamplePeriod() {
-	static const int period = [] {
+	static std::atomic<int64_t> period_once {Common::OnceUnset};
+	const auto period = static_cast<int>(Common::Once(period_once, [] {
 		const auto number = [](const char* value) {
 			return std::max(0, static_cast<int>(std::strtol(value, nullptr, 10)));
 		};
@@ -1366,7 +1371,7 @@ int SamplePeriod() {
 		}
 		const char* net = std::getenv("KYTY_MEM_IMPORT_NET");
 		return net != nullptr ? number(net) : 16;
-	}();
+	}));
 	return period;
 }
 
@@ -2285,10 +2290,11 @@ void BufferCache::OverlayOwnedWrites(uint64_t vaddr, void* data, uint64_t size) 
 }
 
 bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size) {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_GPU_OWNED_WRITE_DATA");
 		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
-	}();
+	}));
 	if (!enabled || size == 0 || !GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid() ||
 	    m_scheduler.Current().IsInvalid() || !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		return false;
@@ -2642,10 +2648,11 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 // KYTY_UPLOAD_BARRIER_BATCH=0 restores one barrier pair per upload.
 static bool UploadBarrierBatchEnabled() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_UPLOAD_BARRIER_BATCH");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	return enabled;
 }
 
@@ -2654,10 +2661,11 @@ static bool UploadBarrierBatchEnabled() {
 // trailing barrier, and the draw and dispatch resource uploads run in batches; 0 = one copy per
 // upload as recorded, batches only around buffer discovery and BDA synchronization.
 int BufferCache::UploadBatchMode() {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_UPLOAD_BATCH");
 		return value == nullptr ? 1 : static_cast<int>(std::strtol(value, nullptr, 10) != 0);
-	}();
+	}));
 	return UploadBarrierBatchEnabled() ? mode : 0;
 }
 
@@ -2684,6 +2692,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer) {
 	MemTrackProf::Timer prof_timer(MemTrackProf::Counter::SyncNs, MemTrackProf::Counter::SyncCount);
 	if (buffer.IsImported()) {
+		m_sync_other++;
 		// The GPU reads the guest's bytes at execution: nothing to upload, no re-protection. A
 		// write only takes GPU ownership (CPU readers wait for the writer, see PublishImported).
 		const auto tick = m_scheduler.CurrentTick();
@@ -2728,6 +2737,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, !is_written); });
 	if (source) {
+		m_sync_uploads++;
 		NoteBufferWrite(vaddr, size, true);
 		auto& command = m_scheduler.Current();
 		const bool batch = m_upload_batch_depth != 0;
@@ -2816,7 +2826,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (is_texel_buffer && !is_written) {
 		// May copy an image into the buffer.
 		NoteBufferWrite(vaddr, size);
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
+		const bool filled = SynchronizeBufferFromImage(buffer, vaddr, size);
+		m_sync_other += filled ? 1 : 0;
+		return filled;
 	}
 	return false;
 }
@@ -3071,7 +3083,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	if (is_gds) {
 		if (vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - vaddr) {
-			EXIT("BufferCache: GDS fill range is out of bounds\n");
+		EXIT("BufferCache: GDS fill range is out of bounds, vaddr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " gds_size=0x%016" PRIx64 "\n",
+		     vaddr, size, m_gds_buffer.Size());
 		}
 		m_gds_buffer.Fill(vaddr, size, value);
 		return;

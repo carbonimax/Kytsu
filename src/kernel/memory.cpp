@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -256,16 +257,18 @@ static int VmaMemoMode() {
 		return g_test_vma_memo_mode;
 	}
 #endif
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_VMA_MEMO");
 		const int   m = value == nullptr ? 1 : static_cast<int>(std::strtol(value, nullptr, 10));
-		if (value != nullptr) {
-			std::printf("KYTY_VMA_MEMO=%d: per-thread range lookup memo %s\n", m,
-			            m != 0 ? "on" : "off");
+		// Two threads may make the first call at once: the flag keeps the log line single.
+		static std::atomic<bool> logged {false};
+		if (value != nullptr && !logged.exchange(true)) {
+			std::printf("KYTY_VMA_MEMO=%d: per-thread range lookup memo %s\n", m, m != 0 ? "on" : "off");
 			std::fflush(stdout);
 		}
 		return m;
-	}();
+	}));
 	return mode;
 }
 
@@ -578,10 +581,11 @@ private:
 
 	static int MemoMode() {
 		// The flag name is compared once, so both A/B arms pay the same per-lookup cost.
-		static const bool driven = [] {
+		static std::atomic<int64_t> driven_once {Common::OnceUnset};
+		const auto driven = static_cast<bool>(Common::Once(driven_once, [] {
 			const char* flag = std::getenv("KYTY_AB_FLAG");
 			return flag != nullptr && std::strcmp(flag, "vma_memo") == 0;
-		}();
+		}));
 		const int mode = VmaMemoMode();
 		return mode != 0 && driven && Libs::Graphics::PerfStats::AbArmOff() ? 0 : mode;
 	}
@@ -1118,6 +1122,10 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+uint64_t VirtualRangesGeneration() {
+	return g_vma_generation.load(std::memory_order_acquire);
+}
+
 bool IsVirtualAddressKnown(uint64_t vaddr) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
@@ -1181,6 +1189,10 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t guest_vaddr,
                     [[maybe_unused]] uint64_t guest_pc) noexcept {
 	// Execute and Unknown accesses are rejected by RenderContext::HandleFault.
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, guest_vaddr);
+}
+
+bool DescribeNearestGpuMapping(uint64_t fault_vaddr, uint64_t* begin, uint64_t* end) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->DescribeNearestMapping(fault_vaddr, begin, end);
 }
 
 struct PrtAperture {

@@ -1134,7 +1134,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
 		image.numeric_class = Prospero::SampledTextureNumericClass(
-		    depth_bits ? Prospero::BufferFormat::k16UNorm : Prospero::RemapTextureFormat(format));
+		    depth_bits ? Prospero::BufferFormat::k16UNorm
+		               : Prospero::RemapTextureFormat(CompareFormat(base, format)));
 		if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {
 			if (image.indirect_root != ImageResource::NoIndirectImage) {
 				return SpecializationFail("packed UNorm sampling requires a direct image");
@@ -2250,8 +2251,8 @@ uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
 	// failing the draw.
 	const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
 	const auto tile = static_cast<Prospero::TileMode>((value.dwords[3] >> 20u) & 0x1fu);
-	const auto numeric_class =
-	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	const auto numeric_class = Prospero::SampledTextureNumericClass(
+	    Prospero::RemapTextureFormat(CompareFormat(root, format)));
 	if (NullImageDescriptor(value) || !ValidImageDescriptor(value, root.r128) ||
 	    DescriptorDimension(value, root.dimension) != root.dimension ||
 	    Prospero::IsFmaskTextureFormat(format) || format == Prospero::BufferFormat::k11_11_10UNorm ||
@@ -2406,7 +2407,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::ReadConstBuffer) continue;
 			const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
-			if (memory.kind == ResourceKind::ScalarBuffer &&
+			if (memory.kind == ResourceKind::ScalarBuffer && !memory.planning_only &&
 			    specialization.buffers[memory.resource].scalar_empty &&
 			    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer)
 				inst.ReplaceUsesWith(Value(0u));
@@ -2422,7 +2423,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read) {
 				const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
-				const bool native_oob = memory.kind == ResourceKind::Buffer &&
+				const bool  native_oob =
+				    memory.kind == ResourceKind::Buffer && !memory.planning_only &&
 				    specialization.buffers[memory.resource].zero_stride_oob &&
 				    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer;
 				const bool null_indirect = memory.kind == ResourceKind::IndirectBuffer &&

@@ -483,6 +483,13 @@ if(KYTY_TARGET_X86_64_V3)
 	target_compile_definitions(build_flags_tests PRIVATE KYTY_EXPECT_X86_64_V3)
 endif()
 
+add_executable(texture_track_range_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/TextureTrackRangeTests.cpp")
+target_include_directories(texture_track_range_tests PRIVATE ${inc_headers})
+add_executable(texture_track_range_mutant_no_clamp_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TextureTrackRangeTests.cpp")
+target_include_directories(texture_track_range_mutant_no_clamp_tests PRIVATE ${inc_headers})
+target_compile_definitions(texture_track_range_mutant_no_clamp_tests PRIVATE KYTY_TRACKEDGE_MUTANT_NO_CLAMP=1)
+
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageManagerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
@@ -699,6 +706,9 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
+add_kyty_full_emulator_test(http2_abort_request_tests
+	"${KYTY_TESTS_DIR}/Http2AbortRequestTests.cpp")
+
 add_executable(rtc_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/RtcTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libRtc.cpp"
@@ -766,6 +776,13 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
+
+add_executable(guest_snprintf_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestSnprintfTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/guestPrintf.cpp"
+)
+target_link_libraries(guest_snprintf_tests common fmt::fmt)
+target_include_directories(guest_snprintf_tests PRIVATE ${inc_headers})
 
 add_executable(libc_stdio_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LibcStdioTests.cpp"
@@ -896,6 +913,10 @@ if(BUILD_TESTING)
 	add_test(NAME refresh_prof COMMAND $<TARGET_FILE:refresh_prof_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME texture_track_range COMMAND $<TARGET_FILE:texture_track_range_tests>)
+	add_test(NAME texture_track_range_mutant_no_clamp
+	         COMMAND $<TARGET_FILE:texture_track_range_mutant_no_clamp_tests>)
+	set_tests_properties(texture_track_range_mutant_no_clamp PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME driver_cache_policy COMMAND $<TARGET_FILE:driver_cache_policy_tests>)
 	add_test(NAME apr_preopen COMMAND $<TARGET_FILE:apr_preopen_tests>)
@@ -928,6 +949,7 @@ if(BUILD_TESTING)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
+	add_test(NAME guest_snprintf COMMAND $<TARGET_FILE:guest_snprintf_tests>)
 	add_test(NAME libc_stdio COMMAND $<TARGET_FILE:libc_stdio_tests>)
 	set_tests_properties(libc_stdio PROPERTIES TIMEOUT 60)
 	add_test(NAME libc_registration COMMAND $<TARGET_FILE:libc_registration_tests>)
@@ -948,6 +970,7 @@ if(BUILD_TESTING)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
+	add_test(NAME http2_abort_request COMMAND $<TARGET_FILE:http2_abort_request_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
 	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
@@ -1007,6 +1030,10 @@ if(BUILD_TESTING)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
+	if(WIN32)
+		add_test(NAME guest_stack_debug_print
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --guest-stack-debug-print-only)
+	endif()
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME command_scheduler_runtime
@@ -1038,6 +1065,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME srgb_texture
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
+	add_test(NAME resolve_inplace_new_context
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --resolve-inplace-only)
+	set_tests_properties(resolve_inplace_new_context PROPERTIES ENVIRONMENT KYTY_RESOLVE_INPLACE=1)
 	add_test(NAME msaa_storage
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME gpu_capture_replay
@@ -1127,6 +1157,7 @@ if(BUILD_TESTING)
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
+		guest_snprintf_tests
 		libc_stdio_tests
 		libc_registration_tests
 		shader_recompiler_compute_tests
@@ -1147,9 +1178,11 @@ if(BUILD_TESTING)
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		http2_abort_request_tests
 		rtc_tests
 		playgo_tests
 		vr_tracker2_tests
+		psml_tests
 	)
 endif()
 

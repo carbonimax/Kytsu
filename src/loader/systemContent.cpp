@@ -176,7 +176,9 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 
 	auto read_size = [](const nlohmann::ordered_json& object, const char* key, uint64_t* size,
 	                    uint64_t unit = 1) {
-		if (auto it = object.find(key); it != object.end()) {
+		// param.json is guest data: a string/bool/null throws a type_error and kills
+		// the emulator before the game is even loaded.
+		if (auto it = object.find(key); it != object.end() && it->is_number_unsigned()) {
 			*size = it->get<uint64_t>() * unit;
 		}
 	};

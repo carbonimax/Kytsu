@@ -696,6 +696,63 @@ void TestAddContent(const std::filesystem::path& root) {
             FileSystem::KernelClose(user_fd) == OK && unmount(&point) == OK,
         "user add-on replaces the detected folder of its label");
 
+  const auto app0 = root / "local-entitlement-game";
+  const auto section = [](const std::string& title, const std::string& entitlement,
+                          const std::string& status = "NO_EXTRA_DATA") {
+    return "[PSAL]\r\ncontent_id=UP0001-" + title + "_00-" + entitlement +
+           "\r\ndownload_status=" + status + "\r\n";
+  };
+  const auto local_label = label(70);
+  const auto valid = section("PPSA11111", local_label);
+  write(app0 / "dlc_emu.ini",
+        "; local entitlement fixture\n" + valid + valid + section("PPSA22222", label(71)) +
+            section("PPSA11111", label(72), "INSTALLED") + section("PPSA11111", "SHORT") +
+            section("PPSA11111", label(73)) + "service_label=1\n" +
+            section("PPSA11111", label(74)) + "download_status=NO_EXTRA_DATA\n" +
+            section("PPSA11111", label(75)) + "enabled=false\n" +
+            section("PPSA11111", label(77)) + "no equals sign\n" +
+            "[PSAC]\ncontent_id=UP0001-PPSA11111_00-" + label(76) +
+            "\ndownload_status=NO_EXTRA_DATA\n");
+  const auto local = Common::ReadLocalEntitlements(app0 / "dlc_emu.ini", "PPSA11111");
+  Check(local.size() == 1 && local[0].entitlement_label == local_label &&
+            local[0].mount_dir.empty(),
+        "dlc_emu.ini keeps one valid PSAL entry and rejects foreign, malformed and unknown ones");
+  Loader::AddContentLoad({}, {}, "PPSA11111", local);
+  Label local_query {};
+  std::memcpy(local_query.data, local_label.c_str(), 17);
+  Check(get(0, &local_query, &single) == OK && single.package_type == 3 &&
+            single.download_status == 0 && list(0, nullptr, 0, &count) == OK && count == 4 &&
+            mount(0, &local_query, &point) == static_cast<int>(0x80d90005u),
+        "dlc_emu.ini entry is a license-only add-on with nothing to mount");
+  const auto other_title = Common::ReadLocalEntitlements(app0 / "dlc_emu.ini", "PPSA22222");
+  Check(other_title.size() == 1 && other_title[0].entitlement_label == label(71) &&
+            Common::ReadLocalEntitlements(app0 / "missing" / "dlc_emu.ini", "PPSA11111").empty(),
+        "dlc_emu.ini sections apply only to their own title, and a missing file gives nothing");
+  write(app0 / "oversized" / "dlc_emu.ini", valid + std::string(65536, ' '));
+  Check(Common::ReadLocalEntitlements(app0 / "oversized" / "dlc_emu.ini", "PPSA11111").empty(),
+        "oversized dlc_emu.ini is rejected");
+  write(app0 / "installed" / "dlc_emu.ini", section("PPSA11111", label(0)));
+  const auto shadowed = Common::ReadLocalEntitlements(app0 / "installed" / "dlc_emu.ini",
+                                                      "PPSA11111");
+  Loader::AddContentLoad(folder, {}, "PPSA11111", shadowed);
+  Check(shadowed.size() == 1 && list(0, nullptr, 0, &count) == OK && count == 68 &&
+            mount(0, &info[3].label, &point) == OK && unmount(&point) == OK,
+        "installed add-on wins over a dlc_emu.ini entry with the same label");
+  Loader::AddContentLoad({}, {*licensed}, "PPSA11111",
+                         Common::ReadLocalEntitlements(app0 / "dlc_emu.ini", "PPSA11111"));
+  Check(list(0, nullptr, 0, &count) == OK && count == 5, "dlc_emu.ini adds to user add-ons");
+  const auto archived_game = root / "local-entitlement-game.zar";
+  const std::array<uint8_t, 1> archive_payload {0};
+  Check(ArchiveTests::CreateArchive(archived_game, archive_payload, valid),
+        "create archive containing a dlc_emu.ini");
+  const auto archived_app0 = Common::MakeArchivePath(archived_game);
+  Check(Common::ReadLocalEntitlements(archived_app0 / "dlc_emu.ini", "PPSA11111").size() == 1 &&
+            Common::ReadLocalEntitlements(Common::MakeArchivePath(root / "no-ini.zar") /
+                                              "dlc_emu.ini",
+                                          "PPSA11111")
+                .empty(),
+        "archive-backed app0 reads dlc_emu.ini the same way");
+
   Loader::AddContentLoad(folder / "missing", {}, "PPSA11111");
   Check(list(0, info.data(), 4, &count) == OK && count == 3,
         "missing add-ons folder retains GTA V entitlements");
@@ -2706,6 +2763,20 @@ void CheckSocketWakeup() {
   const int enabled = 1;
   Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
         "enable TCP_NODELAY");
+  int reuse_address = 0;
+  uint32_t reuse_address_size = sizeof(reuse_address);
+  Check(Net::Setsockopt(writer, 0xffff, 0x0004, &enabled, sizeof(enabled)) == 0 &&
+            Net::Getsockopt(writer, 0xffff, 0x0004, &reuse_address, &reuse_address_size) == 0 &&
+            reuse_address != 0,
+        "Net SO_REUSEADDR reaches the host socket");
+#if !defined(_WIN32)
+  int reuse_port = 0;
+  uint32_t reuse_port_size = sizeof(reuse_port);
+  Check(Net::Setsockopt(writer, 0xffff, 0x0200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Getsockopt(writer, 0xffff, 0x0200, &reuse_port, &reuse_port_size) == 0 &&
+            reuse_port != 0,
+        "Net SO_REUSEPORT reaches the host socket");
+#endif
   int socket_error = -1;
   uint32_t error_size = sizeof(socket_error);
   *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;

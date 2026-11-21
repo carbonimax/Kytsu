@@ -1,6 +1,7 @@
 #include "mainDialog.h"
 
 #include "cheatFile.h"
+#include "cmdCommand.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
@@ -47,7 +48,6 @@ class QWidget;
 
 #if defined(_WIN32)
 constexpr char  EMULATOR_EXE[] = "kyty_emulator.exe";
-constexpr char  CMD_EXE[]      = "cmd.exe";
 constexpr DWORD CMD_X_CHARS    = 175;
 constexpr DWORD CMD_Y_CHARS    = 1000;
 #else
@@ -437,21 +437,6 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 }
 #endif
 
-#if defined(_WIN32)
-// cmd /K arguments that keep the console open (with close_on_clean_exit, only after an error).
-// A quote is written as "" rather than \" so cmd's quote count stays even and operators inside
-// arguments stay quoted.
-static QString CmdCommand(const QString& interpreter, const QStringList& args,
-                          bool close_on_clean_exit) {
-	static const QRegularExpression quote_or_end(QStringLiteral(R"((\\*)("|\z))"));
-	// The UCRT reads 2n backslashes before a quote as n.
-	auto quoted = QStringList {interpreter} + args;
-	quoted.replaceInStrings(quote_or_end, QStringLiteral(R"(\1\1\2\2)"));
-	return QStringLiteral("/K \"\"") + quoted.join(QStringLiteral("\" \"")) +
-	       (close_on_clean_exit ? "\" && exit\"" : "\"\"");
-}
-#endif
-
 // A missing or malformed file only logs a warning: the game starts without presets.
 static void ApplyPresets(const Configuration& info, QProcessEnvironment& environment,
                          QStringList& args) {
@@ -477,14 +462,14 @@ static void ApplyPresets(const Configuration& info, QProcessEnvironment& environ
 	                  << (applied.isEmpty() ? QStringLiteral("(none)") : applied.join(' '));
 }
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
+bool MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
 	const auto& interpreter = m_p->GetInterpreter();
 
 	auto args = CreateEmulatorArgs(info);
 	if (args.isEmpty()) {
 		QMessageBox::critical(this, tr("Error"), tr("Invalid emulator configuration"));
 		QApplication::quit();
-		return;
+		return false;
 	}
 
 	// Presets come last so the dialog settings and the user's environment win.
@@ -493,7 +478,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	QString error;
 	if (!info.MacEnvironment(environment, error)) {
 		QMessageBox::critical(this, tr("Error"), error);
-		return;
+		return false;
 	}
 #endif
 	if (info.recommended_options) {
@@ -519,16 +504,25 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	}
 #elif defined(_WIN32)
 	// Use nativeArguments so Qt does not re-quote the /K command string.
-	process->setProgram(CMD_EXE);
+	process->setProgram(CmdProgram);
 	process->setArguments({});
-	process->setNativeArguments(
-	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
+	const auto launch = CmdCommand(QStringList {QDir::toNativeSeparators(interpreter)} + args,
+	                               close_terminal, environment);
+	if (!launch) {
+		QMessageBox::critical(this, tr("Error"),
+		                      tr("The emulator arguments are longer than %1 characters or contain a "
+		                         "NUL character; cmd.exe cannot pass them on")
+		                          .arg(CmdArgumentsLimit));
+		return false;
+	}
+	process->setProcessEnvironment(launch->environment);
+	process->setNativeArguments(launch->native_arguments);
 #endif
 #if defined(__APPLE__)
 	const auto runtime = Configuration::MacRuntimeDirectory();
 	if (!QDir().mkpath(runtime)) {
 		QMessageBox::critical(this, tr("Error"), tr("Cannot create runtime folder: %1").arg(runtime));
-		return;
+		return false;
 	}
 	process->setWorkingDirectory(runtime);
 #else
@@ -554,10 +548,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 		QMessageBox::critical(
 		    this, tr("Error"),
 		    tr("Failed to start:\n%1\n\n%2").arg(process->program(), process->errorString()));
-		return;
+		return true;
 	}
 #endif
 	process->waitForFinished(100);
+	return true;
 }
 
 void MainDialog::WriteSettings(QSettings& s) {
@@ -642,7 +637,13 @@ void MainDialogPrivate::Run(const QString& activity) {
 	        });
 	auto info             = m_ui->widget->CreateConfiguration(*item);
 	info->launch_activity = activity;
-	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
+	if (!m_main_dialog->RunInterpreter(process, *info, g_close_terminal)) {
+		if (item != nullptr) {
+			item->SetRunning(false);
+		}
+		m_running_games--;
+		process->deleteLater();
+	}
 
 	Update();
 }
