@@ -1118,6 +1118,10 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+uint64_t VirtualRangesGeneration() {
+	return g_vma_generation.load(std::memory_order_acquire);
+}
+
 bool IsVirtualAddressKnown(uint64_t vaddr) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
