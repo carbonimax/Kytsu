@@ -16,12 +16,15 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/recompiler/ir/passes/SelectForwarding.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <map>
 #include <span>
@@ -642,6 +645,15 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	return result;
 }
 
+// KYTY_EXEC_SELECT_FORWARD=0 skips ForwardGuardedSelects. Read once.
+static bool ExecSelectForwarding() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EXEC_SELECT_FORWARD");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
@@ -693,6 +705,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",
 			     StageName(ir.stage), ir.shader_hash, traced);
 		}
+	}
+	// After the ray query matcher, so that it sees the same IR with or without this pass.
+	if (ExecSelectForwarding()) {
+		IR::ForwardGuardedSelects(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
 	}
 
 	IR::CollectShaderInfo(ir, options.input_info, options.host_features.buffer_int64_atomics);
