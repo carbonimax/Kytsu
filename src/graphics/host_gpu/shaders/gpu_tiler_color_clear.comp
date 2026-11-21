@@ -37,8 +37,11 @@ void main() {
 		atomicOr(mismatch, 1u);
 	}
 	barrier();
-	const uint slot = key >> 5u;
-	const bool hit  = mismatch == 0u && (key & 0x1fu) == 0u && (params.keys & (1u << slot)) != 0u;
+	// PS5 register clears use 0x10 as well as 0x20: both select the register-clear slot.
+	const bool register_clear = key == 0x10u;
+	const uint slot           = register_clear ? 1u : key >> 5u;
+	const bool hit            = mismatch == 0u && ((key & 0x1fu) == 0u || register_clear) &&
+	                            (params.keys & (1u << slot)) != 0u;
 	if (gl_LocalInvocationIndex < Slots) {
 		predicates.data[slice * Slots + gl_LocalInvocationIndex] =
 		    uint(hit && slot == gl_LocalInvocationIndex);

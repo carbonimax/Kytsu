@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "common/onceValue.h"
 
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
@@ -136,10 +137,11 @@ bool Active() noexcept {
 } // namespace
 
 bool Enabled() noexcept {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_CP_SPLIT_PROF");
 		return PerfStats::Enabled() && value != nullptr && std::atoi(value) != 0;
-	}();
+	}));
 	return enabled;
 }
 

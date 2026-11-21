@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -140,9 +141,23 @@ public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
 		m_cpu_dirty.Fill();
+		for (auto& epoch: m_block_cpu_epoch) {
+			epoch.store(1, std::memory_order_relaxed); // an untracked region reads 0
+		}
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
+
+	// KYTY_BIND_MEMO: per 64 KiB block, advances (before the pages are unprotected) whenever one of
+	// its pages becomes CPU-modified. Unchanged since a synchronization left a range clean = the
+	// guest wrote none of its bytes since (pages already CPU-modified do not fault, so they do not
+	// advance it: callers only keep ranges that were clean).
+	static constexpr size_t DirtyBlockPages = std::max<size_t>(1, (64ull * 1024ull) / TRACKER_PAGE_SIZE);
+	static constexpr size_t DirtyBlocks     = TRACKER_REGION_PAGES / DirtyBlockPages;
+	[[nodiscard]] uint64_t BlockCpuEpoch(size_t block) const {
+		return m_block_cpu_epoch[block].load(std::memory_order_acquire);
+	}
+	[[nodiscard]] uint64_t RegionCpuEpoch() const { return m_region_cpu_epoch.load(std::memory_order_acquire); }
 
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
@@ -179,6 +194,16 @@ public:
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			if (!changed.None()) {
+				for (const auto [first, last]: changed) {
+					for (auto block = first / DirtyBlockPages; block <= (last - 1) / DirtyBlockPages; block++) {
+						m_block_cpu_epoch[block].fetch_add(1, std::memory_order_acq_rel);
+					}
+				}
+				m_region_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>(changed);
@@ -259,6 +284,8 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	std::array<std::atomic<uint32_t>, DirtyBlocks> m_block_cpu_epoch {};
+	std::atomic<uint64_t>                          m_region_cpu_epoch {1};
 };
 
 } // namespace Libs::Graphics

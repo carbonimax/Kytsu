@@ -95,10 +95,15 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// The ring that new per-draw stream copies go to (KYTY_STREAM_HOST_CACHED, bufferCache.cpp).
+	[[nodiscard]] StreamBuffer&                StreamRing() noexcept;
+	// KYTY_TC_LOCK_ORDER (GPU thread): the tick up to which ObtainBuffer(vaddr, size, true) would
+	// wait for priority operations (queued main-queue fault publications), or 0. Never blocks.
+	[[nodiscard]] uint64_t WritePublishTick(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
+			case MemoryUsage::Stream: return StreamRing();
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
 		}
@@ -157,6 +162,18 @@ public:
 	[[nodiscard]] uint64_t ColorMetadataEpoch() const {
 		return m_color_metadata_epoch.load(std::memory_order_relaxed);
 	}
+	// Advances whenever a buffer is registered or unregistered (GPU thread).
+	[[nodiscard]] uint64_t BufferSetEpoch() const noexcept { return m_buffer_set_epoch; }
+	// KYTY_BIND_MEMO: see MemoryTracker::CpuDirtyEpoch.
+	[[nodiscard]] uint64_t CpuDirtyEpoch(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.CpuDirtyEpoch(vaddr, size);
+	}
+	// KYTY_BIND_MEMO: a kept binding still counts as a use of its buffer (GC age).
+	void TouchBinding(const Buffer& buffer) { TouchBuffer(buffer); }
+	// KYTY_BIND_MEMO_STATS: synchronizations that uploaded CPU data, or that copied an image or
+	// went through imported memory (GPU thread).
+	[[nodiscard]] uint64_t SyncUploads() const noexcept { return m_sync_uploads; }
+	[[nodiscard]] uint64_t SyncOther() const noexcept { return m_sync_other; }
 	void               ProcessFaultBuffer();
 	// Synchronizes the queued BDA ranges that are mapped, with deferred uploads (see
 	// BeginDeferredUploads).
@@ -329,6 +346,9 @@ private:
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
+	uint64_t                                          m_buffer_set_epoch = 0;
+	uint64_t                                          m_sync_uploads     = 0;
+	uint64_t                                          m_sync_other       = 0;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	// KYTY_CP_PIPELINE: the GPU thread's program lookups test the ranges while the back thread runs.
@@ -344,6 +364,7 @@ private:
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::atomic<uint64_t>                             m_color_metadata_epoch {0};
+	// Leaf lock: taken under TextureCache::m_lock (WritePublishTick), never takes another lock.
 	std::mutex                                        m_pending_mutex;
 	std::vector<PendingPublish>                       m_pending_publishes;
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
@@ -377,7 +398,10 @@ private:
 	bool                                              m_reprotect_batch   = false;
 	std::mutex                                        m_deferred_mutex; // deferred protections + copies
 	std::vector<DeferredCopy>                         m_deferred_copies;
+	const bool                                        m_stream_host_cached;
 	StreamBuffer                                      m_stream_buffer;
+	// KYTY_AB_FLAG=stream_host_cached: a ring in the default memory for the forced-off arm.
+	std::unique_ptr<StreamBuffer>                     m_stream_default;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

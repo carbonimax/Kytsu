@@ -308,6 +308,50 @@ void TestRangeSet() {
         "range set subtraction did not preserve both exact tails");
 }
 
+void TestRangeSetMergesMatchReference() {
+  constexpr uint64_t Units = 512;
+  constexpr uint64_t Base = 0x40000;
+  RangeSet ranges;
+  std::vector<bool> reference(Units, false);
+  uint64_t state = 0x2545f4914f6cdd1dull;
+  const auto next = [&state] {
+    state ^= state << 13u;
+    state ^= state >> 7u;
+    state ^= state << 17u;
+    return state;
+  };
+  for (int step = 0; step < 20000; step++) {
+    const uint64_t begin = next() % Units;
+    const uint64_t size = 1 + next() % std::min<uint64_t>(24, Units - begin);
+    const bool add = next() % 4 != 0;
+    if (add) {
+      ranges.Add(Base + begin, size);
+    } else {
+      ranges.Subtract(Base + begin, size);
+    }
+    for (uint64_t unit = begin; unit < begin + size; unit++) {
+      reference[unit] = add;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> expected;
+    for (uint64_t unit = 0; unit < Units; unit++) {
+      if (!reference[unit]) {
+        continue;
+      }
+      if (!expected.empty() && expected.back().second == Base + unit) {
+        expected.back().second++;
+      } else {
+        expected.emplace_back(Base + unit, Base + unit + 1);
+      }
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> actual;
+    ranges.ForEach([&](uint64_t start, uint64_t end) {
+      actual.emplace_back(start, end);
+    });
+    Check(actual == expected,
+          "range set add/subtract did not match the coalesced reference");
+  }
+}
+
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
@@ -406,6 +450,36 @@ void TestCpuDirtyUpload() {
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "explicit CPU dirtiness did not release write protection");
   tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  Release(memory);
+}
+
+// KYTY_BIND_MEMO: the CPU-dirty epoch of a range moves when one of its pages becomes CPU-modified,
+// and not for pages already CPU-modified or in another 64 KiB block.
+void TestCpuDirtyEpoch() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto block_pages = Libs::Graphics::RegionManager::DirtyBlockPages;
+  auto *memory = Allocate(block_pages * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto other = address + block_pages * page_size;
+  Check(tracker.CpuDirtyEpoch(address, page_size) == 0, "untracked range has an epoch");
+  tracker.ForEachUploadRange(
+      address, block_pages * 2 * page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto clean = tracker.CpuDirtyEpoch(address, page_size);
+  Check(clean != 0, "tracked range has no epoch");
+  tracker.MarkRegionAsCpuModified(other, page_size);
+  Check(tracker.CpuDirtyEpoch(address, page_size) == clean,
+        "a write in another block moved the epoch");
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  const auto dirty = tracker.CpuDirtyEpoch(address, page_size);
+  Check(dirty != clean, "a page turning CPU-modified did not move the epoch");
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  Check(tracker.CpuDirtyEpoch(address, page_size) == dirty,
+        "an already CPU-modified page moved the epoch");
+  Check(tracker.CpuDirtyEpoch(address, block_pages * 2 * page_size) != 0, "two-block range has no epoch");
+  tracker.MarkRegionAsCpuModified(address, block_pages * 2 * page_size);
   Release(memory);
 }
 
@@ -1513,9 +1587,11 @@ int main(int argc, char **argv) {
 #endif
   TestGuestRange();
   TestRangeSet();
+  TestRangeSetMergesMatchReference();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuDirtyEpoch();
   TestCpuDirtyHook();
   TestUploadWithoutDeferral();
   TestCleanUploadPreservesOwnership();

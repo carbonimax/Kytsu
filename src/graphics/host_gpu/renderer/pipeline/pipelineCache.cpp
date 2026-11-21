@@ -29,6 +29,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <deque>
 #include <array>
 #include <atomic>
@@ -518,6 +519,8 @@ struct PipelineCache::ProgramCache {
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (diag_log) diag_module_us = PerfStats::SteadyUs() - module_begin;
+		SetVulkanObjectNameF(graphics.device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
+		                     options.shader_hash);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -1427,7 +1430,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
         }
         SetPipelineCreationQuiet(false);
 	};
-	const auto               workers = std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
+	// Several threads compiling pipelines at once trips a crash inside NVIDIA's
+	// libnvidia-glvkspirv, so that driver warms up serially.
+	const auto workers = m_graphics.physical_device_properties.vendorID == 0x10DEu
+	                         ? 1u
+	                         : std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
 	std::vector<std::thread> threads;
 	for (uint32_t i = 1; i < workers && i < jobs.size(); i++) {
 		threads.emplace_back(work);
@@ -2252,6 +2259,42 @@ bool PipelineCache::MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig
 }
 #undef KYTY_KEY_CHECK
 
+// shortcut: measurement only (KYTY_PERF_STATS=1), no behaviour change; remove once the
+// SPI_PS_INPUT_CNTL DEFAULT_VAL rule is decided. For each new pipeline, counts the pixel inputs
+// the hardware fills with DEFAULT_VAL (OFFSET bit 5 set, or no export at OFFSET in the last
+// vertex stage) where we read something else: the VS parameter at OFFSET & 0x1f, or an
+// unwritten location while DEFAULT_VAL is not 0,0,0,0.
+static void CountPixelInputDefaults(const ShaderVertexInputInfo& last_stage,
+                                    const ShaderPixelInputInfo&  pixel) {
+	if (!PerfStats::Enabled() || last_stage.stage.program == nullptr ||
+	    pixel.stage.program == nullptr || pixel.parameter_mode == ShaderPixelParameterMode::Rectangle) {
+		return;
+	}
+	static std::atomic<uint64_t> pipelines {0}, hit_pipelines {0};
+	const auto exports = last_stage.stage.program->param_export_mask;
+	uint32_t read_vs = 0, read_unwritten = 0, custom = 0;
+	for (uint32_t input = 0; input < pixel.input_num && input < 32u; input++) {
+		const auto setting  = pixel.interpolator_settings[input];
+		const bool exported = ((exports >> (setting & 0x1fu)) & 1u) != 0;
+		if ((setting & 0x20u) == 0 && exported) continue;
+		if (!exported && ((setting >> 8u) & 3u) == 0) continue;
+		(exported ? read_vs : read_unwritten)++;
+		custom += (pixel.custom_interpolation_mask >> input) & 1u;
+	}
+	const auto seen = ++pipelines;
+	const auto hits = read_vs + read_unwritten != 0 ? ++hit_pipelines : hit_pipelines.load();
+	if (read_vs + read_unwritten != 0) {
+		std::printf("PERF arifix-s3 vs=0x%016" PRIx64 " ps=0x%016" PRIx64
+		            " inputs=%u read_vs=%u read_unwritten=%u custom=%u exports=0x%08x\n",
+		            last_stage.stage.program->shader_hash, pixel.stage.program->shader_hash,
+		            read_vs + read_unwritten, read_vs, read_unwritten, custom, exports);
+	}
+	if (std::has_single_bit(seen)) {
+		std::printf("PERF arifix-s3-seen pipelines=%" PRIu64 " hit_pipelines=%" PRIu64 "\n", seen,
+		            hits);
+	}
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
                                                             std::span<const RenderColorInfo> colors,
@@ -2296,6 +2339,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 	if (ps_active) {
 		LoadStoredModule(ps_input_info.stage.module);
+		CountPixelInputDefaults(vertex_info.back(), ps_input_info);
 	}
 
 	if (graphics_debug_dump_enabled()) {

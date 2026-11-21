@@ -1879,6 +1879,46 @@ void CheckAprPaths(const std::filesystem::path &root) {
             reinterpret_cast<Size>(size_symbol->vaddr)(0xfffffffeu, &cached_size) != OK,
         "APR resolves a directory and reports sizes only for known IDs");
 
+  const auto create_marker_file = [&](const char *name, const char *data) {
+    Check(fixture.Create(root / name), "create marked APR fixture");
+    fixture.Write(data, static_cast<uint32_t>(std::strlen(data)));
+    fixture.Close();
+  };
+  create_marker_file("content.pak.sndr", "APR");
+  create_marker_file("content.pak.emf", "wrong container");
+  create_marker_file("engine.ucas.emf", "engine");
+  create_marker_file("exact.pak", "exact");
+  create_marker_file("exact.pak.sndr", "wrong");
+  Check(std::filesystem::create_directory(root / "directory.pak.sndr"),
+        "create directory with an APR marker suffix");
+  const char *marked_paths[] = {"content.pak", "engine.ucas", "exact.pak",
+                                "directory.pak", "absent.ucas"};
+  std::array<uint32_t, 5> marked_ids{};
+  std::array<uint64_t, 5> marked_sizes{};
+  std::array<int, 5> marked_results{};
+  Check(resolve_each("/app0/", marked_paths, 5, marked_ids.data(),
+                     marked_sizes.data(), marked_results.data()) == 3 &&
+            marked_results[0] == OK && marked_sizes[0] == 3 &&
+            marked_results[1] == OK && marked_sizes[1] == 6 &&
+            marked_results[2] == OK && marked_sizes[2] == 5 &&
+            marked_results[3] == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            marked_results[4] == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "APR resolves marker files in order, prefers exact paths, and rejects "
+        "directories");
+  FileSystem::FileStat marked_stat{};
+  uint64_t marked_size = 0;
+  Check(reinterpret_cast<Stat>(stat_symbol->vaddr)(marked_ids[1],
+                                                   &marked_stat) == OK &&
+            reinterpret_cast<Size>(size_symbol->vaddr)(marked_ids[1],
+                                                       &marked_size) == OK &&
+            marked_stat.st_size == 6 && marked_size == 6,
+        "APR marker IDs retain the backing path for stat and size");
+  uint32_t repeated_id = 0;
+  Check(resolve("/app0/", marked_paths, 1, &repeated_id, &marked_size,
+                &error_index) == OK &&
+            repeated_id == marked_ids[0] && marked_size == 3,
+        "APR caches the resolved marker ID and size");
+
   // PATH_MAX includes NUL; all components remain below NAME_MAX (255).
   std::string longest = "/app0/";
   for (int i = 0; i < 3; ++i) {
@@ -2110,6 +2150,73 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
         "close UDP truncation fixture");
 }
 #endif
+
+void CheckGuestUdpLobbySocket() {
+  namespace Net = Libs::Network::Net;
+  Loader::SymbolDatabase symbols;
+  Libs::LibNet::InitNet_1_Net(&symbols);
+  const auto* send_symbol = symbols.Find({"gvD1greCu0A", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto* recv_symbol = symbols.Find({"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto* errno_symbol = symbols.Find({"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  Check(send_symbol && recv_symbol && errno_symbol, "UDP guest exports resolve");
+  using SendTo = int (KYTY_SYSV_ABI *)(int, const void*, size_t, int, const void*, uint32_t);
+  using RecvFrom = int (KYTY_SYSV_ABI *)(int, void*, size_t, int, void*, uint32_t*);
+  using Errno = int* (KYTY_SYSV_ABI *)();
+  const auto send_to = reinterpret_cast<SendTo>(send_symbol->vaddr);
+  const auto recv_from = reinterpret_cast<RecvFrom>(recv_symbol->vaddr);
+  auto* net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
+  const int socket = Net::Socket(2, 2, 0);
+  Check(socket >= 0, "create local lobby UDP socket");
+#if defined(_WIN32)
+  const int broadcast = 1;
+  int actual_broadcast = 0;
+  uint32_t broadcast_size = sizeof(actual_broadcast);
+  Check(Net::Setsockopt(socket, 0xffff, 0x10000, &broadcast, sizeof(broadcast)) == 0 &&
+        Net::Getsockopt(socket, 0xffff, 0x10000, &actual_broadcast, &broadcast_size) == 0 &&
+        actual_broadcast != 0, "enable guest all-ones broadcast route");
+#endif
+  for (const int option : {0x1105, 0x1106}) {
+    const int timeout = 200000;
+    int actual = -1;
+    uint32_t size = sizeof(actual);
+    Check(Net::Setsockopt(socket, 0xffff, option, &timeout, sizeof(timeout)) == 0 &&
+          Net::Getsockopt(socket, 0xffff, option, &actual, &size) == 0 && actual == timeout,
+          "guest microsecond socket timeout round trips");
+    Check(Net::Setsockopt(socket, 0xffff, option, &timeout, 1) == -1,
+          "short guest timeout is rejected");
+#if defined(_WIN32)
+    const int short_timeout = 1;
+    Check(Net::Setsockopt(socket, 0xffff, option, &short_timeout, sizeof(short_timeout)) == 0 &&
+          Net::Getsockopt(socket, 0xffff, option, &actual, &size) == 0 && actual == 1000,
+          "sub-millisecond timeout rounds up rather than waiting forever");
+    Check(Net::Setsockopt(socket, 0xffff, option, &timeout, sizeof(timeout)) == 0,
+          "restore bounded timeout");
+#endif
+  }
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  uint32_t size = address.size();
+  Check(Net::Bind(socket, address.data(), size) == 0 &&
+        Net::Getsockname(socket, address.data(), &size) == 0, "bind lobby to local ephemeral port");
+  const char packet[] = "local-player-handshake";
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(send_to(socket, packet, sizeof(packet), 0, address.data(), size) == sizeof(packet),
+        "guest UDP send reaches the same local lobby socket");
+  char received[sizeof(packet)] {};
+  std::array<uint8_t, 16> peer {};
+  uint32_t peer_size = peer.size();
+  Check(recv_from(socket, received, sizeof(received), 0, peer.data(), &peer_size) == sizeof(packet) &&
+        std::memcmp(packet, received, sizeof(packet)) == 0 && peer == address &&
+        *net_errno == Libs::Posix::POSIX_EINVAL,
+        "guest UDP receive preserves payload, source address and success errno");
+  const int enabled = 1;
+  Check(Net::Setsockopt(socket, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+        recv_from(socket, received, sizeof(received), 0, nullptr, nullptr) == Libs::Network::NET_ERROR_EWOULDBLOCK &&
+        *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+        "empty nonblocking guest UDP receive reports would-block");
+  Check(send_to(-1, packet, sizeof(packet), 0, address.data(), size) == Libs::Network::NET_ERROR_EBADF,
+        "guest UDP send translates invalid descriptor");
+  Check(Net::SocketClose(socket) == 0, "close lobby fixture");
+}
 
 #if defined(__linux__)
 void KYTY_SYSV_ABI RecordNetCtlEvent(int event, void* arg) {
@@ -2855,6 +2962,96 @@ void CheckSocketWakeup() {
 
 } // namespace
 
+static void TestUnrealScreenPercentage() {
+  namespace FileSystem = Libs::LibKernel::FileSystem;
+  Check(FileSystem::AppendUnrealScreenPercentage(
+            "../../../Sample/Sample.uproject -async", 50) ==
+            "../../../Sample/Sample.uproject -async "
+            "-ini:Engine:[SystemSettings]:r.ScreenPercentage=50 "
+            "-dpcvars=r.ScreenPercentage=50",
+        "Unreal command line gains r.ScreenPercentage");
+  Check(FileSystem::AppendUnrealScreenPercentage(
+            std::string("-project=a.uproject\r\n\0", 22), 75) ==
+            "-project=a.uproject "
+            "-ini:Engine:[SystemSettings]:r.ScreenPercentage=75 "
+            "-dpcvars=r.ScreenPercentage=75",
+        "Unreal command line drops trailing line ends and NULs");
+  Check(FileSystem::AppendUnrealScreenPercentage("", 10) ==
+            " -ini:Engine:[SystemSettings]:r.ScreenPercentage=10 "
+            "-dpcvars=r.ScreenPercentage=10",
+        "empty Unreal command line");
+  Check(
+      FileSystem::IsUnrealCommandLinePath("/app0/ue4commandline.txt") &&
+          FileSystem::IsUnrealCommandLinePath("/app0/UECommandLine.txt") &&
+          !FileSystem::IsUnrealCommandLinePath("/app0/othercommandline.txt") &&
+          !FileSystem::IsUnrealCommandLinePath(
+              "/app0/data/ue4commandline.txt") &&
+          !FileSystem::IsUnrealCommandLinePath("/savedata0/uecommandline.txt"),
+      "only the two Unreal command line paths match");
+}
+
+static void WriteFixture(const std::filesystem::path &path,
+                         const std::string &text) {
+  Common::File file;
+  Check(file.Create(path), "create fixture file");
+  file.Write(text.data(), static_cast<uint32_t>(text.size()));
+  file.Close();
+}
+
+static std::string ReadGuestFile(const char *path) {
+  const int fd = FileSystem::KernelOpen(path, 0, 0);
+  if (fd < 0) {
+    return "<open failed>";
+  }
+  FileSystem::FileStat stat{};
+  std::string text(4096, '\0');
+  const auto read = FileSystem::KernelRead(fd, text.data(), text.size());
+  Check(FileSystem::KernelFstat(fd, &stat) == OK && read >= 0 &&
+            stat.st_size == read,
+        "fstat reports the size read");
+  Check(FileSystem::KernelClose(fd) == OK, "close command line file");
+  text.resize(read >= 0 ? static_cast<size_t>(read) : 0);
+  return text;
+}
+
+static void CheckUnrealCommandLine(const std::filesystem::path &root) {
+  const auto folder = root / "unreal";
+  Check(std::filesystem::create_directory(folder),
+        "create Unreal fixture directory");
+  const std::string original = "../../../Sample/Sample.uproject -async\r\n";
+  WriteFixture(folder / "ue4commandline.txt", original);
+  WriteFixture(folder / "othercommandline.txt", "-other\n");
+  const auto served = FileSystem::AppendUnrealScreenPercentage(original, 50);
+
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::Silent;
+  options.unreal_screen_percentage = 50;
+  Config::Load(options);
+  FileSystem::Mount(folder, "/app0");
+  Check(ReadGuestFile("/app0/ue4commandline.txt") == served,
+        "Unreal command line served with r.ScreenPercentage");
+  Check(ReadGuestFile("/app0/UE4CommandLine.txt") == served,
+        "Unreal command line matched in any case");
+  Check(ReadGuestFile("/app0/othercommandline.txt") == "-other\n",
+        "other command line files are served as they are");
+  FileSystem::FileStat stat{};
+  Check(FileSystem::KernelStat("/app0/ue4commandline.txt", &stat) == OK &&
+            stat.st_size == static_cast<int64_t>(served.size()),
+        "stat reports the served command line size");
+  Check(FileSystem::KernelOpen("/app0/uecommandline.txt", 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "a missing Unreal command line stays missing");
+  Check(FileSystem::KernelOpen("/app0/ue4commandline.txt", 0x0400, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EACCES,
+        "a read-only truncating open is still refused");
+
+  options.unreal_screen_percentage = 0;
+  Config::Load(options);
+  Check(ReadGuestFile("/app0/ue4commandline.txt") == original,
+        "without the option the command line is left alone");
+  FileSystem::Umount("/app0");
+}
+
 int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
@@ -2875,6 +3072,17 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (argc == 2 && std::string_view(argv[1]) == "--apr-only") {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    CheckAprPaths(temporary.Path());
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: APR cases passed\n");
+    return 0;
+  }
+
+  TestUnrealScreenPercentage();
   TestMutexHandoff();
   TestStaticRwlockDestroy();
   TestPendingSignalDispatch();
@@ -2908,6 +3116,7 @@ int main(int argc, char** argv) {
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
+  CheckUnrealCommandLine(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestStatTimes();
@@ -2918,6 +3127,7 @@ int main(int argc, char** argv) {
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   CheckSocketWakeup();
+  CheckGuestUdpLobbySocket();
   FileSystem::Shutdown();
   CheckEtherAddressFormatting();
 #if defined(__linux__)

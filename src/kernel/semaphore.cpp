@@ -81,6 +81,7 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 	while (m_status != Status::Set) {
 		m_mutex.Unlock();
 		Common::Thread::SleepMicro(10);
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
 		m_mutex.Lock();
 	}
 
@@ -97,6 +98,7 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 	while (!m_waiting_threads.empty()) {
 		m_mutex.Unlock();
 		Common::Thread::SleepMicro(10);
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
 		m_mutex.Lock();
 	}
 }

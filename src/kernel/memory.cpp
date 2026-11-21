@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -177,6 +178,7 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static callback_func_t       g_test_before_backing_map   = nullptr;
 static callback_func_t       g_test_backing_read         = nullptr;
+static int                   g_test_sparse_copy_cache_mode = -1; // -1 = KYTY_SPARSE_COPY_CACHE
 static uint64_t              g_test_backing_bytes_zeroed = 0;
 static std::atomic<uint64_t> g_test_free_range_visits {0};
 static int                   g_test_vma_memo_mode = -1; // -1 = KYTY_VMA_MEMO
@@ -255,16 +257,18 @@ static int VmaMemoMode() {
 		return g_test_vma_memo_mode;
 	}
 #endif
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_VMA_MEMO");
 		const int   m = value == nullptr ? 1 : static_cast<int>(std::strtol(value, nullptr, 10));
-		if (value != nullptr) {
-			std::printf("KYTY_VMA_MEMO=%d: per-thread range lookup memo %s\n", m,
-			            m != 0 ? "on" : "off");
+		// Two threads may make the first call at once: the flag keeps the log line single.
+		static std::atomic<bool> logged {false};
+		if (value != nullptr && !logged.exchange(true)) {
+			std::printf("KYTY_VMA_MEMO=%d: per-thread range lookup memo %s\n", m, m != 0 ? "on" : "off");
 			std::fflush(stdout);
 		}
 		return m;
-	}();
+	}));
 	return mode;
 }
 
@@ -361,18 +365,6 @@ public:
 			return false;
 		}
 		*out = *overlap;
-		return true;
-	}
-
-	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-		Edited();
-
-		auto position = m_ranges.find(start);
-		if (position != m_ranges.end() && position->second.size == size &&
-		    IsReservedRangeType(position->second.type)) {
-			EraseUnlocked(position);
-		}
 		return true;
 	}
 
@@ -589,10 +581,11 @@ private:
 
 	static int MemoMode() {
 		// The flag name is compared once, so both A/B arms pay the same per-lookup cost.
-		static const bool driven = [] {
+		static std::atomic<int64_t> driven_once {Common::OnceUnset};
+		const auto driven = static_cast<bool>(Common::Once(driven_once, [] {
 			const char* flag = std::getenv("KYTY_AB_FLAG");
 			return flag != nullptr && std::strcmp(flag, "vma_memo") == 0;
-		}();
+		}));
 		const int mode = VmaMemoMode();
 		return mode != 0 && driven && Libs::Graphics::PerfStats::AbArmOff() ? 0 : mode;
 	}
@@ -1129,6 +1122,10 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+uint64_t VirtualRangesGeneration() {
+	return g_vma_generation.load(std::memory_order_acquire);
+}
+
 bool IsVirtualAddressKnown(uint64_t vaddr) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
@@ -1231,6 +1228,21 @@ bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->CopySparseMemory<true>(vaddr, data, size);
+}
+
+SparseCopyStats GetSparseCopyStats() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetSparseCopyStats() : SparseCopyStats {};
+}
+
+void ReportSparseCopyCache() {
+	const auto s = GetSparseCopyStats();
+	if (s.mode == 0) {
+		return;
+	}
+	// Totals since start, so the last line covers the whole session.
+	std::printf("PERF sparsecopy total: mode=%d checked=%" PRIu64 " locked=%" PRIu64 " stale_bytes=%" PRIu64
+	            " stale_maps=%" PRIu64 " bumps_maps=%" PRIu64 " bumps_bytes=%" PRIu64 "\n",
+	            s.mode, s.checked, s.locked, s.stale_bytes, s.stale_maps, s.map_bumps, s.byte_bumps);
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {
@@ -2204,6 +2216,23 @@ static void UnmapGpuRanges(const std::vector<VirtualRanges::Range>& ranges) {
 	}
 }
 
+// A span can hold pages unmapped earlier: its tracked fragments, when there is at least one and
+// every hole between them is free guest address space (an untracked address is not a mapping).
+static bool QueryTrackedFragmentsAroundFreeHoles(uint64_t vaddr, uint64_t len,
+                                                 std::vector<VirtualRanges::Range>* ranges) {
+	if (g_virtual_ranges->QueryFragments(vaddr, len, ranges) == 0) {
+		return false;
+	}
+	auto current = vaddr;
+	for (const auto& range: *ranges) {
+		if (range.start > current && !g_guest_address_space->ContainsFree(current, range.start - current)) {
+			return false;
+		}
+		current = range.start + range.size;
+	}
+	return current == vaddr + len || g_guest_address_space->ContainsFree(current, vaddr + len - current);
+}
+
 // The ABI entry point and batch operations hold g_memory_operation_mutex.
 static int UnmapMemory(uint64_t vaddr, size_t len) {
 	LOGF("\t start = 0x%016" PRIx64 "\n"
@@ -2216,7 +2245,8 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 	}
 	len = (len + page_size - 1) & ~(page_size - 1);
 	std::vector<VirtualRanges::Range> ranges;
-	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
+	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges) &&
+	    !QueryTrackedFragmentsAroundFreeHoles(vaddr, len, &ranges)) {
 		return KERNEL_ERROR_EACCES;
 	}
 	UnmapGpuRanges(ranges);
@@ -2554,6 +2584,23 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
+// A fixed map of exactly the live direct range (same offset, protection and type, still a view of
+// the backing at that offset) changes nothing: skip the teardown and rebuild and its fault window.
+static bool FixedMapMatchesExistingRange(uint64_t vaddr, uint64_t size, int64_t phys_offset,
+                                         int prot, int type) {
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(vaddr, size, &ranges) || ranges.size() != 1) {
+		return false;
+	}
+	const auto& r              = ranges.front();
+	uint64_t    backing_offset = 0;
+	return r.type == VirtualRangeType::Direct && r.start == vaddr && r.size == size &&
+	       r.offset == static_cast<uint64_t>(phys_offset) && r.protection == prot &&
+	       (type == -1 || r.memory_type == type) &&
+	       g_guest_address_space->BackingOffsetOf(vaddr, size, &backing_offset) &&
+	       backing_offset == static_cast<uint64_t>(phys_offset);
+}
+
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
                            int64_t direct_memory_start, size_t alignment, const char* name,
@@ -2606,6 +2653,11 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		}
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
+		}
+
+		if (FixedMapMatchesExistingRange(in_addr, len, direct_memory_start, prot, type)) {
+			*addr = reinterpret_cast<void*>(in_addr);
+			return OK;
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -2895,6 +2947,10 @@ void TestBeforeNextBackingMap(callback_func_t callback) {
 
 void TestSetBackingReadCallback(callback_func_t callback) {
 	g_test_backing_read = callback;
+}
+
+void TestSetSparseCopyCacheMode(int mode) {
+	g_test_sparse_copy_cache_mode = mode;
 }
 
 void TestSetVmaMemoMode(int mode) {
