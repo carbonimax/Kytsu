@@ -9249,36 +9249,62 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
 }
 
 void TestLoopPhiBufferAtomicIAdd32() {
+  // Stepped: one V# that the loop advances by an immediate goes through BDA.
+  // RuntimeStep (advanced by a lane value) and NoLoop (a V# word computed
+  // from a lane value, no Phi) keep main's fatal rule for writes.
+  enum class Variant { Stepped, RuntimeStep, NoLoop };
+  const auto build = [](Fixture &fixture, Variant variant) {
+    auto *entry = fixture.block;
+    auto *loop = fixture.AddBlock();
+    entry->AddBranch(loop);
+    loop->AddBranch(loop);
+    std::array<Value, 4> words;
+    if (variant == Variant::NoLoop) {
+      for (uint32_t word = 0; word < 4u; ++word)
+        words[word] = fixture.UserData(word);
+      words[0] = fixture.Emit(ValueOpcode::IAdd32,
+                              {words[0], fixture.Emit(ValueOpcode::LaneId)});
+    } else {
+      std::array<Inst *, 4> phis{};
+      for (uint32_t word = 0; word < 4u; ++word) {
+        phis[word] = &loop->AppendNewInst(ValueOpcode::Phi, {},
+                                          static_cast<uint64_t>(Type::U32));
+      }
+      const auto lane = fixture.Emit(ValueOpcode::LaneId, {}, 0, loop);
+      for (uint32_t word = 0; word < 4u; ++word) {
+        const auto step = variant == Variant::RuntimeStep && word == 0u
+                              ? lane
+                              : Value(word == 0u ? 1u : 0u);
+        const auto next = fixture.Emit(ValueOpcode::IAdd32,
+                                       {Value(phis[word]), step}, 0, loop);
+        phis[word]->AddPhiOperand(entry, fixture.UserData(word));
+        phis[word]->AddPhiOperand(loop, next);
+        words[word] = Value(phis[word]);
+      }
+    }
+    const auto handle =
+        fixture.Emit(ValueOpcode::GetBufferResource,
+                     {words[0], words[1], words[2], words[3]},
+                     MemoryFlags{0, 0x980}, loop);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
+                 {handle, Value(0u), Value(0u), Value(1u), Value(0u),
+                  Value(true)},
+                 fixture.AddMemory(memory, 0x980), loop);
+  };
   Fixture fixture;
-  auto *entry = fixture.block;
-  auto *loop = fixture.AddBlock();
-  entry->AddBranch(loop);
-  loop->AddBranch(loop);
-  std::array<Inst *, 4> phis{};
-  for (uint32_t word = 0; word < 4u; ++word) {
-    phis[word] = &loop->AppendNewInst(ValueOpcode::Phi, {},
-                                      static_cast<uint64_t>(Type::U32));
-  }
-  for (uint32_t word = 0; word < 4u; ++word) {
-    const auto next = fixture.Emit(
-        ValueOpcode::IAdd32,
-        {Value(phis[word]), Value(word == 0u ? 1u : 0u)}, 0, loop);
-    phis[word]->AddPhiOperand(entry, fixture.UserData(word));
-    phis[word]->AddPhiOperand(loop, next);
-  }
-  const auto handle = fixture.Emit(
-      ValueOpcode::GetBufferResource,
-      {Value(phis[0]), Value(phis[1]), Value(phis[2]), Value(phis[3])},
-      MemoryFlags{0, 0x980}, loop);
-  MemoryInfo memory;
-  memory.kind = ResourceKind::Buffer;
-  fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
-               {handle, Value(0u), Value(0u), Value(1u), Value(0u),
-                Value(true)},
-               fixture.AddMemory(memory, 0x980), loop);
+  build(fixture, Variant::Stepped);
   fixture.PlanAndTrack();
   Check(fixture.program.memory_info[0].kind == ResourceKind::IndirectBuffer,
         "loop-Phi BufferAtomicIAdd32 was not planned as an indirect buffer");
+  for (const auto variant : {Variant::RuntimeStep, Variant::NoLoop}) {
+    Fixture invalid;
+    build(invalid, variant);
+    CheckFatal([&] { invalid.PlanAndTrack(); },
+               "pc=0x00000980 buffer descriptor is not a valid runtime value",
+               "an atomic on a V# no loop steps by an immediate went through BDA");
+  }
 }
 
 void TestInvariantLoopPhi() {

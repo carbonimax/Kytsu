@@ -4539,6 +4539,33 @@ private:
 		return bound->source;
 	}
 
+	// True when each V# word's Phi web holds exactly one definition, the other non-Phi members
+	// being IAdd32 of a web Phi and an immediate, and at least one word takes such a step: one V#
+	// advanced by a loop. A web that merges two definitions, or a V# with no loop step, is not.
+	static bool IsLoopSteppedDescriptor(const Inst& handle) {
+		bool stepped = false;
+		for (uint32_t word = 0; word < 4u; ++word) {
+			const auto web   = PhiWeb(handle.Arg(word));
+			uint32_t   roots = 0;
+			for (const auto node: web) {
+				const auto* inst = node.TryInstruction();
+				if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) continue;
+				const auto in_web = [&](uint32_t arg) {
+					const auto* phi = inst->Arg(arg).Resolve().TryInstruction();
+					return phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
+					       std::ranges::find(web, inst->Arg(arg).Resolve()) != web.end();
+				};
+				const bool step = inst != nullptr && inst->GetOpcode() == ValueOpcode::IAdd32 &&
+				                  ((in_web(0) && inst->Arg(1).Resolve().IsImmediate()) ||
+				                   (in_web(1) && inst->Arg(0).Resolve().IsImmediate()));
+				stepped |= step;
+				roots += step ? 0u : 1u;
+			}
+			if (roots != 1u) return false;
+		}
+		return stepped;
+	}
+
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -4731,13 +4758,15 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				// A write first takes the one bound buffer its V# Phi web carries; only without one
-				// does a GPU-selected atomic go through BDA like the indirect loads.
+				// A write first takes the one bound buffer its V# Phi web carries. Without one, only an
+				// atomic on one V# that a loop steps goes through BDA like the indirect loads; any
+				// other write stays fatal (its address is ambiguous).
 				source = buffer != BufferAccess::Read ? CarriedBufferSource(*handle) : UINT32_MAX;
 				if (source == UINT32_MAX &&
 				    memory.kind == (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                       : ResourceKind::Buffer) &&
-				    memory.SupportsIndirectBufferLoad(op)) {
+				    memory.SupportsIndirectBufferLoad(op) &&
+				    (buffer == BufferAccess::Read || IsLoopSteppedDescriptor(*handle))) {
 					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 					return;
 				}
