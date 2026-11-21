@@ -56037,7 +56037,7 @@ TessellationStage CompileTessellationStage(const char *name, const std::vector<u
                                            ShaderType stage,
                                            const ShaderTessellationInputInfo &tess) {
   using namespace ShaderRecompiler;
-  ShaderVertexInputInfo vertex;
+  ShaderVertexInputInfo vertex{};
   vertex.logical_stage = stage;
   vertex.tess = tess;
   CompileOptions options;
@@ -56064,7 +56064,7 @@ TessellationStage CompileTessellationStage(const char *name, const std::vector<u
 }
 
 std::vector<u32> TessellationStageKey(ShaderType stage, const ShaderTessellationInputInfo &tess) {
-  ShaderVertexInputInfo vertex;
+  ShaderVertexInputInfo vertex{};
   vertex.logical_stage = stage;
   vertex.tess = tess;
   std::vector<u32> key;
@@ -56655,7 +56655,7 @@ void CheckEmbeddedFetchVertexOffset() {
                            Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float) {
     std::array<u32, 11> user_data{};
     user_data[10] = slot10;
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.logical_stage = stage;
     vertex.tess = {.input_control_points = 3, .output_control_points = 3,
                    .ls_stride = 124, .hs_stride = 128, .domain = 1,
@@ -56699,7 +56699,7 @@ void CheckEmbeddedFetchVertexOffset() {
 
   const auto Resolve = [](const CompiledShader &result,
                           u32 index_offset) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.fetch_embedded = true;
     ShaderRecompiler::IR::CompiledShaderInfo program{};
     program.user_data_base = result.program.user_data_base;
@@ -56710,7 +56710,7 @@ void CheckEmbeddedFetchVertexOffset() {
   };
 
   const auto ResolveInstance = [](const CompiledShader &result) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.fetch_embedded = true;
     ShaderRecompiler::IR::CompiledShaderInfo program{};
     program.user_data_base = result.program.user_data_base;
@@ -59751,7 +59751,7 @@ void CheckEmbeddedFetchLaneSpill() {
   AppendEnd(&code);
 
   std::array<u32, 11> user_data{};
-  ShaderVertexInputInfo vertex;
+  ShaderVertexInputInfo vertex{};
   vertex.fetch_embedded = true;
   vertex.fetch_buffer_reg = 0;
   vertex.resources_num = 1;
@@ -63062,7 +63062,7 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
   for (const auto [stages, hs_wave, gs_wave] :
        {std::tuple{0x0260210du, 32u, 32u}, {0x0020210du, 32u, 64u}, {0x0040210du, 64u, 32u}}) {
     context.SetShaderStages(stages);
-    std::array<ShaderVertexInputInfo, 3> info;
+    std::array<ShaderVertexInputInfo, 3> info{};
     const auto params = PrepareTessellationPrograms(regs, context, info);
     (void)params;
     // The fork's program cache compiles each non-mesh stage with its input info's wave size.
