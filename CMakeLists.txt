@@ -902,6 +902,9 @@ target_link_libraries(net_resolver_tests kyty_test_gtest)
 add_kyty_full_emulator_test(agc_tests "${KYTY_TESTS_DIR}/AgcTests.cpp")
 target_link_libraries(agc_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(kernel_thread_tests "${KYTY_TESTS_DIR}/KernelThreadTests.cpp")
+target_link_libraries(kernel_thread_tests kyty_test_gtest)
+
 add_kyty_full_emulator_test(kernel_event_flag_tests "${KYTY_TESTS_DIR}/KernelEventFlagTests.cpp")
 target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
 
