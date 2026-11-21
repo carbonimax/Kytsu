@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/onceValue.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -206,10 +207,11 @@ std::atomic<uint64_t> g_reuse_diffs {0};
 
 #if KYTY_SRT_X86_WALKER
 bool ProtectedLoadsEnabled() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_SRT_PROTECTED_LOADS");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	return enabled;
 }
 
@@ -1599,10 +1601,11 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 }
 
 uint32_t WalkReuseMode() noexcept {
-	static const uint32_t mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<uint32_t>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_SRT_WALK_REUSE");
 		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)) : 1u;
-	}();
+	}));
 	return mode;
 }
 

@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -405,10 +406,11 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		// with GPU-written bytes would otherwise fault on the GPU thread and drain the GPU; only
 		// GPU-written bytes the read covers are synchronized.
 		// KYTY_VERTEX_TABLE_BACKING_READS=0 reads them in place.
-		static const bool backing_reads = [] {
+		static std::atomic<int64_t> backing_reads_once {Common::OnceUnset};
+		const auto backing_reads = static_cast<bool>(Common::Once(backing_reads_once, [] {
 			const char* value = std::getenv("KYTY_VERTEX_TABLE_BACKING_READS");
 			return value == nullptr || std::strcmp(value, "0") != 0;
-		}();
+		}));
 		std::array<uint32_t, 64>                                   attrib_copy {};
 		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4u> buffer_copy {};
 		uint32_t attrib_count = 0;

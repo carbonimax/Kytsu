@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1122,11 +1123,12 @@ void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> co
 // KYTY_REPROTECT_BATCH: 1 (default, also when unset) = on, 0 = off, 2 = on with checks; other
 // values = off.
 static int ReprotectBatchMode() {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_REPROTECT_BATCH");
 		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
 		return v == 1 || v == 2 ? static_cast<int>(v) : 0;
-	}();
+	}));
 	return mode;
 }
 
@@ -1306,12 +1308,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 bool BufferCache::AsyncFaultReadbacks() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_ASYNC_READBACK");
 		// Default on; KYTY_ASYNC_READBACK=0 restores synchronous readbacks (and, by default, turns
 		// compute preemption and the readback queue off with them).
 		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
-	}();
+	}));
 	return enabled;
 }
 
@@ -1350,7 +1353,8 @@ int Watch() {
 // imported buffers samples one batch in KYTY_MEM_IMPORT_NET (default 16, 0 = off), or every batch with
 // KYTY_MEM_IMPORT_WATCH.
 int SamplePeriod() {
-	static const int period = [] {
+	static std::atomic<int64_t> period_once {Common::OnceUnset};
+	const auto period = static_cast<int>(Common::Once(period_once, [] {
 		const auto number = [](const char* value) {
 			return std::max(0, static_cast<int>(std::strtol(value, nullptr, 10)));
 		};
@@ -1367,7 +1371,7 @@ int SamplePeriod() {
 		}
 		const char* net = std::getenv("KYTY_MEM_IMPORT_NET");
 		return net != nullptr ? number(net) : 16;
-	}();
+	}));
 	return period;
 }
 
@@ -2286,10 +2290,11 @@ void BufferCache::OverlayOwnedWrites(uint64_t vaddr, void* data, uint64_t size) 
 }
 
 bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size) {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_GPU_OWNED_WRITE_DATA");
 		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
-	}();
+	}));
 	if (!enabled || size == 0 || !GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid() ||
 	    m_scheduler.Current().IsInvalid() || !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		return false;
@@ -2643,10 +2648,11 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 // KYTY_UPLOAD_BARRIER_BATCH=0 restores one barrier pair per upload.
 static bool UploadBarrierBatchEnabled() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_UPLOAD_BARRIER_BATCH");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	return enabled;
 }
 
@@ -2655,10 +2661,11 @@ static bool UploadBarrierBatchEnabled() {
 // trailing barrier, and the draw and dispatch resource uploads run in batches; 0 = one copy per
 // upload as recorded, batches only around buffer discovery and BDA synchronization.
 int BufferCache::UploadBatchMode() {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_UPLOAD_BATCH");
 		return value == nullptr ? 1 : static_cast<int>(std::strtol(value, nullptr, 10) != 0);
-	}();
+	}));
 	return UploadBarrierBatchEnabled() ? mode : 0;
 }
 

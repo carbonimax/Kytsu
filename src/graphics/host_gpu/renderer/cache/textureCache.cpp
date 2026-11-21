@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -71,10 +72,11 @@ bool TcLockOrder() {
 
 // KYTY_IMAGE_CHURN_OPT: 0 = off, 1 = on (default), 2 = on and verify against guest bytes.
 uint32_t ImageChurnOpt() {
-	static const uint32_t mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<uint32_t>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_IMAGE_CHURN_OPT");
 		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
-	}();
+	}));
 	return mode;
 }
 
@@ -1570,10 +1572,11 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 uint32_t TextureCache::FindImageMemoMode() noexcept {
-	static const uint32_t mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<uint32_t>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_FIND_IMAGE_MEMO");
 		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
-	}();
+	}));
 	return mode;
 }
 

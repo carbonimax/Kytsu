@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -294,10 +295,11 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 // the state keeps the union of stages and accesses for the next real transition.
 bool ElideReadOnlyDepthBarrier(const VulkanImageState& state, vk::ImageLayout destination_layout,
                                vk::AccessFlags2 write_access) {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_RO_DEPTH_ELIDE");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	if (!enabled || state.layout != destination_layout || (state.access_mask & write_access)) {
 		return false;
 	}
