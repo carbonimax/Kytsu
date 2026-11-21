@@ -3176,7 +3176,7 @@ bool PthreadHasAnyPendingSignal(Pthread thread) {
 }
 
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
-	if (thread == nullptr || signum < 0 || signum >= 64) {
+	if (thread == nullptr || thread->almost_done || signum < 0 || signum >= 64) {
 		return false;
 	}
 
@@ -3253,10 +3253,9 @@ static void CleanupThread(void* arg) {
 
 	RunThreadDestructors();
 
-	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-	rt->DeleteTlss(thread->unique_id);
-
+	// Guest signal handlers stop here: they would run on freed TLS.
 	thread->almost_done = true;
+	Loader::RuntimeLinker::DeleteThreadTls();
 }
 
 static void* RunThread(void* arg) {
@@ -3272,6 +3271,7 @@ static void* RunThread(void* arg) {
 
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
+	Loader::RuntimeLinker::CreateThreadTls();
 	g_pthread_self = thread;
 	g_thread_destructors_started = false;
 
@@ -3438,6 +3438,7 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 	if (result == 0) {
 		FreeGuestStack(thread->attr);
 
+		thread->pending_signal_mask.store(0, std::memory_order_relaxed);
 		thread->almost_done = false;
 		thread->free        = true;
 	}

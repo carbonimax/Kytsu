@@ -660,6 +660,7 @@ target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
 
 add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ControllerSettingsTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/padVr.cpp"
 )
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
@@ -717,6 +718,35 @@ target_link_libraries(rtc_tests common kyty_test_gtest)
 target_include_directories(rtc_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(ajm_instance_tests "${KYTY_TESTS_DIR}/AjmInstanceTests.cpp")
+
+add_executable(playgo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PlayGoTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPlayGo.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/systemContent.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(playgo_tests common nlohmann_json::nlohmann_json kyty_test_gtest)
+target_include_directories(playgo_tests PRIVATE ${inc_headers})
+
+add_executable(vr_tracker2_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VrTracker2Tests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libVrTracker2.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(vr_tracker2_tests common kyty_test_gtest)
+target_include_directories(vr_tracker2_tests PRIVATE ${inc_headers})
+
+# The test reads NotoSans-Regular.ttf, which this fork does not download: pass -DKYTY_NOTO_SANS_DIR.
+if(KYTY_NOTO_SANS_DIR)
+	add_executable(font_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/FontTests.cpp"
+		"${KYTY_SOURCE_DIR}/libs/libFont.cpp"
+		"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+		"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	target_link_libraries(font_tests common SDL3::SDL3-static FFmpeg::ffmpeg kyty_test_gtest)
+	target_include_directories(font_tests PRIVATE ${inc_headers})
+	target_compile_definitions(font_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
+endif()
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
@@ -797,6 +827,7 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
+target_link_libraries(gpu_blit_shader_tests Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # GoogleTest from the fmt submodule, for upstream tests written against gtest.
@@ -938,6 +969,8 @@ if(BUILD_TESTING)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME http2_abort_request COMMAND $<TARGET_FILE:http2_abort_request_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
+	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
+	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_mad_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-only)
 	add_test(NAME shader_recompiler_mad_f32_spirv COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-spirv-only)
@@ -1144,6 +1177,8 @@ if(BUILD_TESTING)
 		http_uri_parse_tests
 		http2_abort_request_tests
 		rtc_tests
+		playgo_tests
+		vr_tracker2_tests
 		psml_tests
 	)
 endif()

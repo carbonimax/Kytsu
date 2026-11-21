@@ -110,6 +110,7 @@ struct ConfigOptions {
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 	uint32_t               unreal_screen_percentage        = 0;
+	std::string            launch_activity;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -192,6 +193,8 @@ bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
 // The r.ScreenPercentage served to Unreal Engine games, 10 to 200; 0 leaves them alone.
 uint32_t UnrealScreenPercentage();
+// Activity ID of the one-shot launchActivity game intent; empty sends none.
+const std::string& GetLaunchActivity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

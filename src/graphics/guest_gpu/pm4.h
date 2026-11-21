@@ -911,11 +911,12 @@ constexpr uint32_t FLIP_PACKET_DW              = 64;
 constexpr uint32_t WAIT_FLIP_DONE_PACKET_DW    = 32;
 
 // Fork: a flip or flip-done wait block (cmd_id, then at least 2 payload dw). The SET_UCONFIG_REG
-// handler runs exactly these blocks and ProcessPm4 drains the CP pipeline before them.
-constexpr bool IsFlipBlock(uint32_t cmd_id, const uint32_t* payload) {
+// handler runs exactly these blocks and ProcessPm4 drains the CP pipeline before them. Graphics
+// queues tag them with R = 1; an async compute queue's blocks have R = 0.
+constexpr bool IsFlipBlock(uint32_t cmd_id, const uint32_t* payload, bool async_compute) {
 	const auto op = (cmd_id >> 8u) & 0xffu;
-	if ((op != IT_SET_UCONFIG_REG && op != IT_SET_UCONFIG_REG_INDEX) || KYTY_PM4_R(cmd_id) != 1u ||
-	    payload[0] != SQ_THREAD_TRACE_USERDATA_2) {
+	if ((op != IT_SET_UCONFIG_REG && op != IT_SET_UCONFIG_REG_INDEX) ||
+	    (KYTY_PM4_R(cmd_id) != 1u && !async_compute) || payload[0] != SQ_THREAD_TRACE_USERDATA_2) {
 		return false;
 	}
 	const auto tag = payload[1] & 0xff000000u;
