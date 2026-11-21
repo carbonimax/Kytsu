@@ -8497,7 +8497,6 @@ public:
         desc.type = BindingType::DepthTarget;
         desc.info.pitch = grown_depth_pitch;
         desc.info.mip_layout[0].pitch = grown_depth_pitch;
-        desc.info.mip_layout[0].linear_pitch = grown_depth_pitch;
         desc.view_info.format = vk::Format::eD32Sfloat;
         desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
         desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
@@ -18441,13 +18440,7 @@ public:
       const auto same_placement = [](const ImageInfo &left, const ImageInfo &right) {
         return left.pitch == right.pitch &&
                std::equal(left.mip_layout.begin(), left.mip_layout.end(),
-                          right.mip_layout.begin(),
-                          [](const ImageMipInfo &a, const ImageMipInfo &b) {
-                            return a.offset == b.offset && a.size == b.size &&
-                                   a.pitch == b.pitch && a.height == b.height &&
-                                   a.tail_x == b.tail_x && a.tail_y == b.tail_y &&
-                                   a.surface_z == b.surface_z;
-                          });
+                          right.mip_layout.begin());
       };
 
       auto cached_desc = volume(base, {4, 8, 8});
