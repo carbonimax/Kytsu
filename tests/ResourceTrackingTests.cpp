@@ -9250,9 +9250,10 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
 
 void TestLoopPhiBufferAtomicIAdd32() {
   // Stepped: one V# that the loop advances by an immediate goes through BDA.
-  // RuntimeStep (advanced by a lane value) and NoLoop (a V# word computed
-  // from a lane value, no Phi) keep main's fatal rule for writes.
-  enum class Variant { Stepped, RuntimeStep, NoLoop };
+  // RuntimeStep (advanced by a lane value), LaneRoot (a constant step from a
+  // lane-computed V# word) and NoLoop (a lane-computed V# word, no Phi) keep
+  // main's fatal rule for writes.
+  enum class Variant { Stepped, RuntimeStep, LaneRoot, NoLoop };
   const auto build = [](Fixture &fixture, Variant variant) {
     auto *entry = fixture.block;
     auto *loop = fixture.AddBlock();
@@ -9277,7 +9278,13 @@ void TestLoopPhiBufferAtomicIAdd32() {
                               : Value(word == 0u ? 1u : 0u);
         const auto next = fixture.Emit(ValueOpcode::IAdd32,
                                        {Value(phis[word]), step}, 0, loop);
-        phis[word]->AddPhiOperand(entry, fixture.UserData(word));
+        const auto root =
+            variant == Variant::LaneRoot && word == 0u
+                ? fixture.Emit(ValueOpcode::IAdd32,
+                               {fixture.UserData(word),
+                                fixture.Emit(ValueOpcode::LaneId)})
+                : fixture.UserData(word);
+        phis[word]->AddPhiOperand(entry, root);
         phis[word]->AddPhiOperand(loop, next);
         words[word] = Value(phis[word]);
       }
@@ -9298,7 +9305,8 @@ void TestLoopPhiBufferAtomicIAdd32() {
   fixture.PlanAndTrack();
   Check(fixture.program.memory_info[0].kind == ResourceKind::IndirectBuffer,
         "loop-Phi BufferAtomicIAdd32 was not planned as an indirect buffer");
-  for (const auto variant : {Variant::RuntimeStep, Variant::NoLoop}) {
+  for (const auto variant :
+       {Variant::RuntimeStep, Variant::LaneRoot, Variant::NoLoop}) {
     Fixture invalid;
     build(invalid, variant);
     CheckFatal([&] { invalid.PlanAndTrack(); },

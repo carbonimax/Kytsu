@@ -4539,10 +4539,11 @@ private:
 		return bound->source;
 	}
 
-	// True when each V# word's Phi web holds exactly one definition, the other non-Phi members
-	// being IAdd32 of a web Phi and an immediate, and at least one word takes such a step: one V#
-	// advanced by a loop. A web that merges two definitions, or a V# with no loop step, is not.
-	static bool IsLoopSteppedDescriptor(const Inst& handle) {
+	// True when each V# word's Phi web holds exactly one definition, a valid runtime value, the
+	// other non-Phi members being IAdd32 of a web Phi and an immediate, and at least one word takes
+	// such a step: one known V# advanced by a loop. A web that merges two definitions, a definition
+	// the tracker cannot evaluate (lane-computed), or a V# with no loop step, is not.
+	bool IsLoopSteppedDescriptor(const Inst& handle) const {
 		bool stepped = false;
 		for (uint32_t word = 0; word < 4u; ++word) {
 			const auto web   = PhiWeb(handle.Arg(word));
@@ -4558,6 +4559,7 @@ private:
 				const bool step = inst != nullptr && inst->GetOpcode() == ValueOpcode::IAdd32 &&
 				                  ((in_web(0) && inst->Arg(1).Resolve().IsImmediate()) ||
 				                   (in_web(1) && inst->Arg(0).Resolve().IsImmediate()));
+				if (!step && !ValidateRuntimeValue(m_program, node)) return false;
 				stepped |= step;
 				roots += step ? 0u : 1u;
 			}
