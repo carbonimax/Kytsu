@@ -1,8 +1,23 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
+
+// KYTY_MOVREL_READ_MUX=0 keeps one compare and one select per candidate register for V_MOVRELS.
+// Read once.
+bool MovrelReadMux() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MOVREL_READ_MUX");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 bool IsExecOrVcc(const Decoder::Operand& operand) {
 	switch (operand.kind) {
@@ -413,10 +428,37 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	const auto base     = inst.src0.reg;
 	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                    IR::U32(IR::Value(0xffu)));
-	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
-	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
-		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+	if (!MovrelReadMux()) {
+		auto selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
+		for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
+			const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
+			selected =
+			    ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+		}
+		WriteOperand(DestinationOperand(inst), selected);
+		return;
+	}
+	// A binary multiplexer on M0's bits: one select per candidate and one test per bit, instead of
+	// a compare and a select per register. M0 past the last register still reads the base.
+	std::vector<IR::U32> level;
+	for (uint32_t index = base; index < std::max(current_vector_limit, base + 1u); index++) {
+		level.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(index)));
+	}
+	const auto count = static_cast<uint32_t>(level.size());
+	for (uint32_t bit = 0; level.size() > 1u; bit++) {
+		const auto set =
+		    ir.INotEqual(ir.BitwiseAnd(m0, IR::U32(IR::Value(1u << bit))), IR::U32(IR::Value(0u)));
+		std::vector<IR::U32> next;
+		for (size_t i = 0; i < level.size(); i += 2) {
+			next.push_back(i + 1 < level.size() ? ir.Select(set, level[i + 1], level[i])
+			                                    : level[i]);
+		}
+		level = std::move(next);
+	}
+	auto selected = level[0];
+	if (count < 256u) {
+		selected = ir.Select(ir.ULessThan(m0, IR::U32(IR::Value(count))), selected,
+		                     ir.GetVectorReg(static_cast<IR::VectorReg>(base)));
 	}
 	WriteOperand(DestinationOperand(inst), selected);
 }
