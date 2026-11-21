@@ -767,6 +767,9 @@ target_link_libraries(pthread_fpu_control_tests ZArchive::zarchive)
 add_test(NAME pthread_fpu_control COMMAND $<TARGET_FILE:pthread_fpu_control_tests>)
 target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 
+add_kyty_full_emulator_test(kernel_module_info_tests "${KYTY_TESTS_DIR}/KernelModuleInfoTests.cpp")
+target_link_libraries(kernel_module_info_tests kyty_test_gtest)
+
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
