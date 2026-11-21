@@ -34,7 +34,7 @@ double GetTimeMs() {
 } // namespace Loader
 
 namespace Libs::LibKernel::FileSystem {
-void Mount(const std::filesystem::path& directory, const std::string& point) {
+void Mount(const std::filesystem::path& directory, const std::string& point, bool) {
 	g_mounted_directory = directory;
 	g_test_mounts[point] = directory;
 }
@@ -472,6 +472,8 @@ void TestConvert() {
 	mount.blocks     = 96;
 	SaveDataMountResult mounted {};
 	CHECK(SaveDataMount3(&mount, &mounted) == OK);
+	const auto source_dir = g_mounted_directory;
+	std::ofstream(source_dir / "progress") << "old";
 	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_BUSY);
 	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
 	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
@@ -491,21 +493,37 @@ void TestConvert() {
 	convert.dst_blocks   = 128;
 	CHECK(SaveDataConvert(&convert) == OK);
 	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
-	CHECK(event.type == 5 && event.error_code == OK && std::string(event.dir_name.data) == "save");
+	CHECK(event.type == 5 && event.error_code == OK && event.user_id == 1 &&
+	      std::string(event.title_id.data) == "CONVERT" &&
+	      std::string(event.dir_name.data) == "save");
 	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
-	// A named destination gets a copy of the save at the requested size.
+	// A named destination gets a copy of the save at the requested size; the source stays.
 	const auto copy      = DirName("copy");
+	const auto copy_dir  = source_dir.parent_path() / "copy";
 	convert.dst_dir_name = &copy;
 	convert.dst_blocks   = 160;
 	CHECK(SaveDataConvert(&convert) == OK);
 	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
 	CHECK(event.type == 5 && event.error_code == OK && std::string(event.dir_name.data) == "copy");
+	const auto read_progress = [](const fs::path& dir) {
+		std::string text;
+		std::ifstream(dir / "progress") >> text;
+		return text;
+	};
+	CHECK(read_progress(source_dir) == "old" && read_progress(copy_dir) == "old");
 	convert.src_dir_name = &copy;
 	convert.dst_dir_name = nullptr;
 	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
 	convert.src_dir_name = &source;
 	convert.dst_blocks   = 128;
 	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	// A second launch asking for the same conversion does not copy again over the new save.
+	std::ofstream(copy_dir / "progress") << "new";
+	convert.dst_dir_name = &copy;
+	convert.dst_blocks   = 160;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_EXISTS);
+	CHECK(SaveDataGetEventResult(nullptr, &event) != OK);
+	CHECK(read_progress(source_dir) == "old" && read_progress(copy_dir) == "new");
 	float progress = 0.0f;
 	CHECK(SaveDataGetConvertProgress(&progress) == OK && progress == 1.0f);
 	CHECK(SaveDataGetConvertProgress(nullptr) == SAVE_DATA_ERROR_PARAMETER);
@@ -794,7 +812,8 @@ void TestSearchSortKeys() {
 
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
-	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
+	const std::string quoted = "\"" + executable.string() + "\"";
+	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), quoted.c_str(), mode,
 	              static_cast<char*>(nullptr)) == 0);
 #else
 	const pid_t pid = fork();

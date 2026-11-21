@@ -74,7 +74,7 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --no-tessellation                    Skip tessellation patch draws. Default: drawn.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
 	::printf("  --native-rt                          Use native RT on the GPU.\n");
@@ -98,8 +98,12 @@ static void PrintUsage() {
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
-	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --playgo-hack                        Report 1000 PlayGo chunks without chunk metadata.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf(
+	    "  --unreal-screen-percentage <10-200>  Render Unreal Engine games at this share of their\n"
+	    "                                       output (r.ScreenPercentage).\n");
+	::printf("  --launch-activity <id>               Launch into this activity (1-32 printable ASCII chars).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -209,7 +213,8 @@ static constexpr Flag FLAGS[] = {
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
-    {"--tessellation", &ConfigOptions::tessellation_enabled},
+    {"--tessellation", &ConfigOptions::tessellation_enabled}, // the default; kept for old command lines
+    {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--native-rt", &ConfigOptions::native_rt},
@@ -341,6 +346,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.user_name = value;
+		} else if (arg == "--launch-activity") {
+			if (value.empty() || value.size() > 32 ||
+			    !std::ranges::all_of(value, [](char c) { return c >= ' ' && c <= '~'; })) {
+				::printf("invalid activity ID: must contain 1-32 printable ASCII characters\n");
+				return false;
+			}
+			options.config.launch_activity = value;
 		} else if (arg == "--user-id") {
 			if (!ParseUserId(value, options.config.user_id)) {
 				::printf("invalid user ID: %s\n", value.c_str());
@@ -425,6 +437,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--trophy-duration") {
 			if (!ParseUint32(value, options.config.trophy_duration_seconds)) {
 				::printf("invalid trophy duration: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--unreal-screen-percentage") {
+			auto& percentage = options.config.unreal_screen_percentage;
+			if (!ParseUint32(value, percentage) || percentage < 10 || percentage > 200) {
+				::printf("invalid Unreal screen percentage (10-200): %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--console-language") {

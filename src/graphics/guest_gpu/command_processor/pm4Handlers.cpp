@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/graphicsRun.h" // Fork: EopAtGpu front reads (WAIT_REG_MEM)
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/memory.h"
 #include "libs/agc.h"
 
 #include <algorithm>
@@ -38,6 +39,21 @@ constexpr uint32_t RegisterSelectorMask = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
+}
+
+// Synced copy of an indirect register table: a handler can flush GPU work or run completion
+// callbacks that change the guest allocation while later pairs are still unread.
+const std::vector<uint32_t>& ReadIndirectRegisterPairs(uint64_t address, uint32_t count) {
+	// shortcut: one reused buffer per thread (no allocation per packet); register handlers never
+	// parse another indirect table, give each caller its own copy if one ever does.
+	thread_local std::vector<uint32_t> pairs;
+	pairs.resize(static_cast<size_t>(count) * 2);
+	const auto bytes = pairs.size() * sizeof(uint32_t);
+	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, pairs.data(), bytes)) {
+		// Off the GPU thread the buffer cache cannot sync: keep the direct read.
+		std::memcpy(pairs.data(), reinterpret_cast<const void*>(address), bytes);
+	}
+	return pairs;
 }
 
 } // namespace
@@ -594,8 +610,11 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 
 	auto payload_dw = KYTY_PM4_LEN(cmd_id) - 1u;
 
+	// Conditional IB comparisons accept dword-aligned addresses. Clearing bit 2
+	// selects the preceding value when the guest puts a predicate at +4.
+	// A dword-aligned 64-bit load is a plain unaligned load on x86-64 and arm64.
 	auto* compare_addr = reinterpret_cast<const volatile uint64_t*>(
-	    (buffer[1] & 0xfffffff8u) | (static_cast<uint64_t>(buffer[2]) << 32u));
+	    (buffer[1] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[2]) << 32u));
 	uint64_t mask        = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
 	uint64_t reference   = buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u);
 	uint32_t mode        = buffer[0] & 0x3u;
@@ -967,12 +986,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
 
 	const uint32_t control = buffer[2];
+	const bool     chain   = (control & (1u << 20u)) != 0;
 
 	auto* indirect_buffer =
 	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
 	const uint32_t indirect_num_dw = control & 0xfffffu;
 
 	if (indirect_num_dw == 0) {
+		if (chain) cp.ProcessIndirectBuffer({}, true);
 		return 3;
 	}
 	if (indirect_buffer == nullptr) {
@@ -983,7 +1004,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
+	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, chain);
 
 	return 3;
 }
@@ -994,8 +1015,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 	GpuCapture::Touch(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 
@@ -1005,6 +1026,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// Make every pair visible before applying registers: a handler can flush GPU
+	// work or run completion callbacks that change the original guest allocation.
+	const auto& pairs =
+	    ReadIndirectRegisterPairs(reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw);
+	indirect_buffer = pairs.data();
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -1064,8 +1090,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 	GpuCapture::Touch(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 
@@ -1076,6 +1102,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	const auto& pairs           = ReadIndirectRegisterPairs(indirect_address, indirect_num_dw);
+	indirect_buffer             = pairs.data();
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -1118,8 +1146,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 	GpuCapture::Touch(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 
@@ -1129,6 +1157,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto& pairs =
+	    ReadIndirectRegisterPairs(reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw);
+	indirect_buffer = pairs.data();
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -1290,13 +1321,13 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 }
 
 // A flip block: the tag (flip mode, signed 5-bit buffer index) and bus, the flip argument
-// written to USERDATA_3, then an end-of-pipe RELEASE_MEM with a GL2 writeback whose interrupt
-// carries the port.
-static uint32_t CpFlip(CommandProcessor& cp, const uint32_t* block, uint32_t remaining_dw) {
+// written to USERDATA_3, then a RELEASE_MEM with a GL2 writeback whose interrupt carries the port.
+static uint32_t CpFlip(CommandProcessor& cp, uint32_t user_data_r, const uint32_t* block,
+                       uint32_t remaining_dw) {
 	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(remaining_dw < Pm4::FLIP_PACKET_DW ||
-	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u) ||
+	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, user_data_r) ||
 	                     block[9] != KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u));
 
 	const auto tag = block[1];
@@ -1346,11 +1377,14 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
 	// Fork: ProcessPm4 drains the CP pipeline before every block Pm4::IsFlipBlock names.
-	if (Pm4::IsFlipBlock(cmd_id, buffer)) {
-		return (buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_FLIP ? CpFlip(cp, buffer, dw)
-		                                                          : CpWaitFlipDone(cp, buffer, dw);
+	// Driver user data has R = 1; a compute queue's flip has R = 0.
+	if (Pm4::IsFlipBlock(cmd_id, buffer, cp.IsAsyncComputeQueue())) {
+		return (buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_FLIP
+		           ? CpFlip(cp, KYTY_PM4_R(cmd_id), buffer, dw)
+		           : CpWaitFlipDone(cp, buffer, dw);
 	}
-	if (KYTY_PM4_R(cmd_id) == 1u && buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+	if ((KYTY_PM4_R(cmd_id) == 1u || cp.IsAsyncComputeQueue()) &&
+	    buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
 		if ((buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_RESET_QUEUE) {
 			cp.ResetQueue(buffer[1]);
 			return KYTY_PM4_LEN(cmd_id) - 1u;

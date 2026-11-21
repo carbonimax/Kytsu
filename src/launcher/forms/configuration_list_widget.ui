@@ -353,11 +353,7 @@
            </property>
           </column>
          </widget>
-         <widget class="QListView" name="cfgs_grid">
-          <property name="styleSheet">
-           <string notr="true">#cfgs_grid { background: transparent; }</string>
-          </property>
-         </widget>
+         <widget class="GameGridView" name="cfgs_grid"/>
         </widget>
        </item>
       </layout>
@@ -380,6 +376,11 @@
    <extends>QStackedWidget</extends>
    <header>gameViews.h</header>
    <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>GameGridView</class>
+   <extends>QListView</extends>
+   <header>gameGridView.h</header>
   </customwidget>
  </customwidgets>
  <resources/>

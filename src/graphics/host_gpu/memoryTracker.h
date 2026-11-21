@@ -26,6 +26,33 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// KYTY_BIND_MEMO: a sum of the CPU-dirty epochs covering [vaddr, vaddr + size) (RegionManager::
+	// BlockCpuEpoch; whole regions by their region epoch, untracked regions 0). It changes whenever
+	// a page of the range becomes CPU-modified. Creates nothing, takes no lock.
+	[[nodiscard]] uint64_t CpuDirtyEpoch(uint64_t vaddr, uint64_t size) const {
+		uint64_t epoch = 0;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size; index++) {
+			if (index >= REGION_COUNT) {
+				EXIT("invalid memory tracker region\n");
+			}
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				continue;
+			}
+			const uint64_t region = index * TRACKER_REGION_SIZE;
+			if (vaddr <= region && vaddr + size >= region + TRACKER_REGION_SIZE) {
+				epoch += manager->RegionCpuEpoch();
+				continue;
+			}
+			constexpr uint64_t block_bytes = RegionManager::DirtyBlockPages * TRACKER_PAGE_SIZE;
+			const uint64_t     begin       = std::max(vaddr, region) - region;
+			const uint64_t     end         = std::min(vaddr + size, region + TRACKER_REGION_SIZE) - region;
+			for (uint64_t block = begin / block_bytes; block * block_bytes < end; block++) {
+				epoch += manager->BlockCpuEpoch(static_cast<size_t>(block));
+			}
+		}
+		return epoch;
+	}
 	// KYTY_MEMTRACK_PROF: the page of vaddr has a region and is write-tracked (CPU-clean) or
 	// GPU-modified, i.e. a guest write to it faults for this tracker. Creates nothing.
 	[[nodiscard]] bool IsPageWatched(uint64_t vaddr);
@@ -36,7 +63,9 @@ public:
 	// The same for the pages of the range that are not GPU-modified (their newer bytes stay on the GPU).
 	void               MarkRegionAsCpuModifiedExceptGpu(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
-	// Only for ranges whose complete tracker pages have no cache-buffer owner.
+	// Releases the GPU's claim on the range's pages and gives them to the CPU in one critical
+	// section. Only for ranges whose complete tracker pages have no cache-buffer owner, or whose
+	// GPU data was just downloaded for a guest write (BufferCache::ReadMemory).
 	void               ReleaseUnownedRegion(uint64_t vaddr, uint64_t size);
 	// Marks up to `size` bytes from page-aligned `vaddr` CPU-modified (unprotected), stopping at
 	// the first GPU-modified page and at the region end. Returns the bytes marked.

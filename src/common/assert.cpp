@@ -4,6 +4,7 @@
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,18 @@
 #include <thread>
 
 namespace Common {
+
+// An emergency hook can wait on a thread that waits on the failing one; exit regardless.
+static void ArmExitWatchdog(int status) {
+	static std::atomic_flag armed;
+	if (armed.test_and_set()) {
+		return;
+	}
+	std::thread([status] {
+		std::this_thread::sleep_for(std::chrono::seconds(10));
+		std::_Exit(status);
+	}).detach();
+}
 
 static std::string BuildFatalReport(const char* title, std::string_view text, const char* file,
                                     int line) {
@@ -43,6 +56,7 @@ static void RetireThreadIfSpeculative(const char* title, std::string_view text, 
 [[noreturn]] static void DbgReport(const char* title, std::string_view text, const char* file,
                                    int line) {
 	RetireThreadIfSpeculative(title, text, file, line);
+	ArmExitWatchdog(321);
 	Log::WriteToConsoleAndLog(BuildFatalReport(title, text, file, line));
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);

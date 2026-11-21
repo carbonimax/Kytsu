@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -30,17 +31,22 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -49,6 +55,40 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+// The shader whose images PrepareBindings resolves (0 elsewhere), for the S4 counter.
+thread_local uint64_t t_binding_shader_hash = 0;
+
+// shortcut: measurement only (KYTY_PERF_STATS=1), no behaviour change; remove once the
+// depth-compare rule for color formats is decided. Every depth-compare bind counts; one that ends
+// on a color image with a guest format outside DEPTH_FORMAT_POLICIES keeps a color view with a
+// comparison sampler, which Vulkan leaves undefined. Logs each new (shader, guest format) pair
+// of those, and the totals at each power of two of all depth-compare binds.
+void NoteDepthCompareBind(Prospero::BufferFormat guest_format, vk::Format image_format,
+                          bool color_image) {
+	if (!PerfStats::Enabled()) {
+		return;
+	}
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint32_t>> seen;
+	static uint64_t                                binds = 0, outside = 0;
+	const auto format = static_cast<uint32_t>(guest_format);
+	const bool hit    = color_image && FindGuestDepthFormatPolicy(guest_format) == nullptr;
+	std::lock_guard lock(mutex);
+	++binds;
+	if (hit) {
+		++outside;
+		if (seen.emplace(t_binding_shader_hash, format).second) {
+			std::printf("PERF arifix-s4 shader=0x%016" PRIx64 " guest_format=%u image_format=%d\n",
+			            t_binding_shader_hash, format, static_cast<int>(image_format));
+		}
+	}
+	if (std::has_single_bit(binds)) {
+		std::printf("PERF arifix-s4-seen compare_binds=%" PRIu64 " outside_table=%" PRIu64
+		            " pairs=%zu\n",
+		            binds, outside, seen.size());
+	}
+}
 
 } // namespace
 
@@ -115,7 +155,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    const Buffer** obtained = nullptr) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -124,7 +165,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	     .storage_bounds = static_cast<ShaderRecompiler::Spirv::StorageBounds>(graphics.storage_bounds),
 	     .storage_bounds_alignment = graphics.storage_bounds_alignment};
 	const bool device_bounds = profile.storage_bounds == ShaderRecompiler::Spirv::StorageBounds::Device;
-	if (address == 0 || size == 0) {
+	// A base in guest page 0 is a null or garbage descriptor.
+	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 		// Without shader checks only a null descriptor reads zero and drops writes.
 		if (device_bounds) return {nullptr, 0, vk::WholeSize};
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
@@ -137,6 +179,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	if (obtained != nullptr) {
+		*obtained = buffer;
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -191,8 +236,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 		return false;
 	}
 	// Bits 0-7 name the mip-stats counter. A clear COMPRESSION_EN disables the metadata and its
-	// settings.
-	const auto         metadata_control = descriptor.fields[6] & 0x00ffff00u;
+	// settings. MaxUncompBlkSize/MaxCompBlkSize (bits 15-18) size DCC blocks; HTILE depth ignores them.
+	constexpr uint32_t dcc_block_size_mask = 0x00078000u;
+	const auto         metadata_control    = descriptor.fields[6] & 0x00ffff00u & ~dcc_block_size_mask;
 	constexpr uint32_t pipe_aligned     = 1u << 19u;
 	if (!descriptor.MetaCompress()) {
 		return true;
@@ -407,6 +453,10 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
+	const auto base_layer = descriptor.Type() == Prospero::ImageType::kColor1D ||
+	                                descriptor.Type() == Prospero::ImageType::kColor2D
+	                            ? 0u
+	                            : descriptor.BaseArray5();
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -427,7 +477,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = base_layer;
 			if (view.base_layer >= image_layers) {
 				EXIT("texture base layer is out of bounds\n");
 			}
@@ -456,12 +506,7 @@ static bool ResolveTextureMipViewIn(ImageInfo& info, uint32_t physical_levels, b
 	physical.UpdateSize();
 	info.UpdateSize();
 	const auto same_mip = [&](uint32_t target, uint32_t source) {
-		const auto& left  = physical.mip_layout[target];
-		const auto& right = info.mip_layout[source];
-		return left.offset == right.offset && left.size == right.size &&
-		       left.pitch == right.pitch && left.height == right.height &&
-		       left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-		       left.surface_z == right.surface_z &&
+		return physical.mip_layout[target] == info.mip_layout[source] &&
 		       physical.MipExtent(target) == info.MipExtent(source);
 	};
 	if (physical.first_tail_level == info.first_tail_level &&
@@ -539,10 +584,11 @@ struct ResolvedTextureDesc {
 // bind. Image heap resources (which also depend on the guest mapping) are not kept. 2 = derive
 // anyway and exit on any difference with the kept description.
 uint32_t TextureDescMemoMode() noexcept {
-	static const uint32_t mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<uint32_t>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_TEXTURE_DESC_MEMO");
 		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
-	}();
+	}));
 	return mode;
 }
 
@@ -553,6 +599,9 @@ struct TextureDescMemoEntry {
 	ResolvedTextureDesc                 resolved;
 	// The image FindImage gave for resolved.desc (KYTY_FIND_IMAGE_MEMO); reset with the entry.
 	TextureCache::FindImageMemo find;
+	// KYTY_RESOLVE_INPLACE: the program-owned resource equal to `resource` (PrepareBindings only); a
+	// published program's info never changes or moves, so its address stands for its content.
+	const ShaderRecompiler::IR::ImageResource* stable = nullptr;
 };
 
 // Direct-mapped, one per host thread that resolves textures (the GPU thread, and the
@@ -560,6 +609,23 @@ struct TextureDescMemoEntry {
 constexpr size_t TextureDescMemoSlots = 4096;
 thread_local std::unique_ptr<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>
     t_texture_desc_memo;
+// Bumped when a RenderExecutor (so a render context) is created or destroyed: the programs and images
+// an entry names may be gone, and the next context may reuse their addresses and image ids.
+std::atomic<uint64_t> g_texture_desc_memo_generation {0};
+thread_local uint64_t t_texture_desc_memo_generation = 0;
+
+// The calling thread's memo (null when it has none and !create), emptied if a context came or went.
+std::array<TextureDescMemoEntry, TextureDescMemoSlots>* TextureDescMemo(bool create) {
+	const auto generation = g_texture_desc_memo_generation.load(std::memory_order_relaxed);
+	if (t_texture_desc_memo_generation != generation) {
+		t_texture_desc_memo.reset();
+		t_texture_desc_memo_generation = generation;
+	}
+	if (create && !t_texture_desc_memo) {
+		t_texture_desc_memo = std::make_unique<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>();
+	}
+	return t_texture_desc_memo.get();
+}
 
 size_t TextureDescMemoSlot(const ShaderRecompiler::IR::ImageResource& resource,
                            const ShaderRecompiler::IR::DescriptorValue& value) noexcept {
@@ -583,10 +649,12 @@ bool SameResolvedTextureDesc(const ResolvedTextureDesc& a, const ResolvedTexture
 	       x.pixel_format == y.pixel_format && x.guest_format == y.guest_format &&
 	       x.type == y.type && x.extent == y.extent && x.resources == y.resources &&
 	       x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
-	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.mip_layout == y.mip_layout &&
-	       x.tiled_slice_stride == y.tiled_slice_stride &&
-	       x.linear_slice_stride == y.linear_slice_stride &&
-	       x.first_tail_level == y.first_tail_level &&
+	       x.samples == y.samples && x.tile_mode == y.tile_mode &&
+	       // UpdateSize no longer re-zeroes records past resources.levels (equal on both sides here).
+	       std::equal(x.mip_layout.begin(),
+	                  x.mip_layout.begin() + std::min<size_t>(x.resources.levels, x.mip_layout.size()),
+	                  y.mip_layout.begin()) &&
+	       x.tiled_slice_stride == y.tiled_slice_stride && x.first_tail_level == y.first_tail_level &&
 	       std::memcmp(&x.tiling, &y.tiling, sizeof(x.tiling)) == 0;
 }
 
@@ -629,11 +697,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto          memo_mode = resource.heap ? 0u : TextureDescMemoMode();
 	TextureDescMemoEntry* memo     = nullptr;
 	if (memo_mode != 0) {
-		if (!t_texture_desc_memo) {
-			t_texture_desc_memo =
-			    std::make_unique<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>();
-		}
-		memo = &(*t_texture_desc_memo)[TextureDescMemoSlot(resource, value)];
+		memo = &(*TextureDescMemo(true))[TextureDescMemoSlot(resource, value)];
 		if (!(memo->valid && memo->value == value && memo->resource == resource)) {
 			memo = nullptr;
 		} else if (memo_mode == 2) {
@@ -665,6 +729,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			entry.resource = resource;
 			entry.resolved = resolved_storage;
 			entry.find     = {};
+			entry.stable   = nullptr;
 			find_memo      = &entry.find;
 		}
 	}
@@ -682,6 +747,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
+	if (resource.depth_compare) {
+		NoteDepthCompareBind(desc.info.guest_format, image->info.pixel_format,
+		                     !stencil_association && !image->info.IsDepth());
+	}
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
@@ -702,6 +771,138 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	TextureBinding binding {id, nullptr, std::move(desc)};
 	return binding;
+}
+
+namespace {
+
+// KYTY_RESOLVE_INPLACE (default 1 = on; 0 = off, every bind through ResolveTexture as before; 2 =
+// verify), with KYTY_TEXTURE_DESC_MEMO=1 only: when PrepareBindings binds a program texture whose kept
+// description is in the memo, it writes the binding straight into its slot (one copy of the
+// description instead of three, no scratch description) and knows the resource by its address
+// instead of comparing it field by field. An address holds for one render context: the memos are
+// dropped when a RenderExecutor is created or destroyed. Any other case runs ResolveTexture. 2 = also
+// resolve each such binding through ResolveTexture and compare ("PERF resolveinplace"). Switchable
+// between frames: KYTY_AB_FLAG=resolve_inplace.
+uint32_t ResolveInplaceMode() noexcept {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_RESOLVE_INPLACE");
+		const auto  m     = value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		if (value != nullptr) {
+			std::printf("KYTY_RESOLVE_INPLACE=%u\n", m);
+		}
+		return m;
+	}();
+	return mode;
+}
+
+// After ResolveTexture: marks the memo entry it kept or stored for `resource` (owned by a program).
+void MarkStableTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                       const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto* const table = TextureDescMemo(false);
+	if (table == nullptr) {
+		return;
+	}
+	auto& entry = (*table)[TextureDescMemoSlot(resource, value)];
+	if (entry.valid && entry.value == value && entry.resource == resource) {
+		entry.stable = &resource;
+	}
+}
+
+// KYTY_RESOLVE_INPLACE=2: every field (ImageInfo has no operator==).
+bool SameImageDescExact(const TextureCache::ImageDesc& a, const TextureCache::ImageDesc& b) {
+	const auto& x = a.info;
+	const auto& y = b.info;
+	const auto& m = x.metadata;
+	const auto& n = y.metadata;
+	return a.type == b.type && a.heap == b.heap && a.view_info == b.view_info && x.data == y.data &&
+	       x.stencil == y.stencil && m.range == n.range && m.kind == n.kind && m.clear_word == n.clear_word &&
+	       m.compression == n.compression && m.stencil_compressed == n.stencil_compressed &&
+	       m.clear_register_valid == n.clear_register_valid && m.dcc_alpha_msb == n.dcc_alpha_msb &&
+	       x.htile_initial_clear == y.htile_initial_clear && x.pixel_format == y.pixel_format &&
+	       x.guest_format == y.guest_format && x.type == y.type && x.extent == y.extent &&
+	       x.resources == y.resources && x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
+	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.bgra16 == y.bgra16 &&
+	       x.mip_layout == y.mip_layout && std::memcmp(&x.tiling, &y.tiling, sizeof(x.tiling)) == 0 &&
+	       x.tiled_slice_stride == y.tiled_slice_stride && x.first_tail_level == y.first_tail_level;
+}
+
+} // namespace
+
+void RenderExecutor::DropTextureDescMemos() noexcept {
+	g_texture_desc_memo_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ResolveTexture's path for a description kept in the memo, written into `out`; false, with nothing
+// done, when the memo does not hold this program resource and T#.
+bool RenderExecutor::ResolveKeptTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                        const ShaderRecompiler::IR::DescriptorValue& value,
+                                        TextureBinding& out, bool verify) {
+	auto* const table = resource.heap ? nullptr : TextureDescMemo(false);
+	if (table == nullptr) {
+		return false;
+	}
+	auto& memo = (*table)[TextureDescMemoSlot(resource, value)];
+	if (memo.stable != &resource || !memo.valid || !(memo.value == value)) {
+		return false;
+	}
+	if (verify && !(memo.resource == resource)) {
+		PerfStats::Add(PerfStats::Counter::RiResourceDiffs, 1);
+	}
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	// Not null: the memo keeps no null T#.
+	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage    = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+	if (m_lod_stats && descriptor.MipStatsCntEn() && !storage) {
+		auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
+		const uint8_t base    = descriptor.BaseLevel();
+		counter.finest_level  = std::min(counter.finest_level, base);
+		if (descriptor.MinLod() > base << 8u) {
+			counter.clamped = true;
+		} else {
+			counter.unclamped = true;
+		}
+	}
+	auto&      texture_cache     = m_context.GetTextureCache();
+	const auto pixel_format      = memo.resolved.pixel_format;
+	const auto view_format       = memo.resolved.view_format;
+	const bool shader_conversion = memo.resolved.shader_conversion;
+	out.desc       = memo.resolved.desc;
+	out.image_view = nullptr;
+	out.layout     = vk::ImageLayout::eUndefined;
+	out.mip_views.clear();
+	auto id = [&] {
+		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
+		return texture_cache.FindImage(out.desc, shader_conversion, &memo.find);
+	}();
+	out.image_id = id;
+	if (!id) {
+		out.layout = vk::ImageLayout::eGeneral;
+		return true;
+	}
+	auto* image = &texture_cache.GetImage(id);
+	if (image->depth_id) {
+		id    = image->depth_id;
+		image = &texture_cache.GetImage(id);
+	} else if (image->info.IsDepth()) {
+		if (storage) {
+			EXIT("depth target cannot be bound as a storage image\n");
+		}
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, out.desc.info.data.size);
+	} else if (storage) {
+		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else {
+		out.desc.view_info.format = SampledViewFormat(m_context.GetGraphics(), out.desc.info.guest_format,
+		                                              pixel_format, resource.skip_degamma);
+		(void)SelectSampledColorView(image->info.pixel_format, out.desc.view_info.format,
+		                             descriptor.DstSelXYZW());
+	}
+	out.image_id = id;
+	return true;
 }
 
 static bool ResolveTextureDesc(const RenderContext& context,
@@ -750,7 +951,7 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format         = ShaderRecompiler::IR::ReadsDepthBits(resource)
 	                                ? Prospero::BufferFormat::k16UNorm
-	                                : descriptor.Format();
+	                                : ShaderRecompiler::IR::CompareFormat(resource, descriptor.Format());
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
@@ -790,6 +991,7 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+	const bool meta_compress       = block_bytes == 0 && !resource.r128 && descriptor.MetaCompress();
 	auto& desc = out.desc;
 	desc       = {};
 	desc.info.data         = {address, 0};
@@ -802,12 +1004,12 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
-		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
+		                           meta_compress, view_levels,
 		                           view_base)) {
 			// The layout stores no mip past MAX_MIP here, so a view starting in the chain ends at
 			// MAX_MIP; dynamic-mip shaders still count mips up to LAST_LEVEL.
@@ -837,7 +1039,7 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
 		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
@@ -914,10 +1116,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
+	prepared.buffer_sources.clear();
+	prepared.buffers.clear();
 	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	const uint32_t inplace = ResolveInplaceMode() == 0 || TextureDescMemoMode() != 1 ||
+	                                 (ResolveInplaceMode() == 1 && PerfStats::AbOff("resolve_inplace"))
+	                             ? 0u
+	                             : ResolveInplaceMode();
+	uint32_t kept = 0;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (program.info.images[i].heap) {
 			prepared.images[i] = {};
@@ -932,11 +1141,50 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				MipStats::Mark(descriptor.MipStatsCntId());
 			}
 		}
+		if (inplace != 0) {
+			auto&          out   = prepared.images[i];
+			const uint64_t epoch = inplace == 2 ? m_context.GetTextureCache().ImageIndexEpoch() : 0;
+			if (ResolveKeptTexture(program.info.images[i], snapshot.images[i], out, inplace == 2)) {
+				kept++;
+				if (inplace == 2) {
+					const auto check = ResolveTexture(program.info.images[i], snapshot.images[i]);
+					const bool same_rest = check.image_view == out.image_view && check.layout == out.layout &&
+					                       check.mip_views.empty() && SameImageDescExact(check.desc, out.desc);
+					PerfStats::Add(PerfStats::Counter::RiChecked, 1);
+					if (!same_rest || check.image_id != out.image_id) {
+						const bool raced = same_rest &&
+						                   m_context.GetTextureCache().ImageIndexEpoch() != epoch;
+						PerfStats::Add(raced ? PerfStats::Counter::RiRaced : PerfStats::Counter::RiDiffs, 1);
+						static std::atomic<uint32_t> logged {0};
+						if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+							std::printf("KYTY_RESOLVE_INPLACE=2: %s addr=0x%016" PRIx64 " image %u/%u desc %s\n",
+							            raced ? "raced" : "diff", out.desc.info.data.address,
+							            out.image_id.index, check.image_id.index, same_rest ? "same" : "differs");
+						}
+					}
+				}
+				BindImage(out.image_id, out.desc.type == TextureCache::BindingType::Storage);
+				continue;
+			}
+		}
+		t_binding_shader_hash = program.shader_hash;
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		t_binding_shader_hash = 0;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
+		if (inplace != 0) {
+			MarkStableTexture(program.info.images[i], snapshot.images[i]);
+		}
+	}
+	if (kept != 0) {
+		// Batched: no atomic per binding in the arm being timed.
+		thread_local uint64_t pending = 0;
+		if ((pending += kept) >= 4096) {
+			PerfStats::Add(PerfStats::Counter::RiKept, pending);
+			pending = 0;
+		}
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	PerfStats::ScopedTimer sampler_timer(PerfStats::Counter::BindSamplerNs,
@@ -955,10 +1203,216 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
+namespace {
+
+using StatsClock = std::chrono::steady_clock;
+
+uint64_t StatsNs(StatsClock::time_point a, StatsClock::time_point b) {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+}
+
+// KYTY_BIND_MEMO_STATS: one FindBuffers slot, timed from construction; at destruction it counts
+// whether the slot found the same source for the same program and V# as its previous draw.
+struct FindSlotStats {
+	FindSlotStats(PreparedBindings::BufferSlotStats* slot, const PreparedBindings::BufferSource& source,
+	              const void* program, const ShaderRecompiler::IR::DescriptorValue& value, bool written,
+	              const BufferCache& cache)
+	    : slot(slot), source(source), program(program), value(value), written(written), cache(cache) {
+		if (slot != nullptr) {
+			const auto c0 = StatsClock::now();
+			start         = StatsClock::now();
+			PerfStats::Add(PerfStats::Counter::FbClockNs, StatsNs(c0, start));
+			epoch = cache.BufferSetEpoch();
+		}
+	}
+	~FindSlotStats() {
+		if (slot == nullptr) return;
+		const auto ns = StatsNs(start, StatsClock::now());
+		PerfStats::Add(PerfStats::Counter::FbSlots, 1);
+		PerfStats::Add(PerfStats::Counter::FbNs, ns);
+		// Sentinel write ranges also depend on the other stages (not kept, as in the fork).
+		const bool sentinel = written && DecodeNativeDescriptor<ShaderBufferResource>(value).NumRecords() == UINT32_MAX;
+		if (!sentinel && slot->program == program && slot->value == value && slot->find_epoch == epoch &&
+		    epoch == cache.BufferSetEpoch() && slot->source.address == source.address &&
+		    slot->source.size == source.size && slot->source.id == source.id) {
+			PerfStats::Add(PerfStats::Counter::FbHit, 1);
+			PerfStats::Add(PerfStats::Counter::FbHitNs, ns);
+		}
+		slot->program    = sentinel ? nullptr : program;
+		slot->value      = value;
+		slot->source     = source;
+		slot->find_epoch = cache.BufferSetEpoch();
+	}
+	PreparedBindings::BufferSlotStats*           slot;
+	const PreparedBindings::BufferSource&        source;
+	const void*                                  program;
+	const ShaderRecompiler::IR::DescriptorValue& value;
+	bool                                         written;
+	const BufferCache&                           cache;
+	StatsClock::time_point                       start {};
+	uint64_t                                     epoch = 0;
+};
+
+// KYTY_BIND_MEMO_STATS: classifies one NativeStorageBuffer call of RebindBuffers (CP back thread).
+void NoteBindStats(BufferCache& cache, PreparedBindings::BufferSlotStats& slot,
+                   const PreparedBindings::BufferSource& source, const ShaderRecompiler::IR::BufferResource& resource,
+                   const vk::DescriptorBufferInfo& info, uint32_t offset, uint64_t epoch0, uint64_t uploads0,
+                   uint64_t other0, uint64_t clock_ns, uint64_t ns) {
+	using PerfStats::Add;
+	using C = PerfStats::Counter;
+	Add(C::BmCalls, 1);
+	Add(C::BmNs, ns);
+	Add(C::BmClockNs, clock_ns);
+	const bool texel = resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled());
+	const auto kind  = static_cast<uint32_t>(resource.written ? 1 : texel ? 3 : 2);
+	const bool upload = cache.SyncUploads() != uploads0;
+	const bool other  = cache.SyncOther() != other0;
+	const bool stream = info.buffer && info.buffer == cache.GetUtilityBuffer(MemoryUsage::Stream).Handle();
+	bool       kept   = false;
+	if (source.address == 0 || source.size == 0) {
+		Add(C::BmNull, 1);
+		Add(C::BmNullNs, ns);
+	} else if (resource.written) {
+		Add(C::BmWritten, 1);
+		Add(C::BmWrittenNs, ns);
+	} else if (stream) {
+		Add(C::BmStream, 1);
+		Add(C::BmStreamNs, ns);
+	} else if (upload || other) {
+		Add(C::BmWork, 1);
+		Add(C::BmWorkNs, ns);
+		kept = !other; // after an upload the range is clean: a memo may store it
+	} else {
+		kept = true;
+		Add(C::BmClean, 1);
+		Add(C::BmCleanNs, ns);
+		if (kind == 3) {
+			Add(C::BmTexel, 1);
+			Add(C::BmTexelNs, ns);
+		}
+		const bool same_key = slot.kept && slot.address == source.address && slot.size == source.size &&
+		                      slot.kind == kind && slot.bind_epoch == epoch0 && epoch0 == cache.BufferSetEpoch();
+		if (same_key && slot.info == info && slot.offset == offset) {
+			Add(C::BmSlotHit, 1);
+			Add(C::BmSlotHitNs, ns);
+			if (kind == 3) {
+				Add(C::BmSlotTexel, 1);
+				Add(C::BmSlotTexelNs, ns);
+			}
+		} else if (same_key) {
+			Add(C::BmSlotDiff, 1);
+		}
+		struct RangeEntry {
+			uint64_t                 address = 0, size = 0, epoch = UINT64_MAX;
+			vk::DescriptorBufferInfo info;
+			uint32_t                 offset = 0, kind = 0;
+		};
+		static std::array<RangeEntry, 4096> table {}; // back thread only
+		auto& e = table[((source.address ^ (source.size << 40u) ^ kind) * 0x9e3779b97f4a7c15ull) >> 52u];
+		if (e.address == source.address && e.size == source.size && e.kind == kind && e.epoch == epoch0 &&
+		    epoch0 == cache.BufferSetEpoch() && e.info == info && e.offset == offset) {
+			Add(C::BmRangeHit, 1);
+			Add(C::BmRangeHitNs, ns);
+		}
+		e = {source.address, source.size, cache.BufferSetEpoch(), info, offset, kind};
+	}
+	slot = {slot.program, slot.value, slot.source, slot.find_epoch, source.address, source.size,
+	        cache.BufferSetEpoch(), info, offset, kind, kept};
+}
+
+// KYTY_BIND_MEMO (default 1): buffer slot memo, after pengui07/KytyPS5 (Petr, GPL-2.0).
+//   0: off: every slot looks its buffer up (FindBuffers) and binds it (RebindBuffers) at each draw;
+//   1 (default): a slot keeps its source while its V# and slot metadata, the buffer set and the guest virtual
+//      ranges are unchanged, and keeps its plain-read binding while its range, the buffer set and the
+//      CPU-dirty epochs of the 64 KiB blocks it covers are unchanged; in-session A/B:
+//      KYTY_AB_FLAG=bind_memo (arm 0 = off). Entries left during an off arm stay exact: every input
+//      they depend on is in their key;
+//   2: verify: each slot a memo would keep is looked up and bound anyway and compared ("PERF bindverify").
+// Off while imported memory, the late-read detector or a GPU capture is active (their bookkeeping
+// runs inside the lookups).
+int BindMemoMode(const BufferCache& cache) {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_BIND_MEMO");
+		const int   m     = value == nullptr ? 1 : std::atoi(value);
+		if (value != nullptr) {
+			std::printf("KYTY_BIND_MEMO=%d\n", m);
+		}
+		return m;
+	}();
+	if (mode == 0 || cache.ImportActive() || LateRead::Enabled() || GpuCapture::Enabled()) [[unlikely]] {
+		return 0;
+	}
+	return mode == 1 && PerfStats::AbOff("bind_memo") ? 0 : mode;
+}
+
+// KYTY_BIND_MEMO=2: the first differences, in the log (counts: "PERF bindverify", KYTY_PERF_STATS=1).
+void NoteVerifyDiff(const char* what, uint64_t address, uint64_t size, const char* why) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("KYTY_BIND_MEMO=2: %s diff addr=0x%016" PRIx64 " size=0x%" PRIx64 ": %s\n", what, address, size, why);
+	}
+}
+
+// KYTY_BIND_MEMO: one FindBuffers slot. Reads the generations before the lookup (an edit during it
+// makes the next draw miss) and stores the found source at destruction; in verify mode compares it
+// with the kept one.
+struct FindSlotMemo {
+	FindSlotMemo(PreparedBindings::BufferSlotMemo* memo, const PreparedBindings::BufferSource& source,
+	             const ShaderRecompiler::IR::DescriptorValue& value, const ShaderRecompiler::IR::BufferResource& metadata,
+	             const BufferCache& cache, bool check)
+	    : memo(memo), source(source), value(value), metadata(metadata), check(check) {
+		if (memo != nullptr) {
+			buffers = cache.BufferSetEpoch();
+			ranges  = LibKernel::Memory::VirtualRangesGeneration();
+			kept    = memo->source;
+		}
+	}
+	~FindSlotMemo() {
+		if (memo == nullptr) return;
+		if (check) {
+			PerfStats::Add(PerfStats::Counter::BvFindChecked, 1);
+			if (source.address != kept.address || source.size != kept.size || source.id != kept.id) {
+				PerfStats::Add(PerfStats::Counter::BvFindDiffs, 1);
+				NoteVerifyDiff("find", source.address, source.size, "other source");
+			}
+		}
+		// Sentinel write ranges also depend on the other stages' reads: not kept.
+		const bool sentinel =
+		    metadata.written && DecodeNativeDescriptor<ShaderBufferResource>(value).NumRecords() == UINT32_MAX;
+		memo->value           = value;
+		memo->max_byte_extent = metadata.max_byte_extent;
+		memo->written         = metadata.written;
+		memo->scalar          = metadata.scalar;
+		memo->find_kept       = !sentinel;
+		memo->find_buffers    = buffers;
+		memo->find_ranges     = ranges;
+		memo->source          = source;
+	}
+	PreparedBindings::BufferSlotMemo*            memo;
+	const PreparedBindings::BufferSource&        source;
+	const ShaderRecompiler::IR::DescriptorValue& value;
+	const ShaderRecompiler::IR::BufferResource&  metadata;
+	bool                                         check;
+	PreparedBindings::BufferSource               kept;
+	uint64_t                                     buffers = 0, ranges = 0;
+};
+
+bool FindKept(const PreparedBindings::BufferSlotMemo& memo, const ShaderRecompiler::IR::DescriptorValue& value,
+              const ShaderRecompiler::IR::BufferResource& metadata, const BufferCache& cache) {
+	return memo.find_kept && memo.value == value && memo.max_byte_extent == metadata.max_byte_extent &&
+	       memo.written == metadata.written && memo.scalar == metadata.scalar &&
+	       memo.find_buffers == cache.BufferSetEpoch() &&
+	       memo.find_ranges == LibKernel::Memory::VirtualRangesGeneration();
+}
+
+} // namespace
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindFindBuffersNs, PerfStats::BindProfEnabled());
 	auto& cache = m_context.GetBufferCache();
+	const bool memo_stats = PerfStats::BindMemoStatsEnabled();
+	const int  memo_mode  = BindMemoMode(cache);
 	BufferCache::UploadBatch upload_batch(cache);
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
@@ -969,10 +1423,31 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
 		}
+		if (memo_stats) {
+			prepared.buffer_stats.resize(prepared.buffer_sources.size());
+		}
+		if (memo_mode != 0) {
+			prepared.buffer_memo.resize(prepared.buffer_sources.size());
+		}
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
+			PreparedBindings::BufferSlotMemo* memo  = nullptr;
+			bool                              check = false;
+			if (memo_mode != 0) {
+				memo = &prepared.buffer_memo[metadata.descriptor_index];
+				if (FindKept(*memo, snapshot.buffers[resource], metadata, cache)) {
+					if (memo_mode == 1) {
+						source = memo->source;
+						continue;
+					}
+					check = true;
+				}
+			}
+			const FindSlotMemo slot_memo(memo, source, snapshot.buffers[resource], metadata, cache, check);
+			const FindSlotStats slot_stats(memo_stats ? &prepared.buffer_stats[metadata.descriptor_index] : nullptr,
+			                               source, &program, snapshot.buffers[resource], metadata.written, cache);
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
@@ -982,19 +1457,26 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				// still needs its full payload when NumRecords is smaller than it.
 				size = std::max(size, uint64_t {metadata.max_byte_extent});
 			}
-			if (address == 0 || size == 0) {
+			if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 				source = {};
 				continue;
 			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
-					// Sentinel write ranges end before tables captured by any bound stage.
+					// Sentinel write ranges end before tables captured by any bound stage. A
+					// compute dispatch's own scalar reads may overlap its writes (the scalar cache
+					// is not coherent with the dispatch's vector writes, so the values captured at
+					// dispatch start are a valid result), so a table at the start of its own range
+					// is allowed; later tables still end the range so it never grows past the
+					// existing limits.
 					for (const auto* reader: stages) {
+						const bool own_compute_reads =
+						    reader == stage && program.stage == ShaderType::Compute;
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
+							} else if (address - read_address < read_size && !own_compute_reads) {
 								EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}
@@ -1048,13 +1530,88 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	const bool memo_stats = PerfStats::BindMemoStatsEnabled();
+	if (memo_stats) {
+		prepared.buffer_stats.resize(prepared.buffers.size());
+	}
+	auto&     cache     = m_context.GetBufferCache();
+	const int memo_mode = BindMemoMode(cache);
+	if (memo_mode != 0) {
+		prepared.buffer_memo.resize(prepared.buffers.size());
+	}
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
 		PerfStats::ScopedTimer obtain_timer(PerfStats::Counter::BindObtainNs, PerfStats::SrtProfEnabled());
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		const auto& source = prepared.buffer_sources[index];
+		// Plain reads only: written bindings record GPU ownership and texel reads may copy an image.
+		const bool plain_read = !resource.written && !resource.formatted &&
+		                        !(resource.read && Config::SyncRawImageBuffersEnabled());
+		if (memo_mode != 0 && plain_read && source.address != 0 && source.size != 0) {
+			auto&      memo      = prepared.buffer_memo[index];
+			const auto cpu_epoch = cache.CpuDirtyEpoch(source.address, source.size); // before the dirty check
+			const bool kept = memo.bind_kept && memo.address == source.address && memo.size == source.size &&
+			                  memo.bind_buffers == cache.BufferSetEpoch() && memo.cpu_epoch == cpu_epoch;
+			if (kept && memo_mode == 1) {
+				// The range is as clean as when it was bound: the lookup would find the same buffer
+				// and have nothing to upload.
+				GpuCapture::Touch(source.address, source.size);
+				cache.TouchBinding(*memo.buffer);
+				prepared.buffers[index] = memo.info;
+				buffer_offset           = memo.offset;
+			} else {
+				const auto    uploads0 = cache.SyncUploads();
+				const auto    other0   = cache.SyncOther();
+				const Buffer* buffer   = nullptr;
+				prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset, &buffer);
+				const auto& info   = prepared.buffers[index];
+				const bool  stream = info.buffer == cache.GetUtilityBuffer(MemoryUsage::Stream).Handle();
+				const bool  other  = cache.SyncOther() != other0;
+				if (kept) {
+					PerfStats::Add(PerfStats::Counter::BvBindChecked, 1);
+					const char* why = stream                            ? "stream copy"
+					                  : other                           ? "image or imported sync"
+					                  : cache.SyncUploads() != uploads0 ? "upload"
+					                  : info != memo.info               ? "other descriptor"
+					                  : buffer_offset != memo.offset    ? "other offset"
+					                                                    : nullptr;
+					if (why != nullptr && cache.CpuDirtyEpoch(source.address, source.size) != cpu_epoch) {
+						// A guest write that faulted during this lookup: had it landed just after,
+						// the full path would miss it too until the next draw.
+						PerfStats::Add(PerfStats::Counter::BvBindRaced, 1);
+					} else if (why != nullptr) {
+						PerfStats::Add(PerfStats::Counter::BvBindDiffs, 1);
+						NoteVerifyDiff("bind", source.address, source.size, why);
+					}
+				} else if (memo_mode == 2) {
+					PerfStats::Add(PerfStats::Counter::BvBindMisses, 1);
+				}
+				// A stream copy is valid for this draw only; image copies are redone at each bind.
+				memo.bind_kept    = !stream && !other && buffer != nullptr;
+				memo.address      = source.address;
+				memo.size         = source.size;
+				memo.bind_buffers = cache.BufferSetEpoch();
+				memo.cpu_epoch    = cpu_epoch;
+				memo.buffer       = buffer;
+				memo.info         = info;
+				memo.offset       = buffer_offset;
+			}
+		} else if (memo_stats) [[unlikely]] {
+			const auto c0      = StatsClock::now();
+			const auto c1      = StatsClock::now();
+			const auto epoch0  = cache.BufferSetEpoch();
+			const auto upload0 = cache.SyncUploads();
+			const auto other0  = cache.SyncOther();
+			prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
+			                                              resource, buffer_offset);
+			NoteBindStats(cache, prepared.buffer_stats[index], prepared.buffer_sources[index], resource,
+			              prepared.buffers[index], buffer_offset, epoch0, upload0, other0, StatsNs(c0, c1),
+			              StatsNs(c1, StatsClock::now()));
+		} else {
+			prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
+			                                              resource, buffer_offset);
+		}
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =

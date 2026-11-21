@@ -158,6 +158,77 @@ enum class Counter : uint32_t {
 	StagingWriteNs,      // guest bytes written into the upload staging ring (any thread)
 	StagingWriteBytes,
 	StagingWriteCount,
+	// Descriptor heaps ("PERF descheap" line): sets allocated, pools recycled once the GPU is done
+	// with them, allocations that found the current pool full, and new pools.
+	DescSetAllocs,
+	DescPoolResets,
+	DescPoolFull,
+	DescPoolCreates,
+	PatchDraws,          // tessellation patch draws, drawn or skipped (--no-tessellation)
+	TessPipelines,       // tessellation pipelines created, of which
+	TessPipelineMisses,  //   missed the pipeline cache
+	TessPipelineMissNs,
+	// LS, HS and DS program misses on the draw thread ("PERF tessmiss"), and those it translated
+	// itself; the others (KYTY_TESS_PRETRANSLATE) were translated by a worker and only emitted there.
+	TessMissLs,
+	TessMissHs,
+	TessMissDs,
+	TessInlineLs,
+	TessInlineHs,
+	TessInlineDs,
+	TessInlineNs,      // draw-thread preparation + translation of those
+	TessMissNs,        // whole misses (translation, emission, module)
+	TessDeferredDraws, // KYTY_TESS_PRETRANSLATE: draws skipped while a worker translates their stages
+	// Presented frames by interval, in 60 Hz vsync buckets: < 41.7 ms (33), < 58.3 ms (50),
+	// < 75 ms (67), longer ("PERF frames").
+	Frames33,
+	Frames50,
+	Frames67,
+	FramesLong,
+	// KYTY_RESOLVE_INPLACE (descriptors.cpp, "PERF resolveinplace"): textures bound in place, and with =2
+	// those resolved again by the main path and compared.
+	RiKept,
+	RiChecked,
+	RiDiffs,
+	RiResourceDiffs, // the address said same resource, the full comparison did not
+	RiRaced,         // only the image differed, and the texture cache epoch moved between the lookups
+	// KYTY_BIND_MEMO_STATS=1 (measurement; needs KYTY_PERF_STATS=1), CP back thread only: buffer slot
+	// lookups a memo could keep ("PERF bindmemo"). Each *Ns includes one clock read (BmClockNs per call).
+	BmCalls,       // RebindBuffers: NativeStorageBuffer calls
+	BmNs,
+	BmClockNs,     // one empty clock pair per call (to subtract)
+	BmNull,        // null range
+	BmNullNs,
+	BmWritten,     // written binding
+	BmWrittenNs,
+	BmStream,      // read copied into the stream buffer (CPU-dirty range)
+	BmStreamNs,
+	BmWork,        // read whose synchronization uploaded, copied an image or went through imported memory
+	BmWorkNs,
+	BmClean,       // read with nothing to do
+	BmCleanNs,
+	BmTexel,       //   of clean: formatted (texel) reads
+	BmTexelNs,
+	BmSlotHit,     //   of clean: same input and result as the slot's previous lookup (stored after no stream/image),
+	BmSlotHitNs,   //   no buffer (un)registered in between
+	BmSlotTexel,   //     of slot hits: texel
+	BmSlotTexelNs,
+	BmSlotDiff,    //   same slot input and buffer set, but another result (a memo would be wrong)
+	BmRangeHit,    //   of clean: the same by (range, kind) in a 4096-entry direct-mapped table
+	BmRangeHitNs,
+	FbSlots,       // FindBuffers: buffer slots
+	FbNs,
+	FbClockNs,
+	FbHit,         // same program, V# and resulting source as the slot's previous draw, buffer set unchanged
+	FbHitNs,
+	// KYTY_BIND_MEMO=2 (descriptors.cpp): slots the memo would keep, looked up anyway, and differences
+	// ("PERF bindverify").
+	BvFindChecked,
+	BvFindDiffs,
+	BvBindChecked,
+	BvBindDiffs,
+	BvBindMisses,  // plain-read slots the memo could not keep (key or epoch changed, or not stored)
+	BvBindRaced,   // of checked: differed, but the CPU-dirty epoch moved during the lookup itself
 	Count
 };
 
@@ -171,6 +242,8 @@ enum class Counter : uint32_t {
 // descriptor evaluation, specialization, permutation search), counts what changes between lookups and
 // which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
 [[nodiscard]] bool SrtProfEnabled() noexcept;
+// KYTY_BIND_MEMO_STATS=1 (measurement, default off; needs KYTY_PERF_STATS=1), on the CP back thread.
+[[nodiscard]] bool BindMemoStatsEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;
@@ -180,6 +253,7 @@ void               MaybeReport() noexcept;
 void SetStorageBoundsCounters(const volatile uint32_t* counters) noexcept;
 // A pipeline creation reported by VK_EXT_pipeline_creation_feedback (core in Vulkan 1.3).
 void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) noexcept;
+void NoteTessPipeline(bool cache_miss, uint64_t duration_ns) noexcept;
 
 // KYTY_FRAME_TIMES=<file> (measurement, default off): one line per presented frame with its
 // steady-clock time in microseconds and the flip argument of the latest guest flip completed before
@@ -198,6 +272,8 @@ void NoteFlipArg(int64_t arg) noexcept;
 // frames (A/A). A driven option must be safe to change between two frames (no pipeline, shader or
 // cache-key effect). True when `flag` is driven and the current arm is 0.
 [[nodiscard]] bool AbOff(const char* flag) noexcept;
+// AbOff without the flag name: the current arm is 0. For a hot caller that compared KYTY_AB_FLAG once.
+[[nodiscard]] bool AbArmOff() noexcept;
 
 // KYTY_COMPILE_LOG=<file> (diagnostic, default off): one line per shader registration, program
 // translation miss and pipeline creation, each starting with a kind letter and its steady-clock time

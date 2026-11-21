@@ -8,6 +8,10 @@ namespace Libs::VideoDec2::Decoder {
 
 constexpr uint64_t TIMESTAMP_INVALID = UINT64_MAX;
 
+// KYTY_VIDEODEC2_TEN_BIT=1: HEVC/VP9 10-bit frames keep 16-bit samples and their buffers are
+// sized from the configured dimensions. Off by default: 10-bit frames are converted to NV12.
+bool TenBitOutputEnabled();
+
 enum class Result {
 	Ok,
 	ApiFail,
@@ -46,6 +50,7 @@ struct Output {
 	uint32_t codec_type      = 0;
 	uint32_t width           = 0;
 	uint32_t pitch           = 0;
+	uint32_t pitch_in_bytes  = 0;
 	uint32_t height          = 0;
 	void*    buffer          = nullptr;
 	size_t   buffer_size     = 0;

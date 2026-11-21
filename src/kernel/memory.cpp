@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -9,6 +10,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/host_gpu/memTrackProf.h"
@@ -21,6 +23,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -175,8 +178,11 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static callback_func_t       g_test_before_backing_map   = nullptr;
 static callback_func_t       g_test_backing_read         = nullptr;
+static int                   g_test_sparse_copy_cache_mode = -1; // -1 = KYTY_SPARSE_COPY_CACHE
 static uint64_t              g_test_backing_bytes_zeroed = 0;
 static std::atomic<uint64_t> g_test_free_range_visits {0};
+static int                   g_test_vma_memo_mode = -1; // -1 = KYTY_VMA_MEMO
+static std::atomic<uint64_t> g_test_vma_memo_hits {0};
 #endif
 
 // Windows cannot unmap part of a file view: a partial unmap remaps the surviving parts, which
@@ -241,6 +247,49 @@ static bool IsCommittedRangeType(VirtualRangeType type) {
 	return !IsReservedRangeType(type);
 }
 
+// KYTY_VMA_MEMO: 1 (default) answers IsVirtualAddressKnown and ClampRangeSize from the thread's
+// recently found ranges, without the lock, while no range edit ran since. 0 always searches the
+// range map under its lock. 2 also redoes each memo answer under the lock, exits on a difference and
+// counts hits and misses. Read once. In-session A/B: KYTY_AB_FLAG=vma_memo (arm 0 searches the map).
+static int VmaMemoMode() {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (g_test_vma_memo_mode >= 0) {
+		return g_test_vma_memo_mode;
+	}
+#endif
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
+		const char* value = std::getenv("KYTY_VMA_MEMO");
+		const int   m = value == nullptr ? 1 : static_cast<int>(std::strtol(value, nullptr, 10));
+		// Two threads may make the first call at once: the flag keeps the log line single.
+		static std::atomic<bool> logged {false};
+		if (value != nullptr && !logged.exchange(true)) {
+			std::printf("KYTY_VMA_MEMO=%d: per-thread range lookup memo %s\n", m, m != 0 ? "on" : "off");
+			std::fflush(stdout);
+		}
+		return m;
+	}));
+	return mode;
+}
+
+// Bumped by every range-map edit (and by each new map), under the map lock, so a memo slot whose
+// generation is still current describes the map as it is now.
+static std::atomic<uint64_t> g_vma_generation {1};
+
+struct VmaMemo {
+	struct Slot {
+		const void* owner      = nullptr;
+		uint64_t    generation = 0;
+		uint64_t    start      = 0;
+		uint64_t    end        = 0;
+		bool        committed  = false;
+	};
+	static constexpr uint32_t Ways = 4;
+	Slot                      slots[Ways];
+	uint32_t                  next = 0;
+};
+static thread_local VmaMemo t_vma_memo;
+
 class VirtualRanges {
 public:
 	struct Range {
@@ -254,9 +303,13 @@ public:
 		char             name[KERNEL_MAXIMUM_NAME_LENGTH];
 	};
 
+	// A new map at a freed one's address must not reuse that map's memo slots.
+	VirtualRanges() { Edited(); }
+
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		Edited();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -287,6 +340,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		Edited();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -314,21 +368,11 @@ public:
 		return true;
 	}
 
-	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
-		auto position = m_ranges.find(start);
-		if (position != m_ranges.end() && position->second.size == size &&
-		    IsReservedRangeType(position->second.type)) {
-			EraseUnlocked(position);
-		}
-		return true;
-	}
-
 	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type, uint64_t offset,
 	                 int protection, int memory_type, VirtualRangeType type, const char* name,
 	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		Edited();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -369,6 +413,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		Edited();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -381,6 +426,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		Edited();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -442,9 +488,59 @@ public:
 		return true;
 	}
 
+	// Query(addr, 0, ...) != false, through the thread's memo when KYTY_VMA_MEMO is on.
+	bool IsKnown(uint64_t addr) {
+		const int mode = MemoMode();
+		if (mode != 0) {
+			if (const auto generation = MemoFind(addr, 1, false); generation != 0) {
+				if (mode == 2) {
+					Common::LockGuard lock(m_mutex);
+					EXIT_IF(Generation() == generation && FindContaining(addr) == m_ranges.end());
+					MemoChecked(true);
+				}
+				return true;
+			}
+			if (mode == 2) {
+				MemoChecked(false);
+			}
+		}
+		Common::LockGuard lock(m_mutex);
+		auto              vma = FindContaining(addr);
+		if (vma == m_ranges.end()) {
+			return false;
+		}
+		if (mode != 0) {
+			MemoRemember(vma->second);
+		}
+		return true;
+	}
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+		const int mode = MemoMode();
+		if (mode != 0 && virtual_addr != 0 && size != 0 && size <= UINT64_MAX - virtual_addr) {
+			// The span lies inside one committed range: the walk below would return size.
+			if (const auto generation = MemoFind(virtual_addr, size, true); generation != 0) {
+				if (mode == 2) {
+					EXIT_IF(ClampRangeSizeLocked(virtual_addr, size, false, generation) != size);
+					MemoChecked(true);
+				}
+				return size;
+			}
+			if (mode == 2) {
+				MemoChecked(false);
+			}
+		}
+		return ClampRangeSizeLocked(virtual_addr, size, mode != 0, 0);
+	}
+
+	// check_generation != 0 (mode 2): returns size if the map changed since that generation.
+	uint64_t ClampRangeSizeLocked(uint64_t virtual_addr, uint64_t size, bool remember,
+	                              uint64_t check_generation) {
 		Common::LockGuard lock(m_mutex);
 
+		if (check_generation != 0 && Generation() != check_generation) {
+			return size;
+		}
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
@@ -452,6 +548,9 @@ public:
 		auto vma = FindContaining(virtual_addr);
 		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
 			return 0;
+		}
+		if (remember) {
+			MemoRemember(vma->second);
 		}
 		const auto vma_end = End(vma->second.start, vma->second.size);
 
@@ -478,6 +577,71 @@ public:
 private:
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
+	}
+
+	static int MemoMode() {
+		// The flag name is compared once, so both A/B arms pay the same per-lookup cost.
+		static std::atomic<int64_t> driven_once {Common::OnceUnset};
+		const auto driven = static_cast<bool>(Common::Once(driven_once, [] {
+			const char* flag = std::getenv("KYTY_AB_FLAG");
+			return flag != nullptr && std::strcmp(flag, "vma_memo") == 0;
+		}));
+		const int mode = VmaMemoMode();
+		return mode != 0 && driven && Libs::Graphics::PerfStats::AbArmOff() ? 0 : mode;
+	}
+
+	static uint64_t Generation() { return g_vma_generation.load(std::memory_order_acquire); }
+
+	// Called with m_mutex held by every edit, so a slot taken under the lock at this generation
+	// stays exact until the next edit starts.
+	static void Edited() { g_vma_generation.fetch_add(1, std::memory_order_acq_rel); }
+
+	// Generation of a current slot holding [addr, addr + size) (committed if asked), else 0.
+	uint64_t MemoFind(uint64_t addr, uint64_t size, bool committed) const {
+		const auto generation = Generation();
+		for (const auto& slot: t_vma_memo.slots) {
+			if (slot.owner == this && slot.generation == generation && addr >= slot.start &&
+			    addr < slot.end && size <= slot.end - addr && (slot.committed || !committed)) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+				g_test_vma_memo_hits++;
+#endif
+				return generation;
+			}
+		}
+		return 0;
+	}
+
+	// Under m_mutex.
+	void MemoRemember(const Range& range) const {
+		auto& memo = t_vma_memo;
+		// Refresh the slot of the same range (a span across two ranges misses and remembers the first
+		// one on every call), so it does not push out the other ranges.
+		VmaMemo::Slot* same = nullptr;
+		for (auto& s: memo.slots) {
+			if (s.owner == this && s.start == range.start) {
+				same = &s;
+			}
+		}
+		auto& slot      = same != nullptr ? *same : memo.slots[memo.next++ % VmaMemo::Ways];
+		slot.owner      = this;
+		slot.generation = g_vma_generation.load(std::memory_order_relaxed);
+		slot.start      = range.start;
+		slot.end        = End(range.start, range.size);
+		slot.committed  = IsCommittedRangeType(range.type);
+	}
+
+	// Mode 2: counts memo hits (checked under the lock) and misses, printed every 2^20 lookups.
+	void MemoChecked(bool hit) {
+		const auto missed =
+		    hit ? m_memo_missed.load(std::memory_order_relaxed)
+		        : m_memo_missed.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto n = m_memo_checked.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n & 0xfffff) == 0) {
+			std::printf("KYTY_VMA_MEMO=2: %" PRIu64 " lookups, %" PRIu64 " memo answers checked, %" PRIu64
+			            " misses\n",
+			            n, n - std::min(missed, n), missed);
+			std::fflush(stdout);
+		}
 	}
 
 	static bool SameMergeKey(const Range& left, const Range& right) {
@@ -646,10 +810,12 @@ private:
 		return nullptr;
 	}
 
-	RangeMap      m_ranges;
-	Common::Mutex m_mutex;
-	uint64_t      m_cpu_page_table_entries = 0;
-	uint64_t      m_gpu_page_table_entries = 0;
+	RangeMap              m_ranges;
+	Common::Mutex         m_mutex;
+	uint64_t              m_cpu_page_table_entries = 0;
+	uint64_t              m_gpu_page_table_entries = 0;
+	std::atomic<uint64_t> m_memo_checked {0};
+	std::atomic<uint64_t> m_memo_missed {0};
 };
 
 static void RemoveFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start, uint64_t size) {
@@ -956,11 +1122,14 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+uint64_t VirtualRangesGeneration() {
+	return g_vma_generation.load(std::memory_order_acquire);
+}
+
 bool IsVirtualAddressKnown(uint64_t vaddr) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
-	VirtualRanges::Range range {};
-	return g_virtual_ranges->Query(vaddr, 0, &range);
+	return g_virtual_ranges->IsKnown(vaddr);
 }
 
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
@@ -1022,6 +1191,10 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t guest_vaddr,
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, guest_vaddr);
 }
 
+bool DescribeNearestGpuMapping(uint64_t fault_vaddr, uint64_t* begin, uint64_t* end) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->DescribeNearestMapping(fault_vaddr, begin, end);
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;
@@ -1059,6 +1232,21 @@ bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->CopySparseMemory<true>(vaddr, data, size);
+}
+
+SparseCopyStats GetSparseCopyStats() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetSparseCopyStats() : SparseCopyStats {};
+}
+
+void ReportSparseCopyCache() {
+	const auto s = GetSparseCopyStats();
+	if (s.mode == 0) {
+		return;
+	}
+	// Totals since start, so the last line covers the whole session.
+	std::printf("PERF sparsecopy total: mode=%d checked=%" PRIu64 " locked=%" PRIu64 " stale_bytes=%" PRIu64
+	            " stale_maps=%" PRIu64 " bumps_maps=%" PRIu64 " bumps_bytes=%" PRIu64 "\n",
+	            s.mode, s.checked, s.locked, s.stale_bytes, s.stale_maps, s.map_bumps, s.byte_bumps);
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {
@@ -2032,6 +2220,23 @@ static void UnmapGpuRanges(const std::vector<VirtualRanges::Range>& ranges) {
 	}
 }
 
+// A span can hold pages unmapped earlier: its tracked fragments, when there is at least one and
+// every hole between them is free guest address space (an untracked address is not a mapping).
+static bool QueryTrackedFragmentsAroundFreeHoles(uint64_t vaddr, uint64_t len,
+                                                 std::vector<VirtualRanges::Range>* ranges) {
+	if (g_virtual_ranges->QueryFragments(vaddr, len, ranges) == 0) {
+		return false;
+	}
+	auto current = vaddr;
+	for (const auto& range: *ranges) {
+		if (range.start > current && !g_guest_address_space->ContainsFree(current, range.start - current)) {
+			return false;
+		}
+		current = range.start + range.size;
+	}
+	return current == vaddr + len || g_guest_address_space->ContainsFree(current, vaddr + len - current);
+}
+
 // The ABI entry point and batch operations hold g_memory_operation_mutex.
 static int UnmapMemory(uint64_t vaddr, size_t len) {
 	LOGF("\t start = 0x%016" PRIx64 "\n"
@@ -2044,7 +2249,8 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 	}
 	len = (len + page_size - 1) & ~(page_size - 1);
 	std::vector<VirtualRanges::Range> ranges;
-	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
+	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges) &&
+	    !QueryTrackedFragmentsAroundFreeHoles(vaddr, len, &ranges)) {
 		return KERNEL_ERROR_EACCES;
 	}
 	UnmapGpuRanges(ranges);
@@ -2065,6 +2271,13 @@ static bool IsAmmMemoryRange(uint64_t vaddr, size_t size) {
 	return size != 0 && ((vaddr | size) & (page_size - 1)) == 0 &&
 	       vaddr >= kExtendedMemoryBase && vaddr < kExtendedMemoryBase + kExtendedMemorySize &&
 	       size <= kExtendedMemoryBase + kExtendedMemorySize - vaddr;
+}
+
+// A PRT range holds its addresses without physical memory; CPU access faults.
+int MapPrtMemory(uint64_t vaddr, size_t size) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
+	return ReplaceFixedRangeWithReserved(vaddr, size);
 }
 
 int UnmapAmmMemory(uint64_t vaddr, size_t size) {
@@ -2382,6 +2595,23 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
+// A fixed map of exactly the live direct range (same offset, protection and type, still a view of
+// the backing at that offset) changes nothing: skip the teardown and rebuild and its fault window.
+static bool FixedMapMatchesExistingRange(uint64_t vaddr, uint64_t size, int64_t phys_offset,
+                                         int prot, int type) {
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(vaddr, size, &ranges) || ranges.size() != 1) {
+		return false;
+	}
+	const auto& r              = ranges.front();
+	uint64_t    backing_offset = 0;
+	return r.type == VirtualRangeType::Direct && r.start == vaddr && r.size == size &&
+	       r.offset == static_cast<uint64_t>(phys_offset) && r.protection == prot &&
+	       (type == -1 || r.memory_type == type) &&
+	       g_guest_address_space->BackingOffsetOf(vaddr, size, &backing_offset) &&
+	       backing_offset == static_cast<uint64_t>(phys_offset);
+}
+
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
                            int64_t direct_memory_start, size_t alignment, const char* name,
@@ -2434,6 +2664,11 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		}
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
+		}
+
+		if (FixedMapMatchesExistingRange(in_addr, len, direct_memory_start, prot, type)) {
+			*addr = reinterpret_cast<void*>(in_addr);
+			return OK;
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -2576,6 +2811,56 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
 		EXIT_IF(MapDirectMemory(&address, length, prot, 0x10, static_cast<int64_t>(offset),
 		                        page_size, "", type) != OK);
 		mapped += length;
+	}
+	return OK;
+}
+
+// Moves a mapped range onto PRT addresses; the pages keep their memory type.
+int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int prot) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(prt_vaddr, size) || !IsAmmMemoryRange(old_vaddr, size)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (!IsReservedSpan(prt_vaddr, size)) {
+		return KERNEL_ERROR_EACCES;
+	}
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(old_vaddr, size, &ranges) ||
+	    std::any_of(ranges.begin(), ranges.end(),
+	                [](const auto& range) { return range.type != VirtualRangeType::Direct; })) {
+		return AMM_ERROR_REGION_NOT_FULLY_MAPPED;
+	}
+	// The new mapping references the pages before the old one releases them.
+	for (const auto& range: ranges) {
+		void* address = reinterpret_cast<void*>(prt_vaddr + (range.start - old_vaddr));
+		EXIT_IF(MapDirectMemory(&address, range.size, prot, 0x10,
+		                        static_cast<int64_t>(range.offset), PRT_PAGE_SIZE, "",
+		                        range.memory_type) != OK);
+	}
+	UnmapGpuRanges(ranges);
+	for (const auto& range: ranges) {
+		UnmapMemoryOwner(range);
+	}
+	return OK;
+}
+
+int KYTY_SYSV_ABI KernelWriteRemapIntoPrtCommand(uint32_t* record, uint64_t prt_vaddr,
+                                                 uint64_t old_vaddr, uint64_t size, int prot,
+                                                 int prot_mask, uint64_t* record_size) {
+	PRINT_NAME();
+	if (!IsAmmMemoryRange(prt_vaddr, size) || !IsAmmMemoryRange(old_vaddr, size) ||
+	    (prot & ~0x3f7) != 0 || prot_mask != 0x3f3) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (record != nullptr) {
+		record[0] = 0x8327u | static_cast<uint32_t>(prot) << 12;
+		record[1] = static_cast<uint32_t>(prt_vaddr >> 14);
+		record[2] = static_cast<uint32_t>(old_vaddr >> 14);
+		record[3] = static_cast<uint32_t>(size >> 14 << 5 | (old_vaddr >> 46 & 3) << 2 |
+		                                  (prt_vaddr >> 46 & 3));
+	}
+	if (record_size != nullptr) {
+		*record_size = 16;
 	}
 	return OK;
 }
@@ -2723,6 +3008,18 @@ void TestBeforeNextBackingMap(callback_func_t callback) {
 
 void TestSetBackingReadCallback(callback_func_t callback) {
 	g_test_backing_read = callback;
+}
+
+void TestSetSparseCopyCacheMode(int mode) {
+	g_test_sparse_copy_cache_mode = mode;
+}
+
+void TestSetVmaMemoMode(int mode) {
+	g_test_vma_memo_mode = mode;
+}
+
+uint64_t TestVmaMemoHits() {
+	return g_test_vma_memo_hits;
 }
 
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {

@@ -1,6 +1,7 @@
 #include "mainDialog.h"
 
 #include "cheatFile.h"
+#include "cmdCommand.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
@@ -47,7 +48,6 @@ class QWidget;
 
 #if defined(_WIN32)
 constexpr char  EMULATOR_EXE[] = "kyty_emulator.exe";
-constexpr char  CMD_EXE[]      = "cmd.exe";
 constexpr DWORD CMD_X_CHARS    = 175;
 constexpr DWORD CMD_Y_CHARS    = 1000;
 #else
@@ -72,7 +72,7 @@ public:
 
 	void Update();
 	void FindInterpreter();
-	void Run();
+	void Run(const QString& activity);
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
 
@@ -135,17 +135,25 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->close_terminal->setVisible(false); // The emulator runs without a terminal.
 #endif
 
-	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowMinMaxButtonsHint |
-	                            Qt::WindowCloseButtonHint);
+	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowTitleHint | Qt::WindowSystemMenuHint |
+	                            Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint);
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
-	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
-		Update();
+	const auto update_title_sound = [this]() {
 		const auto* item = m_ui->widget->GetSelectedItem();
 		m_title_sound.SetTitle(m_running_games == 0 && item != nullptr ? item->GetInfo().basedir
 		                                                               : QString());
+	};
+	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this, update_title_sound]() {
+		Update();
+		update_title_sound();
+		if (m_ui->widget->GetSelectedItem() != nullptr) {
+			m_title_sound.PlayNavigation();
+		}
 	});
+	// The first game is selected while the widget is built, before this connection exists.
+	update_title_sound();
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_running_games == 0) {
@@ -174,6 +182,19 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(main_dialog, &MainDialog::Resize, [this]() {
 		g_last_geometry = m_main_dialog->saveGeometry();
 		m_ui->widget->WriteSettings();
+	});
+
+	m_controller_preview.SetBatteryMonitor(true);
+	connect(&m_controller_preview, &ControllerPreview::NavigationInput, this,
+	        [this](int action) { m_ui->widget->GamepadNavigate(action); }, Qt::QueuedConnection);
+	connect(&m_controller_preview, &ControllerPreview::StateChanged, this, [this]() {
+		const bool wired = m_controller_preview.ControllerWired();
+		const bool charging = m_controller_preview.BatteryCharging();
+		// Wired and not charging: only the controller + cable glyph is shown.
+		const int percent = !m_controller_preview.ControllerConnected() ? -1
+		                    : (wired && !charging)                    ? 101
+		                                                              : m_controller_preview.BatteryPercent();
+		m_ui->widget->SetControllerBattery(percent, charging);
 	});
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
@@ -282,9 +303,12 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
+	if (!info.launch_activity.isEmpty()) {
+		args << "--launch-activity" << info.launch_activity;
+	}
 	AddFlag(args, info.network_connected, "--network-connected");
 	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
-	AddFlag(args, info.tessellation_enabled, "--tessellation");
+	AddFlag(args, !info.tessellation_enabled, "--no-tessellation");
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
 	AddFlag(args, info.relaxed_shader_float, "--relaxed-shader-float");
 	AddFlag(args, info.native_rt, "--native-rt");
@@ -413,21 +437,6 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 }
 #endif
 
-#if defined(_WIN32)
-// cmd /K arguments that keep the console open (with close_on_clean_exit, only after an error).
-// A quote is written as "" rather than \" so cmd's quote count stays even and operators inside
-// arguments stay quoted.
-static QString CmdCommand(const QString& interpreter, const QStringList& args,
-                          bool close_on_clean_exit) {
-	static const QRegularExpression quote_or_end(QStringLiteral(R"((\\*)("|\z))"));
-	// The UCRT reads 2n backslashes before a quote as n.
-	auto quoted = QStringList {interpreter} + args;
-	quoted.replaceInStrings(quote_or_end, QStringLiteral(R"(\1\1\2\2)"));
-	return QStringLiteral("/K \"\"") + quoted.join(QStringLiteral("\" \"")) +
-	       (close_on_clean_exit ? "\" && exit\"" : "\"\"");
-}
-#endif
-
 // A missing or malformed file only logs a warning: the game starts without presets.
 static void ApplyPresets(const Configuration& info, QProcessEnvironment& environment,
                          QStringList& args) {
@@ -453,14 +462,14 @@ static void ApplyPresets(const Configuration& info, QProcessEnvironment& environ
 	                  << (applied.isEmpty() ? QStringLiteral("(none)") : applied.join(' '));
 }
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
+bool MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
 	const auto& interpreter = m_p->GetInterpreter();
 
 	auto args = CreateEmulatorArgs(info);
 	if (args.isEmpty()) {
 		QMessageBox::critical(this, tr("Error"), tr("Invalid emulator configuration"));
 		QApplication::quit();
-		return;
+		return false;
 	}
 
 	// Presets come last so the dialog settings and the user's environment win.
@@ -469,7 +478,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	QString error;
 	if (!info.MacEnvironment(environment, error)) {
 		QMessageBox::critical(this, tr("Error"), error);
-		return;
+		return false;
 	}
 #endif
 	if (info.recommended_options) {
@@ -495,16 +504,25 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	}
 #elif defined(_WIN32)
 	// Use nativeArguments so Qt does not re-quote the /K command string.
-	process->setProgram(CMD_EXE);
+	process->setProgram(CmdProgram);
 	process->setArguments({});
-	process->setNativeArguments(
-	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
+	const auto launch = CmdCommand(QStringList {QDir::toNativeSeparators(interpreter)} + args,
+	                               close_terminal, environment);
+	if (!launch) {
+		QMessageBox::critical(this, tr("Error"),
+		                      tr("The emulator arguments are longer than %1 characters or contain a "
+		                         "NUL character; cmd.exe cannot pass them on")
+		                          .arg(CmdArgumentsLimit));
+		return false;
+	}
+	process->setProcessEnvironment(launch->environment);
+	process->setNativeArguments(launch->native_arguments);
 #endif
 #if defined(__APPLE__)
 	const auto runtime = Configuration::MacRuntimeDirectory();
 	if (!QDir().mkpath(runtime)) {
 		QMessageBox::critical(this, tr("Error"), tr("Cannot create runtime folder: %1").arg(runtime));
-		return;
+		return false;
 	}
 	process->setWorkingDirectory(runtime);
 #else
@@ -530,10 +548,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 		QMessageBox::critical(
 		    this, tr("Error"),
 		    tr("Failed to start:\n%1\n\n%2").arg(process->program(), process->errorString()));
-		return;
+		return true;
 	}
 #endif
 	process->waitForFinished(100);
+	return true;
 }
 
 void MainDialog::WriteSettings(QSettings& s) {
@@ -576,7 +595,7 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 	s.endGroup();
 }
 
-void MainDialogPrivate::Run() {
+void MainDialogPrivate::Run(const QString& activity) {
 	if (m_update_checker->IsInstalling()) {
 		return;
 	}
@@ -593,6 +612,9 @@ void MainDialogPrivate::Run() {
 	auto* process = new QProcess(this);
 	connect(process, &QProcess::stateChanged, this,
 	        [this, process, item](QProcess::ProcessState state) {
+		        if (state == QProcess::Running) {
+			        m_main_dialog->showMinimized();
+		        }
 		        if (state == QProcess::NotRunning) {
 			        if (item != nullptr) {
 				        item->SetRunning(false);
@@ -600,10 +622,28 @@ void MainDialogPrivate::Run() {
 			        m_running_games--;
 			        process->deleteLater();
 			        Update();
+			        // The launcher comes back, with its title music, once the last game has exited.
+			        if (m_running_games == 0) {
+				        m_main_dialog->setWindowState(m_main_dialog->windowState() &
+				                                      ~Qt::WindowMinimized);
+				        m_main_dialog->show();
+				        m_main_dialog->raise();
+				        m_main_dialog->activateWindow();
+				        const auto* selected = m_ui->widget->GetSelectedItem();
+				        m_title_sound.SetTitle(selected != nullptr ? selected->GetInfo().basedir
+				                                                   : QString());
+			        }
 		        }
 	        });
-	auto info = m_ui->widget->CreateConfiguration(*item);
-	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
+	auto info             = m_ui->widget->CreateConfiguration(*item);
+	info->launch_activity = activity;
+	if (!m_main_dialog->RunInterpreter(process, *info, g_close_terminal)) {
+		if (item != nullptr) {
+			item->SetRunning(false);
+		}
+		m_running_games--;
+		process->deleteLater();
+	}
 
 	Update();
 }

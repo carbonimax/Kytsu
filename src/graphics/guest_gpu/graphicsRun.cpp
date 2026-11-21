@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -509,7 +510,8 @@ int GuestGpu::GetFrameNum() const {
 // Default: every queue when fault readbacks are asynchronous. With synchronous readbacks the
 // guest threads wait far longer on faults when compute runs earlier (in one title -30 % frames).
 static uint64_t ComputePreemptMask() {
-	static const uint64_t mask = [] {
+	static std::atomic<int64_t> mask_once {Common::OnceUnset};
+	const auto mask = static_cast<uint64_t>(Common::Once(mask_once, [] {
 		const char* value = std::getenv("KYTY_COMPUTE_PREEMPT");
 		if (value == nullptr) {
 			return BufferCache::AsyncFaultReadbacks() ? ~uint64_t {0} : uint64_t {0};
@@ -529,7 +531,7 @@ static uint64_t ComputePreemptMask() {
 			p = (*end == ',') ? end + 1 : end;
 		}
 		return result;
-	}();
+	}));
 	return mask;
 }
 
@@ -830,7 +832,11 @@ void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool r
 
 void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
-	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+	// GL2 prefetch: dst_sel bit 2 makes 0x0003022c a register offset, not a guest address.
+	constexpr uint64_t GL2PrefetchRegisterOffset    = 0x0003022c;
+	constexpr uint8_t  NonMemoryDestinationSelector = 0x4;
+	if (num_bytes == 0 || (dst_address_or_offset == GL2PrefetchRegisterOffset &&
+	                       (dst_sel & NonMemoryDestinationSelector) != 0)) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
@@ -1198,6 +1204,14 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
 	GpuCapture::Touch(reinterpret_cast<uint64_t>(commands.data()), commands.size_bytes());
+	if (chain && commands.empty()) {
+		// An empty chain still terminates the calling stream after this packet.
+		auto& caller = g_current_execution->m_buffer_stack.back();
+		EXIT_IF(caller.offset_dw >= caller.commands.size());
+		const auto packet_words = KYTY_PM4_LEN(caller.commands[caller.offset_dw]);
+		EXIT_IF(packet_words > caller.commands.size() - caller.offset_dw);
+		caller.commands = caller.commands.first(caller.offset_dw + packet_words);
+	}
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }
@@ -1314,6 +1328,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
+		if ((packet_header >> 30u) == 0u) {
+			const auto packet_dw = ((packet_header >> 16u) & 0x3fffu) + 2u;
+			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
+			cursor.offset_dw += packet_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		if (debug_dump) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
@@ -1331,7 +1353,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		auto handler = g_cp_op_func[opcode];
 		// A flip or flip-done wait block opens with a SET_UCONFIG_REG of its tag, a pipelined packet,
 		// but it drains and is a sync point like any flip: labels, EOP and flips keep their point.
-		const bool flip_block = remaining_dw >= 3 && Pm4::IsFlipBlock(packet_header, packet + 1);
+		const bool flip_block = remaining_dw >= 3 &&
+		                        Pm4::IsFlipBlock(packet_header, packet + 1, IsAsyncComputeQueue());
 		if (flip_block) {
 			CpSplitProf::Drain(CpSplitProf::Cause::Flip);
 		} else {
@@ -1639,8 +1662,14 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	GpuCapture::Touch(args_addr, sizeof(vk::DispatchIndirectCommand));
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		// Snapshot all dimensions after making GPU writes visible: a host pointer read only
+		// faults when its page is protected, and the 12 bytes can cross a page boundary.
+		vk::DispatchIndirectCommand args {};
+		if (!Libs::LibKernel::Memory::TryReadBufferBacking(args_addr, &args, sizeof(args))) {
+			// Off the GPU thread the buffer cache cannot sync: keep the direct read.
+			std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+		}
+		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
@@ -1669,10 +1698,11 @@ void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 // buffer owns that GPU-modified page, write the label like WRITE_DATA does: into the backing
 // and into the cached buffer at this point of the command stream.
 static bool GpuOwnedEopLabelEnabled() {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_GPU_OWNED_EOP_LABEL");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	return enabled;
 }
 

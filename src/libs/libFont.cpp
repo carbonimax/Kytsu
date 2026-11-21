@@ -1,7 +1,10 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
+#include "common/localization.h"
 #include "common/logging/log.h"
+#include "common/systemFonts.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -16,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -59,7 +63,6 @@ using FontRenderer              = void*;
 using FontMemoryDestroyCallback = void (*)(void* font_memory, void* object, void* destroy_arg);
 using FontMemoryInterface       = void;
 using FontOpenDetail            = void;
-using FontGenerateGlyphDetail   = void;
 using FontString                = void*;
 using FontTextCharacter         = const void*;
 using FontRenderCharacter       = const void*;
@@ -96,6 +99,42 @@ struct FontMemory {
 	void*                      user_object;
 	void*                      parent_object;
 };
+
+struct FontGenerateGlyphDetail {
+	uint16_t          detail_id;
+	uint16_t          reserved;
+	uint16_t          form_options;
+	uint8_t           glyph_form;
+	uint8_t           metrics_form;
+	const FontMemory* memory;
+	void*             reserved2;
+	void*             reserved1;
+};
+static_assert(sizeof(FontGenerateGlyphDetail) == 0x20);
+
+constexpr uint8_t FONT_GLYPH_FORM_OUTLINE = 1;
+
+struct FontPointF {
+	float x;
+	float y;
+};
+
+// Contours close implicitly; contour_indexes holds each contour's last point.
+struct FontGlyphOutline {
+	int16_t     contours_count;
+	int16_t     points_count;
+	uint32_t    flags;
+	FontPointF* points;
+	uint8_t*    point_tags;
+	uint16_t*   contour_indexes;
+};
+static_assert(sizeof(FontGlyphOutline) == 0x20);
+
+constexpr uint8_t FONT_OUTLINE_TAG_CONIC = 0;
+constexpr uint8_t FONT_OUTLINE_TAG_ON    = 1;
+constexpr uint8_t FONT_OUTLINE_TAG_CUBIC = 2;
+// Set for CFF outlines, whose outer contours run counter-clockwise.
+constexpr uint32_t FONT_OUTLINE_REVERSE_FILL = 0x4;
 
 struct LibraryState {
 	const FontMemory* memory;
@@ -231,6 +270,11 @@ struct GlyphState {
 	FontGlyphMetrics                                               metrics;
 	std::vector<uint8_t>                                           image;
 	FontTransImage                                                 trans_image;
+	uint8_t                                                        glyph_form;
+	std::vector<FontPointF>                                        outline_points;
+	std::vector<uint8_t>                                           outline_tags;
+	std::vector<uint16_t>                                          outline_contours;
+	FontGlyphOutline                                               outline;
 };
 
 union FontTextParseResult {
@@ -748,16 +792,31 @@ static bool ttf_data_has_supported_magic(const uint8_t* data, uint32_t size) {
 
 	return (data[0] == 0x00 && data[1] == 0x01 && data[2] == 0x00 && data[3] == 0x00) ||
 	       (data[0] == 't' && data[1] == 'r' && data[2] == 'u' && data[3] == 'e') ||
-	       (data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O');
+	       (data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O') ||
+	       (data[0] == 't' && data[1] == 't' && data[2] == 'c' && data[3] == 'f');
+}
+
+static bool init_stb_info(stbtt_fontinfo* info, const uint8_t* data, uint32_t size) {
+	if (info == nullptr || !ttf_data_has_supported_magic(data, size)) {
+		return false;
+	}
+
+	// TrueType collections (.ttc) store a table of faces; use the first one.
+	const int offset = stbtt_GetFontOffsetForIndex(data, 0);
+	if (offset < 0 || static_cast<uint32_t>(offset) >= size) {
+		return false;
+	}
+
+	return stbtt_InitFont(info, data, offset) != 0;
 }
 
 static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size) {
-	if (font == nullptr || !ttf_data_has_supported_magic(data, size)) {
+	if (font == nullptr) {
 		return false;
 	}
 
 	stbtt_fontinfo info {};
-	if (stbtt_InitFont(&info, data, 0) == 0) {
+	if (!init_stb_info(&info, data, size)) {
 		return false;
 	}
 
@@ -767,6 +826,52 @@ static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size) {
 	font->has_ttf   = true;
 
 	return true;
+}
+
+struct CjkFallbackFace {
+	std::vector<uint8_t> data;
+	stbtt_fontinfo       info {};
+	bool                 ok = false;
+};
+
+// The PS5 system font sets (SC/TC/JP/KR) are not available on the host, and the Latin fallback
+// (Roboto) has no CJK glyphs, so without this face every CJK code point would be drawn as '?'.
+static const CjkFallbackFace& cjk_fallback_face() {
+	static const CjkFallbackFace face = [] {
+		CjkFallbackFace result;
+		const auto      language = static_cast<int>(Config::GetConsoleLanguage());
+		const auto      locale   = Common::Localization::LocaleName(language);
+		for (const auto& path: Common::FindCjkFontFiles(locale)) {
+			auto data = read_file_bytes(path);
+			if (data.empty()) {
+				continue;
+			}
+			result.data = std::move(data);
+			// stbtt_fontinfo keeps a raw pointer into the buffer, so initialize it in place.
+			if (!init_stb_info(&result.info, result.data.data(),
+			                   static_cast<uint32_t>(result.data.size()))) {
+				result.data.clear();
+				continue;
+			}
+			result.ok = true;
+			LOGF("[Font] CJK fallback font: %s\n", path.string().c_str());
+			break;
+		}
+		if (!result.ok) {
+			LOGF("[Font] no CJK fallback font found, CJK text will render as '?' "
+			     "(set KYTY_CJK_FONT to a .ttf/.ttc/.otf file)\n");
+		}
+		return result;
+	}();
+	return face;
+}
+
+static bool cjk_fallback_has_glyph(uint32_t code) {
+	if (code < 0x80u || code > 0x10ffffu) {
+		return false;
+	}
+	const auto& cjk = cjk_fallback_face();
+	return cjk.ok && stbtt_FindGlyphIndex(&cjk.info, static_cast<int>(code)) != 0;
 }
 
 static void init_font_face(FontState* font) {
@@ -783,8 +888,12 @@ static void init_font_face(FontState* font) {
 	}
 
 	const auto& data = fallback_font_data(font_is_bold(font), font_is_italic(font));
-	if (!data.empty()) {
-		(void)init_stb_font(font, data.data(), static_cast<uint32_t>(data.size()));
+	if (!data.empty() && init_stb_font(font, data.data(), static_cast<uint32_t>(data.size()))) {
+		return;
+	}
+
+	if (const auto& cjk = cjk_fallback_face(); cjk.ok) {
+		(void)init_stb_font(font, cjk.data.data(), static_cast<uint32_t>(cjk.data.size()));
 	}
 }
 
@@ -798,14 +907,21 @@ static bool ensure_stb_font(FontState* font) {
 	return font->has_ttf;
 }
 
-static uint32_t stb_supported_codepoint(FontState* font, uint32_t code) {
-	if (font == nullptr || !ensure_stb_font(font)) {
-		return static_cast<uint32_t>('?');
+// The face that actually draws `code`: the font's own face first, then the host CJK fallback,
+// and finally '?' from the font's own face.
+struct StbGlyphFace {
+	const stbtt_fontinfo* info;
+	uint32_t              code;
+};
+
+static StbGlyphFace resolve_stb_glyph(FontState* font, uint32_t code) {
+	if (code <= 0x10ffffu && stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(code)) != 0) {
+		return {&font->font_info, code};
 	}
-	if (code > 0x10ffffu || stbtt_FindGlyphIndex(&font->font_info, static_cast<int>(code)) == 0) {
-		return static_cast<uint32_t>('?');
+	if (cjk_fallback_has_glyph(code)) {
+		return {&cjk_fallback_face().info, code};
 	}
-	return code;
+	return {&font->font_info, static_cast<uint32_t>('?')};
 }
 
 static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* metrics) {
@@ -813,17 +929,19 @@ static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* me
 		return false;
 	}
 
-	code                = stb_supported_codepoint(font, code);
-	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
-	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
+	const auto  glyph   = resolve_stb_glyph(font, code);
+	const auto* info    = glyph.info;
+	code                = glyph.code;
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(info, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(info, font->scale_h);
 
 	int advance = 0;
 	int x0      = 0;
 	int y0      = 0;
 	int x1      = 0;
 	int y1      = 0;
-	stbtt_GetCodepointHMetrics(&font->font_info, static_cast<int>(code), &advance, nullptr);
-	stbtt_GetCodepointBox(&font->font_info, static_cast<int>(code), &x0, &y0, &x1, &y1);
+	stbtt_GetCodepointHMetrics(info, static_cast<int>(code), &advance, nullptr);
+	stbtt_GetCodepointBox(info, static_cast<int>(code), &x0, &y0, &x1, &y1);
 
 	metrics->width                = static_cast<float>(x1 - x0) * scale_x;
 	metrics->height               = static_cast<float>(y1 - y0) * scale_y;
@@ -843,16 +961,18 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 		return false;
 	}
 
-	code                = stb_supported_codepoint(font, code);
-	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
-	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
+	const auto  glyph   = resolve_stb_glyph(font, code);
+	const auto* info    = glyph.info;
+	code                = glyph.code;
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(info, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(info, font->scale_h);
 
 	int x0 = 0;
 	int y0 = 0;
 	int x1 = 0;
 	int y1 = 0;
-	stbtt_GetCodepointBitmapBox(&font->font_info, static_cast<int>(code), scale_x, scale_y, &x0, &y0,
-	                            &x1, &y1);
+	stbtt_GetCodepointBitmapBox(info, static_cast<int>(code), scale_x, scale_y, &x0, &y0, &x1,
+	                            &y1);
 
 	const auto width  = static_cast<uint32_t>(std::clamp(x1 - x0, 0, FONT_GLYPH_MAX_DIM));
 	const auto height = static_cast<uint32_t>(std::clamp(y1 - y0, 0, FONT_GLYPH_MAX_DIM));
@@ -867,7 +987,7 @@ static bool init_stb_image(std::vector<uint8_t>* image, FontTransImage* trans_im
 		return true;
 	}
 
-	stbtt_MakeCodepointBitmap(&font->font_info, image->data(), static_cast<int>(width),
+	stbtt_MakeCodepointBitmap(info, image->data(), static_cast<int>(width),
 	                          static_cast<int>(height), static_cast<int>(width), scale_x, scale_y,
 	                          static_cast<int>(code));
 
@@ -960,6 +1080,71 @@ static void init_image(std::vector<uint8_t>* image, FontTransImage* trans_image,
 	trans_image->width_byte   = width;
 	trans_image->image_width  = width;
 	trans_image->image_height = height;
+}
+
+// Pixels at the font's scale, y up from the pen origin on the baseline.
+static void init_outline(GlyphState* glyph, FontState* font) {
+	if (!ensure_stb_font(font)) {
+		return;
+	}
+
+	const auto  face    = resolve_stb_glyph(font, glyph->code);
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(face.info, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(face.info, font->scale_h);
+
+	stbtt_vertex* vertices = nullptr;
+	const int     num_vertices =
+	    stbtt_GetCodepointShape(face.info, static_cast<int>(face.code), &vertices);
+
+	auto&      points    = glyph->outline_points;
+	auto&      tags      = glyph->outline_tags;
+	auto&      contours  = glyph->outline_contours;
+	const auto add_point = [&](int x, int y, uint8_t tag) {
+		points.push_back({static_cast<float>(x) * scale_x, static_cast<float>(y) * scale_y});
+		tags.push_back(tag);
+	};
+	// The shape ends each contour on its start point, which the implicit close repeats.
+	const auto close_contour = [&](size_t begin) {
+		if (points.size() <= begin) {
+			return;
+		}
+		if (points.size() - begin > 1) {
+			points.pop_back();
+			tags.pop_back();
+		}
+		contours.push_back(static_cast<uint16_t>(points.size() - 1));
+	};
+
+	size_t begin = 0;
+	for (int i = 0; i < num_vertices; i++) {
+		const auto& v = vertices[i];
+		switch (v.type) {
+			case STBTT_vmove:
+				close_contour(begin);
+				begin = points.size();
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+			case STBTT_vline: add_point(v.x, v.y, FONT_OUTLINE_TAG_ON); break;
+			case STBTT_vcurve:
+				add_point(v.cx, v.cy, FONT_OUTLINE_TAG_CONIC);
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+			case STBTT_vcubic:
+				add_point(v.cx, v.cy, FONT_OUTLINE_TAG_CUBIC);
+				add_point(v.cx1, v.cy1, FONT_OUTLINE_TAG_CUBIC);
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+		}
+	}
+	close_contour(begin);
+	stbtt_FreeShape(face.info, vertices);
+
+	glyph->outline = {static_cast<int16_t>(contours.size()),
+	                  static_cast<int16_t>(points.size()),
+	                  (face.info->cff.size != 0 ? FONT_OUTLINE_REVERSE_FILL : 0u),
+	                  points.data(),
+	                  tags.data(),
+	                  contours.data()};
 }
 
 static void fill_render_result(FontState* font, FontRenderSurface* surf, float x, float y,
@@ -2117,7 +2302,13 @@ int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint
 	const int right = glyph_index(code);
 	if (left <= 0 || left >= font->font_info.numGlyphs ||
 	    right <= 0 || right >= font->font_info.numGlyphs) {
-		return FONT_ERROR_NO_SUPPORT_CODE;
+		// A pair drawn partly from the host CJK fallback face has no kerning in this face.
+		const auto drawable = [&](uint32_t value, int index) {
+			return (index > 0 && index < font->font_info.numGlyphs) ||
+			       ((value & 0x80000000u) == 0 && cjk_fallback_has_glyph(value));
+		};
+		return drawable(pre_code, left) && drawable(code, right) ? OK
+		                                                         : FONT_ERROR_NO_SUPPORT_CODE;
 	}
 	kerning->offset_x = static_cast<float>(stbtt_GetGlyphKernAdvance(&font->font_info, left, right)) *
 	                    stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
@@ -2197,6 +2388,11 @@ int KYTY_SYSV_ABI FontGenerateCharGlyph(FontHandle font_handle, uint32_t code,
 	glyph->code = code;
 	fill_metrics_for_code(&glyph->metrics, font, code);
 	init_image(&glyph->image, &glyph->trans_image, code, font);
+	// Without a detail the glyph is private and refers no outline.
+	glyph->glyph_form = (detail != nullptr ? detail->glyph_form : 0);
+	if (glyph->glyph_form == FONT_GLYPH_FORM_OUTLINE) {
+		init_outline(glyph, font);
+	}
 	register_glyph(glyph);
 
 	*font_glyph = glyph;
@@ -2240,6 +2436,21 @@ int KYTY_SYSV_ABI FontGlyphDefineAttribute(void* font_glyph, int attribute, int*
 	     attribute);
 
 	return OK;
+}
+
+const FontGlyphOutline* KYTY_SYSV_ABI FontGlyphRefersOutline(void* font_glyph) {
+	PRINT_NAME();
+
+	auto* glyph = (is_known_glyph(font_glyph) ? static_cast<GlyphState*>(font_glyph) : nullptr);
+	const FontGlyphOutline* outline = nullptr;
+	if (glyph != nullptr && glyph->glyph_form == FONT_GLYPH_FORM_OUTLINE) {
+		outline = &glyph->outline;
+	}
+
+	LOGF("\t glyph = 0x%016" PRIx64 ", outline = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(font_glyph), reinterpret_cast<uint64_t>(outline));
+
+	return outline;
 }
 
 int KYTY_SYSV_ABI FontRenderCharGlyphImageHorizontal(FontHandle font_handle, uint32_t code,
@@ -2302,6 +2513,7 @@ LIB_DEFINE(InitFont_1) {
 	LIB_FUNC("sDuhHGNhHvE", Font::FontGetKerning);
 	LIB_FUNC("IQtleGLL5pQ", Font::FontGetRenderCharGlyphMetrics);
 	LIB_FUNC("8-zmgsxkBek", Font::FontGlyphDefineAttribute);
+	LIB_FUNC("R1T4i+DOhNY", Font::FontGlyphRefersOutline);
 	LIB_FUNC("whrS4oksXc4", Font::FontMemoryInit);
 	LIB_FUNC("h6hIgxXEiEc", Font::FontMemoryTerm);
 	LIB_FUNC("JzCH3SCFnAU", Font::FontOpenFontInstance);

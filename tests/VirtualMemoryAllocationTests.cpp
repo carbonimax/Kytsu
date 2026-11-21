@@ -1,5 +1,6 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -10,8 +11,8 @@
 #include "libs/errno.h"
 #include "loader/elf.h"
 #include "loader/guestInstructionPatcher.h"
-#include "loader/jit.h"
 #include "loader/runtimeLinker.h"
+#include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -88,6 +90,10 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 
 namespace Libs::DbgAddressSanitizer {
 void TestRegisterMemoryCallbacks();
+}
+
+namespace Libs::LibAmpr {
+void InitAmpr_1(Loader::SymbolDatabase* symbols);
 }
 
 namespace {
@@ -1304,6 +1310,22 @@ void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Runs only in its own process (--guest-stack-debug-print-only): it installs the
+// production vectored handler, which never claims faults here, so unrelated
+// exceptions keep their default behavior.
+void TestGuestStackDebugPrint() {
+	const char* test = "GuestStackDebugPrint";
+	Check(test,
+	      Common::HostException::InstallHandler(
+	          [](const Common::HostException::ExceptionInfo&) { return false; }),
+	      "install the production host exception filter");
+	Check(test, Loader::TestDebugPrintOnGuestStack(),
+	      "OutputDebugString on a guest stack did not return to the guest");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
 	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
 
@@ -1732,6 +1754,130 @@ void TestCopySparseMemoryMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// KYTY_SPARSE_COPY_CACHE 1 and 2 copy what 0 copies over mapped, unmapped, partly mapped and
+// unowned ranges, also after a remap to another backing offset and a partial unmap.
+void TestSparseCopyCacheMatchesLockedCopy() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "SparseCopyCacheMatchesLockedCopy";
+	constexpr uint64_t page = SceKernelPageSize;
+	int64_t            phys[2] {};
+	for (auto& offset : phys) {
+		CheckOk(test,
+		        KernelAllocateDirectMemory(SceKernelDirectMemoryStart, KernelGetDirectMemorySize(),
+		                                   page * 4, page, SceKernelMtypeC, &offset),
+		        "KernelAllocateDirectMemory");
+	}
+	void* addr = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&addr, page * 8, 0, page), "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	// Views 0 and 1 hold different bytes, so a stale translation reads the wrong view.
+	const auto map_view = [&](int view, uint8_t first) {
+		void* fixed = addr;
+		CheckOk(test,
+		        KernelMapNamedDirectMemory(&fixed, page * 4, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                   phys[view], page, "sparse_copy_cache"),
+		        "map direct view");
+		for (uint64_t i = 0; i < 4; ++i) {
+			std::memset(reinterpret_cast<void*>(base + i * page), first + i, page);
+		}
+	};
+	// The last two lie inside the survivors of the partial unmap below: only they can hit the
+	// cache there, which shows the cache refills from the remapped survivors.
+	const std::array<std::pair<uint64_t, uint64_t>, 8> ranges {{
+	    {base + page + 7, 100},         // inside one page of the view
+	    {base + page * 2 - 9, page},    // across two pages of the view
+	    {base, page * 4},               // the whole view
+	    {base + page * 3 + 50, page},   // view end, then the reservation
+	    {base + page * 5, 64},          // reserved, never backed
+	    {0x10000, 64},                  // not owned
+	    {base + 9, 100},                // first page (left survivor)
+	    {base + page * 2 + 5, page},    // pages 2 and 3 (right survivor)
+	}};
+	const auto copy_all = [&](int mode) {
+		TestSetSparseCopyCacheMode(mode);
+		std::vector<std::vector<uint8_t>> out;
+		for (const auto& [address, size]: ranges) {
+			for (int repeat = 0; repeat < 2; ++repeat) { // the repeat can hit the cache
+				std::vector<uint8_t> bytes(size + 2, 0x55);
+				bytes.push_back(CopySparseMemory(address, bytes.data() + 1, size) ? 1 : 0);
+				out.push_back(std::move(bytes));
+			}
+		}
+		return out;
+	};
+	const auto compare_modes = [&](const std::string& phase) {
+		const auto locked         = copy_all(0);
+		const auto checked_before = GetSparseCopyStats().checked;
+		Check(test, copy_all(1) == locked, phase + ": mode 1 copied other bytes than mode 0");
+		Check(test, copy_all(2) == locked, phase + ": mode 2 copied other bytes than mode 0");
+		Check(test, GetSparseCopyStats().checked > checked_before, phase + ": no copy took the lock-free path");
+		return locked;
+	};
+	const auto copy_byte = [&](uint64_t address, uint8_t expected) {
+		uint8_t value = 0x55;
+		return CopySparseMemory(address, &value, 1) && value == expected;
+	};
+
+	map_view(0, 0x10);
+	const auto view0 = compare_modes("view 0");
+	Check(test,
+	      view0[0].back() == 1 && std::all_of(view0[0].begin() + 1, view0[0].end() - 2,
+	                                          [](uint8_t value) { return value == 0x11; }),
+	      "locked copy inside the view read wrong bytes");
+	Check(test,
+	      view0[6].back() == 1 && view0[6][1 + page - 50] == 0 && view0[6][page - 50] == 0x13,
+	      "locked copy over the view end did not zero the reservation");
+	Check(test, view0[8].back() == 1 && view0[10].back() == 0 && view0[10][1] == 0x55,
+	      "locked copy of an unbacked or unowned range changed its result");
+
+	// A locked backing write (end-of-pipe label, buffer write-back) flushes the slot: the next copy
+	// reads the new byte under the locks and counts a slot flushed by a byte write, then the
+	// refilled slot hits again.
+	TestSetSparseCopyCacheMode(2);
+	Check(test, copy_byte(base + page + 7, 0x11) && copy_byte(base + page + 7, 0x11),
+	      "lock-free copy before a backing write read wrong bytes");
+	const auto    before_write = GetSparseCopyStats();
+	const uint8_t label        = 0x77;
+	Check(test, TryWriteBacking(base + page + 7, &label, 1), "TryWriteBacking");
+	Check(test, copy_byte(base + page + 7, 0x77), "copy after a backing write read the old byte");
+	const auto after_write = GetSparseCopyStats();
+	Check(test,
+	      after_write.byte_bumps == before_write.byte_bumps + 1 &&
+	          after_write.map_bumps == before_write.map_bumps &&
+	          after_write.stale_bytes == before_write.stale_bytes + 1 &&
+	          after_write.stale_maps == before_write.stale_maps && after_write.checked == before_write.checked,
+	      "a backing write did not flush the slot as one byte-write miss");
+	Check(test, copy_byte(base + page + 7, 0x77) && GetSparseCopyStats().checked == after_write.checked + 1,
+	      "the slot did not refill after a backing write");
+
+	const auto before_remap = GetSparseCopyStats();
+	CheckOk(test, KernelMunmap(base, page * 4), "unmap view 0");
+	map_view(1, 0x20);
+	TestSetSparseCopyCacheMode(2);
+	Check(test, copy_byte(base + page + 7, 0x21), "lock-free copy kept the unmapped view's offset");
+	Check(test,
+	      GetSparseCopyStats().stale_maps == before_remap.stale_maps + 1 &&
+	          GetSparseCopyStats().stale_bytes == before_remap.stale_bytes,
+	      "a remap did not flush the slot as one mapping-change miss");
+	compare_modes("view 1 at the same address");
+
+	CheckOk(test, KernelMunmap(base + page, page), "unmap the second page of view 1");
+	TestSetSparseCopyCacheMode(1);
+	Check(test, copy_byte(base + page * 2 + 5, 0x22) && copy_byte(base + page * 2 + 5, 0x22) &&
+	                copy_byte(base + page + 7, 0),
+	      "lock-free copy after a partial unmap read wrong bytes");
+	compare_modes("after a partial unmap");
+
+	TestSetSparseCopyCacheMode(-1);
+	CheckOk(test, KernelMunmap(base, page), "unmap the first page of view 1");
+	CheckOk(test, KernelMunmap(base + page * 2, page * 2), "unmap the end of view 1");
+	CheckOk(test, KernelMunmap(base + page * 4, page * 4), "release the reservation");
+	for (const auto offset: phys) {
+		CheckOk(test, KernelCheckedReleaseDirectMemory(offset, page * 4), "release direct memory");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFlexibleMapQueryAndWholeMunmap() {
 	const char* test     = "FlexibleMapQueryAndWholeMunmap";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -1775,6 +1921,31 @@ void TestPartialFlexibleMunmapAndFindNext() {
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
 	        "KernelMunmap(right cleanup)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "cleanup should return all flexible memory to Prospero-reported budget");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestUnalignedFlexibleMunmapLengthRoundsToGuestPage() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test         = "UnalignedFlexibleMunmapLengthRoundsToGuestPage";
+	constexpr uint64_t page         = SceKernelPageSize;
+	constexpr uint64_t mapped_size  = 34 * page;
+	constexpr uint64_t unmap_size   = 0x800a0;
+	constexpr uint64_t rounded_size = 33 * page;
+	const auto         baseline     = AvailableFlexibleMemory(test);
+	const auto         base         = MapNamedFlexible(test, mapped_size, SceKernelProtCpuRw,
+	                                                  "prospero_unaligned_munmap");
+
+	CheckOk(test, KernelMunmap(base, unmap_size), "KernelMunmap(unaligned length)");
+	ExpectUnmapped(test, base);
+	ExpectRange(test, Query(test, base + rounded_size), base + rounded_size, base + mapped_size,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "prospero_unaligned_munmap");
+	Check(test, AvailableFlexibleMemory(test) + page == baseline,
+	      "unaligned munmap length should round up to the next guest page");
+
+	CheckOk(test, KernelMunmap(base + rounded_size, page), "KernelMunmap(final page cleanup)");
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "cleanup should return all flexible memory to Prospero-reported budget");
 
@@ -2736,6 +2907,129 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestMunmapReservedSpanWithReleasedHole() {
+	const char* test = "MunmapReservedSpanWithReleasedHole";
+	void* reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 3, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle hole)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 3),
+	        "KernelMunmap(full span with hole)");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + SceKernelPageSize * 2);
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 3) == ErrorAccess,
+	      "KernelMunmap accepted an entirely released span");
+
+	// Same with a committed mapping after the hole: it is released and its budget comes back.
+	const auto baseline = AvailableFlexibleMemory(test);
+	reserve             = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 3, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange(second)");
+	const auto second = reinterpret_cast<uint64_t>(reserve);
+	void*      tail   = reinterpret_cast<void*>(second + SceKernelPageSize * 2);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &tail, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "hole_tail"),
+	        "KernelMapNamedFlexibleMemory(tail)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(second + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(second middle hole)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(second, SceKernelPageSize * 3),
+	        "KernelMunmap(span with hole and mapping)");
+	ExpectUnmapped(test, second + SceKernelPageSize * 2);
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "munmap across a hole leaked flexible budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// KYTY_VMA_MEMO answers against the locked map search, at probes around the page boundary. The
+// first memo call of each step comes right after an edit made while the memo held the old ranges.
+static void CheckVmaMemoStep(const char* test, int mode, uint64_t base, const char* step) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t page        = SceKernelPageSize;
+	const uint64_t     probes[][2] = {{base, 0x100},
+	                                  {base + page - 0x80, 0x100},
+	                                  {base + page, 0x10},
+	                                  {base + 2 * page - 0x10, 0x10}};
+	for (const auto& probe: probes) {
+		TestSetVmaMemoMode(0);
+		const bool known = IsVirtualAddressKnown(probe[0]);
+		const auto clamp = TryClampRangeSize(probe[0], probe[1]);
+		TestSetVmaMemoMode(mode);
+		for (int pass = 0; pass < 2; pass++) {
+			Check(test, IsVirtualAddressKnown(probe[0]) == known,
+			      std::string(step) + ": memo IsVirtualAddressKnown differs from the map");
+			Check(test, TryClampRangeSize(probe[0], probe[1]) == clamp,
+			      std::string(step) + ": memo ClampRangeSize differs from the map");
+		}
+	}
+}
+
+void TestVmaMemoInvalidation() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "VmaMemoInvalidation";
+	constexpr uint64_t page = SceKernelPageSize;
+
+	for (int mode = 1; mode <= 2; mode++) {
+		void* reserve = nullptr;
+		CheckOk(test, KernelReserveVirtualRange(&reserve, 2 * page, 0, page),
+		        "KernelReserveVirtualRange");
+		const auto base = reinterpret_cast<uint64_t>(reserve);
+		void*      addr = reserve;
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&addr, 2 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "vma_memo"),
+		        "KernelMapNamedFlexibleMemory");
+		CheckVmaMemoStep(test, mode, base, "mapped");
+
+		const auto hits = TestVmaMemoHits();
+		Check(test, ClampRangeSize(base, 0x100) == 0x100 && TestVmaMemoHits() == hits + 1,
+		      "a repeated lookup was not answered by the memo");
+
+		CheckOk(test, KernelMunmap(base + page, page), "KernelMunmap(second page)");
+		CheckVmaMemoStep(test, mode, base, "unmapped");
+		Check(test, TryClampRangeSize(base + page - 0x80, 0x100) == 0x80,
+		      "memo kept the unmapped page");
+
+		const auto before_protect = TestVmaMemoHits();
+		CheckOk(test, KernelMprotect(reinterpret_cast<void*>(base), page, SceKernelProtCpuRead),
+		        "KernelMprotect");
+		Check(test, ClampRangeSize(base, 0x100) == 0x100 && TestVmaMemoHits() == before_protect,
+		      "memo answered across a protect");
+		CheckVmaMemoStep(test, mode, base, "protected");
+
+		addr = reinterpret_cast<void*>(base + page);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&addr, page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "vma_memo"),
+		        "KernelMapNamedFlexibleMemory(remap)");
+		CheckVmaMemoStep(test, mode, base, "remapped");
+
+		// Two ranges now (read-only page, then read-write page). A span across both misses and
+		// remembers the first range on every call: that must not push the second range out.
+		Check(test, IsVirtualAddressKnown(base) && IsVirtualAddressKnown(base + page),
+		      "remapped pages unknown");
+		for (int i = 0; i < 2 * 4; i++) {
+			(void)TryClampRangeSize(base + page - 0x80, 0x100);
+		}
+		const auto before_second = TestVmaMemoHits();
+		Check(test, IsVirtualAddressKnown(base + page) && TestVmaMemoHits() == before_second + 1,
+		      "a span across two ranges pushed the second range out of the memo");
+
+		CheckOk(test, KernelMunmap(base, 2 * page), "KernelMunmap");
+		CheckVmaMemoStep(test, mode, base, "released");
+	}
+	TestSetVmaMemoMode(-1);
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMunmapGpuRuns() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "MunmapGpuRuns";
@@ -3219,6 +3513,52 @@ void TestHintlessDirectMapUsesCanonicalGuestBase() {
 	        "KernelReleaseDirectMemory");
 
 	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFixedMapOverIdenticalRangeIsNoOp() {
+	const char* test = "FixedMapOverIdenticalRangeIsNoOp";
+
+	constexpr uint64_t MapSize = SceKernelPageSize * 2;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            MapSize, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, MapSize,
+	                                                            SceKernelProtCpuRw, 0, phys_addr,
+	                                                            SceKernelPageSize, "noop_probe"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	*reinterpret_cast<uint64_t*>(base) = 0x4b5954594e4f4f50ull; // "KYTYNOOP"
+
+	void* again = address;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&again, MapSize, SceKernelProtCpuRw,
+	                                                       SceKernelMapFixed, phys_addr, 0),
+	        "KernelMapDirectMemory(fixed over identical range)");
+	Check(test, reinterpret_cast<uint64_t>(again) == base, "identical fixed map moved the mapping");
+
+	const auto info = Query(test, base);
+	Check(test, info.start == base && info.end == base + MapSize,
+	      "identical fixed map changed the range bounds");
+	Check(test, info.offset == static_cast<uint64_t>(phys_addr),
+	      "identical fixed map changed the physical offset");
+	Check(test, info.protection == SceKernelProtCpuRw,
+	      "identical fixed map changed the protection");
+	Check(test, info.is_direct == 1, "identical fixed map changed the range type");
+	Check(test, std::strcmp(info.name, "noop_probe") == 0,
+	      "identical fixed map replaced the live mapping instead of leaving it alone");
+	Check(test, *reinterpret_cast<const uint64_t*>(base) == 0x4b5954594e4f4f50ull,
+	      "identical fixed map lost the mapped contents");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, MapSize), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, MapSize),
+	        "KernelReleaseDirectMemory");
 }
 
 void TestDirectMemoryContentPersistsAcrossRemap() {
@@ -3705,6 +4045,230 @@ void TestAutomaticMemoryReuseAndAliases() {
 	        "KernelAllocateDirectMemory(released donation)");
 	Check(test, reused == physical, "donation did not return to the ordinary allocator");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(reused, block), "release ordinary reuse");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// An AMM command buffer driven through the library's exports.
+struct AmmCommandBuffer {
+	struct Result {
+		int32_t  result;
+		uint32_t error_offset;
+	};
+	const char*              test;
+	Loader::SymbolDatabase   symbols;
+	std::array<uint64_t, 3>  header {};
+	std::array<uint32_t, 16> data {};
+	uint32_t*                buffer;
+
+	explicit AmmCommandBuffer(const char* name, uint32_t* storage = nullptr)
+	    : test(name), buffer(storage != nullptr ? storage : data.data()) {
+		Libs::LibAmpr::InitAmpr_1(&symbols);
+		Find<int(KYTY_SYSV_ABI*)(void*)>("8aI7R7WaOlc")(header.data());
+		CheckOk(test,
+		        Find<int(KYTY_SYSV_ABI*)(void*, void*, uint32_t)>("N-FSPA4S3nI")(
+		            header.data(), buffer, sizeof(data)),
+		        "set AMM command buffer");
+	}
+	template <class Function>
+	Function Find(const char* nid) {
+		const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+		Check(test, symbol != nullptr, "AMM export does not resolve");
+		return reinterpret_cast<Function>(symbol->vaddr);
+	}
+	uint32_t Offset() {
+		return static_cast<uint32_t>(
+		    Find<uint64_t(KYTY_SYSV_ABI*)(void*)>("GnxKOHEawhk")(header.data()));
+	}
+	// Runs every appended command and reports each GPU range change.
+	Result Submit() {
+		Result   result {1234, 5678};
+		uint32_t submission = 0;
+		g_gpu_range_events.clear();
+		Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
+		CheckOk(test,
+		        Find<int(KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, Result*, uint32_t*)>(
+		            "OJf3vCckPAM")(buffer, Offset(), 0, &result, &submission),
+		        "submit AMM commands");
+		CheckOk(test, Find<int(KYTY_SYSV_ABI*)(uint32_t)>("HXymib4T8gc")(submission),
+		        "wait AMM commands");
+		Libs::LibKernel::Memory::TestSetGpuRangeCallback(nullptr);
+		return result;
+	}
+};
+
+void TestAmmMapAsPrt() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AmmMapAsPrt";
+	constexpr uint64_t block    = 0x200000;
+	constexpr uint64_t base     = kExtendedMemoryBase + 0x24000000;
+	const auto         end      = static_cast<int64_t>(KernelGetDirectMemorySize());
+	int64_t            physical = -1;
+	AmmCommandBuffer   commands(test);
+	const auto         map_as_prt =
+	    commands.Find<int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t)>("ZJCgt+aPHAU");
+	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &physical, true),
+	        "allocate automatic backing");
+	CheckOk(test, MapAutomaticMemory(base + block, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory");
+	for (const auto [address, size] :
+	     {std::pair<uint64_t, uint64_t> {base + 1, block}, {base, 0}, {0, block}})
+		Check(test,
+		      map_as_prt(commands.header.data(), address, size) ==
+		          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+		      "mapAsPrt accepted an invalid range");
+	void* outside = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&outside, block, 0, 0), "reserve outside the AMM range");
+	Check(test,
+	      MapPrtMemory(reinterpret_cast<uint64_t>(outside), block) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "PRT map accepted a range outside the AMM range");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(outside), block), "release reservation");
+	CheckOk(test, map_as_prt(commands.header.data(), base, block * 4), "append mapAsPrt");
+	Check(test, commands.Offset() == 12, "mapAsPrt record is not three dwords");
+	const auto result = commands.Submit();
+	Check(test, result.result == OK && result.error_offset == 0, "mapAsPrt execution failed");
+	ExpectRange(test, Query(test, base), base, base + block * 4, 0, 0, 0, 0, 0, "anon");
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base + block, block}},
+	      "mapAsPrt did not unmap the replaced mapping from the GPU");
+	CheckOk(test, MapAutomaticMemory(base, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "mapAsPrt did not return the replaced pages to the automatic allocator");
+	Check(test, Query(test, base).offset == static_cast<uint64_t>(physical),
+	      "automatic allocation did not reuse the replaced pages");
+	ExpectRange(test, Query(test, base + block), base + block, base + block * 4, 0, 0, 0, 0, 0,
+	            "anon");
+	CheckOk(test, UnmapAmmMemory(base, block * 4), "AMM unmap PRT range");
+	ExpectUnmapped(test, base);
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
+	        "KernelCheckedReleaseDirectMemory(donation)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAmmRemapIntoPrt() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AmmRemapIntoPrt";
+	constexpr uint64_t block    = 0x200000;
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t prt      = kExtendedMemoryBase + 0x26000000;
+	constexpr uint64_t old      = kExtendedMemoryBase + 0x28000000;
+	constexpr uint64_t target   = prt + block;
+	constexpr int      all      = 0x3f3;
+	const auto         end      = static_cast<int64_t>(KernelGetDirectMemorySize());
+	int64_t            physical = -1;
+	AmmCommandBuffer   commands(test);
+	const auto         remap    = commands.Find<int(KYTY_SYSV_ABI*)(
+	    void*, uint64_t, uint64_t, uint64_t, int32_t, int32_t)>("0Xo9g4goDXU");
+	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &physical, true),
+	        "allocate automatic backing");
+	CheckOk(test, MapPrtMemory(prt, block * 4), "MapPrtMemory");
+	CheckOk(test, MapAutomaticMemory(old, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory");
+	*reinterpret_cast<uint64_t*>(old + page * 3) = 0x0123456789abcdefull;
+
+	std::array<uint32_t, 4> record {};
+	uint64_t                record_size = 0;
+	CheckOk(test,
+	        KernelWriteRemapIntoPrtCommand(nullptr, target, old, block, SceKernelProtCpuRead, all,
+	                                       &record_size),
+	        "measure remapIntoPrt");
+	CheckOk(test,
+	        KernelWriteRemapIntoPrtCommand(record.data(), target, old, block, SceKernelProtCpuRead,
+	                                       all, nullptr),
+	        "encode remapIntoPrt");
+	Check(test,
+	      record_size == 16 &&
+	          record == std::array<uint32_t, 4> {0x8327u | SceKernelProtCpuRead << 12,
+	                                             static_cast<uint32_t>(target >> 14),
+	                                             static_cast<uint32_t>(old >> 14),
+	                                             static_cast<uint32_t>(block >> 14 << 5)},
+	      "unexpected remapIntoPrt record");
+	for (const auto [address, source, size, prot, mask] :
+	     {std::tuple<uint64_t, uint64_t, uint64_t, int, int> {target + 1, old, block, 1, all},
+	      {target, old + 1, block, 1, all},
+	      {target, old, 0, 1, all},
+	      {target, old, block, 8, all},
+	      {target, old, block, 1, 0x3f1}})
+		Check(test,
+		      KernelWriteRemapIntoPrtCommand(record.data(), address, source, size, prot, mask,
+		                                     nullptr) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+		      "remapIntoPrt encoder accepted invalid arguments");
+
+	void* outside = nullptr;
+	CheckOk(test, KernelMapDirectMemory(&outside, block, SceKernelProtCpuRw, 0, physical, block),
+	        "KernelMapDirectMemory(outside the AMM range)");
+	const auto alias = reinterpret_cast<uint64_t>(outside);
+	Check(test,
+	      RemapIntoPrtMemory(alias, old, block, SceKernelProtCpuRead) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          RemapIntoPrtMemory(target, alias, block, SceKernelProtCpuRead) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "remap accepted a range outside the AMM range");
+	CheckOk(test, KernelMunmap(alias, block), "KernelMunmap(alias)");
+	Check(test,
+	      RemapIntoPrtMemory(old, old, block, SceKernelProtCpuRead) ==
+	          Libs::LibKernel::KERNEL_ERROR_EACCES,
+	      "remap accepted a target that is not PRT");
+	Check(test,
+	      RemapIntoPrtMemory(target, prt, block, SceKernelProtCpuRead) ==
+	          AMM_ERROR_REGION_NOT_FULLY_MAPPED,
+	      "remap accepted an unmapped source");
+
+	Check(test,
+	      remap(commands.header.data(), target, old, block, SceKernelProtCpuRead, 0x3f1) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          remap(commands.header.data(), target, old, block, SceKernelProtCpuExec, all) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "remapIntoPrt accepted invalid arguments");
+	CheckOk(test, remap(commands.header.data(), target, old, block, SceKernelProtCpuRead, all),
+	        "append remapIntoPrt");
+	Check(test,
+	      commands.Offset() == 16 && std::equal(record.begin(), record.end(), commands.data.begin()),
+	      "remapIntoPrt did not append its four dword record");
+	CheckOk(test, remap(commands.header.data(), target, old, block, SceKernelProtCpuRead, all),
+	        "append repeated remapIntoPrt");
+	const auto result = commands.Submit();
+	Check(test,
+	      result.result == Libs::LibKernel::KERNEL_ERROR_EACCES && result.error_offset == 16,
+	      "remapIntoPrt moved a range onto mapped addresses");
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {
+	              {false, target, block}, {true, target, block}, {false, old, block}},
+	      "remapIntoPrt did not replace the new range and unmap the old one on the GPU");
+	ExpectUnmapped(test, old);
+	ExpectRange(test, Query(test, target), target, target + block, SceKernelProtCpuRead, 0, 1, 0, 1,
+	            nullptr, physical);
+	Check(test, Query(test, target).memory_type == SceKernelMtypeC,
+	      "remapIntoPrt changed the memory type");
+	Check(test, *reinterpret_cast<uint64_t*>(target + page * 3) == 0x0123456789abcdefull,
+	      "remapIntoPrt lost the range contents");
+	ExpectRange(test, Query(test, prt), prt, target, 0, 0, 0, 0, 0, "anon");
+	Check(test,
+	      MapAutomaticMemory(old, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
+	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
+	      "remapIntoPrt released the moved pages to the automatic allocator");
+	CheckOk(test, UnmapAmmMemory(prt, block * 4), "AMM unmap PRT range");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
+	        "KernelCheckedReleaseDirectMemory(donation)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// A submission runs the command buffer that owns the submitted buffer, even when that buffer
+// occupies the header storage of a command buffer that was never destroyed.
+void TestAmmSubmitReusedHeaderStorage() {
+	const char*      test  = "AmmSubmitReusedHeaderStorage";
+	uint64_t         value = 0;
+	AmmCommandBuffer abandoned(test);
+	const auto       write =
+	    abandoned.Find<int(KYTY_SYSV_ABI*)(void*, volatile uint64_t*, uint64_t, uint32_t)>(
+	        "j0+3uJMxYJY");
+	CheckOk(test, write(abandoned.header.data(), &value, 1, 0), "append abandoned writeAddress");
+
+	AmmCommandBuffer commands(test, reinterpret_cast<uint32_t*>(abandoned.header.data()));
+	CheckOk(test, write(commands.header.data(), &value, 2, 0), "append writeAddress");
+	CheckOk(test, write(commands.header.data(), &value, 3, 0), "append second writeAddress");
+	const auto result = commands.Submit();
+	Check(test, result.result == OK && result.error_offset == 0 && value == 3,
+	      "submission did not run the command buffer that owns the buffer");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4433,6 +4997,13 @@ void TestModuleSegmentsUseFlexibleMemory() {
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "unloaded module did not return flexible memory");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestRelocationSkipsNoneEntries() {
+	const char* test = "RelocationSkipsNoneEntries";
+	Check(test, Loader::TestRelocationSkipsNoneEntries(),
+	      "R_X86_64_NONE was not skipped or changed module memory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5572,6 +6143,495 @@ void TestTimeStampCounterPatches() {
 constexpr int32_t FiberErrorState = -2141650938; // SCE_FIBER_ERROR_STATE
 constexpr int32_t FiberErrorPermission = -2141650939;
 
+constexpr size_t   FiberTestObjectSize      = 256;
+constexpr size_t   FiberTestStackAlignment  = 16;
+constexpr size_t   FiberTestSmallestContext = 512;
+constexpr size_t   FiberTestGuardSize       = 64u * 1024u;
+constexpr size_t   FiberTestLargestContext  = 6144;
+constexpr uint64_t FiberTestYieldValue      = 0x2162;
+constexpr uint32_t FiberTestBuildVersion    = 0x0a000000;
+constexpr uint8_t  FiberTestCanary          = 0xa5;
+
+struct alignas(FiberTestStackAlignment) FiberTestBacking {
+	std::array<uint8_t, FiberTestGuardSize + FiberTestLargestContext + FiberTestGuardSize> bytes;
+
+	bool CanariesIntact(uint64_t size) const {
+		const auto canary = [](uint8_t byte) { return byte == FiberTestCanary; };
+		return std::all_of(bytes.begin(), bytes.begin() + FiberTestGuardSize, canary) &&
+		       std::all_of(bytes.begin() + FiberTestGuardSize + size, bytes.end(), canary);
+	}
+};
+
+struct FiberHostCall {
+	void*     context;
+	uint64_t  context_size;
+	uintptr_t target;
+	uint64_t  call_rsp      = 0;
+	uint64_t  stack_base    = 0;
+	uint64_t  stack_limit   = 0;
+	uint64_t  resumed_base  = 0;
+	uint64_t  resumed_limit = 0;
+	uint64_t  argument      = FiberTestYieldValue;
+};
+
+static_assert(offsetof(FiberHostCall, context) == 0);
+static_assert(offsetof(FiberHostCall, context_size) == 8);
+static_assert(offsetof(FiberHostCall, target) == 16);
+static_assert(offsetof(FiberHostCall, call_rsp) == 24);
+static_assert(offsetof(FiberHostCall, argument) == 64);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static_assert(offsetof(NT_TIB, StackBase) == 8);
+static_assert(offsetof(NT_TIB, StackLimit) == 16);
+static_assert(offsetof(FiberHostCall, stack_base) == 32);
+static_assert(offsetof(FiberHostCall, stack_limit) == 40);
+static_assert(offsetof(FiberHostCall, resumed_base) == 48);
+static_assert(offsetof(FiberHostCall, resumed_limit) == 56);
+#endif
+
+[[gnu::naked]] void KYTY_SYSV_ABI FiberHostCallEntry(uint64_t, uint64_t) {
+	asm volatile("pushq %rbx\n\t"
+	             "pushq %r12\n\t"
+	             "movq %rsp, %rbx\n\t"
+	             "movq %rdi, %r12\n\t"
+	             "movq 0(%r12), %rax\n\t"
+	             "movq 8(%r12), %rcx\n\t"
+	             "movq 16(%r12), %r11\n\t"
+	             "movq %rsp, %rdx\n\t"
+	             "subq %rax, %rdx\n\t"
+	             "cmpq %rcx, %rdx\n\t"
+	             "jae 1f\n\t"
+	             "leaq 16(%rax), %rsp\n\t"
+	             "jmp 2f\n\t"
+	             "1:\n\t"
+	             "subq %rcx, %rsp\n\t"
+	             "andq $-16, %rsp\n\t"
+	             "2:\n\t"
+	             "movq %rsp, 24(%r12)\n\t"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             "movq %gs:8, %rax\n\t"
+	             "movq %rax, 32(%r12)\n\t"
+	             "movq %gs:16, %rax\n\t"
+	             "movq %rax, 40(%r12)\n\t"
+#endif
+	             "movq 64(%r12), %rdi\n\t"
+	             "xorl %esi, %esi\n\t"
+	             "callq *%r11\n\t"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             "movq %gs:8, %rax\n\t"
+	             "movq %rax, 48(%r12)\n\t"
+	             "movq %gs:16, %rax\n\t"
+	             "movq %rax, 56(%r12)\n\t"
+#endif
+	             "movq %rbx, %rsp\n\t"
+	             "popq %r12\n\t"
+	             "popq %rbx\n\t"
+	             "retq\n");
+}
+
+void TestFiberHostStack() {
+	const char* test = "FiberHostStack";
+	for (const uint64_t size: {FiberTestSmallestContext, FiberTestLargestContext}) {
+		auto backing = std::make_unique<FiberTestBacking>();
+		backing->bytes.fill(FiberTestCanary);
+		alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> object {};
+		auto*         fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+		FiberHostCall data {backing->bytes.data() + FiberTestGuardSize, size,
+		                    reinterpret_cast<uintptr_t>(&Libs::Fiber::FiberReturnToThread)};
+		const auto    initialize = [&] {
+			return Libs::Fiber::FiberInitialize(fiber, "host-stack", FiberHostCallEntry,
+			                                       reinterpret_cast<uint64_t>(&data), data.context,
+			                                       size, nullptr, FiberTestBuildVersion);
+		};
+		const auto check_canaries = [&] {
+			Check(test, backing->CanariesIntact(size),
+			      "Kyty wrote outside the supplied small fiber context");
+		};
+		const auto check_released = [&](uint64_t address) {
+			VirtualQueryInfo info {};
+			Check(test,
+			      Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void*>(address), 0,
+			                                                  &info, sizeof(info)) != OK,
+			      "fiber stack mapping survived reclamation");
+		};
+		const auto yield = [&] {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			const auto tib = *reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+#endif
+			uint64_t value = 0;
+			CheckOk(test, Libs::Fiber::FiberRun(fiber, 0, &value), "yield from host call");
+			check_canaries();
+			Check(test, value == FiberTestYieldValue, "lost yield argument");
+			void* start = nullptr;
+			void* end   = nullptr;
+			CheckOk(test,
+			        Libs::LibKernel::Memory::KernelIsStack(reinterpret_cast<void*>(data.call_rsp),
+			                                               &start, &end),
+			        "owned fiber stack");
+			Check(test, start != nullptr && end != nullptr, "mapping is not a guest stack");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			// Guest code runs with zeroed TEB stack bounds, fibers included.
+			Check(test, data.stack_base == 0 && data.stack_limit == 0,
+			      "fiber did not run with zeroed TEB stack bounds");
+			const auto* restored = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+			Check(test,
+			      restored->StackBase == tib.StackBase && restored->StackLimit == tib.StackLimit,
+			      "yield did not restore caller bounds");
+#endif
+		};
+		CheckOk(test, initialize(), "initialize small fiber");
+		yield();
+		const auto abandoned = data.call_rsp;
+		CheckOk(test, initialize(), "reinitialize suspended fiber");
+		check_released(abandoned);
+		yield();
+		int         result          = OK;
+		bool        bounds_restored = true;
+		std::thread worker([&] {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			const auto tib = *reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+#endif
+			result = Libs::Fiber::FiberRun(fiber, 0, nullptr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			const auto* restored = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+			bounds_restored =
+			    restored->StackBase == tib.StackBase && restored->StackLimit == tib.StackLimit;
+#endif
+		});
+		worker.join();
+		Check(test, result == FiberErrorState && bounds_restored,
+		      "entry return did not restore the receiving thread");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		Check(test, data.resumed_base == data.stack_base && data.resumed_limit == data.stack_limit,
+		      "migration did not reinstall fiber bounds");
+#endif
+		check_canaries();
+		check_released(data.call_rsp);
+		CheckOk(test, initialize(), "reinitialize terminated fiber");
+		yield();
+		CheckOk(test, Libs::Fiber::FiberFinalize(fiber), "finalize suspended fiber");
+		check_released(data.call_rsp);
+	}
+}
+
+void TestFiberStackExtents() {
+	const char*        test         = "FiberStackExtents";
+	constexpr uint64_t small_limit  = 64u * 1024u;
+	constexpr uint64_t host_reserve = 64u * 1024u;
+	constexpr uint64_t page         = 16u * 1024u;
+	const auto         owned_stack  = [](uint64_t rsp) {
+		std::pair<uint64_t, uint64_t> range {};
+		void*                         start = nullptr;
+		void*                         end   = nullptr;
+		if (Libs::LibKernel::Memory::KernelIsStack(reinterpret_cast<void*>(rsp), &start, &end) ==
+		    OK) {
+			range = {reinterpret_cast<uint64_t>(start), reinterpret_cast<uint64_t>(end)};
+		}
+		return range;
+	};
+	const auto run = [&](Libs::Fiber::FiberObject* fiber, FiberHostCall* data, uint64_t size,
+	                     const char* name) {
+		CheckOk(test,
+		        Libs::Fiber::FiberInitialize(fiber, name, FiberHostCallEntry,
+		                                     reinterpret_cast<uint64_t>(data), data->context, size,
+		                                     nullptr, FiberTestBuildVersion),
+		        "initialize fiber");
+		uint64_t value = 0;
+		CheckOk(test, Libs::Fiber::FiberRun(fiber, 0, &value), "yield from host call");
+		Check(test, value == FiberTestYieldValue, "lost yield argument");
+	};
+	for (const uint64_t size: {FiberTestSmallestContext, FiberTestLargestContext}) {
+		auto backing = std::make_unique<FiberTestBacking>();
+		alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> object {};
+		auto*         fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+		FiberHostCall data {backing->bytes.data() + FiberTestGuardSize, size,
+		                    reinterpret_cast<uintptr_t>(&Libs::Fiber::FiberReturnToThread)};
+		run(fiber, &data, size, "stack-extent");
+		const auto [start, end] = owned_stack(data.call_rsp);
+		Check(test, end - start == ((size + host_reserve + page - 1) & ~(page - 1)),
+		      "owned stack size differs from the context size + 64 KiB rounded to 16 KiB");
+		CheckOk(test, Libs::Fiber::FiberFinalize(fiber), "finalize suspended fiber");
+	}
+	for (const uint64_t size: {small_limit - FiberTestStackAlignment, small_limit}) {
+		auto backing = std::make_unique<std::array<uint8_t, FiberTestGuardSize + small_limit>>();
+		alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> object {};
+		auto*         fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+		FiberHostCall data {backing->data() + FiberTestGuardSize, size,
+		                    reinterpret_cast<uintptr_t>(&Libs::Fiber::FiberReturnToThread)};
+		run(fiber, &data, size, "stack-threshold");
+		const auto base       = reinterpret_cast<uint64_t>(data.context);
+		const bool on_context = data.call_rsp >= base && data.call_rsp < base + size;
+		Check(test, on_context == (size >= small_limit),
+		      "the 64 KiB threshold does not decide where the fiber runs");
+		CheckOk(test, Libs::Fiber::FiberFinalize(fiber), "finalize suspended fiber");
+	}
+	auto backing = std::make_unique<FiberTestBacking>();
+	alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> object {};
+	alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> copy_object {};
+	auto*         fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+	auto*         copy  = reinterpret_cast<Libs::Fiber::FiberObject*>(copy_object.data());
+	FiberHostCall data {backing->bytes.data() + FiberTestGuardSize, FiberTestSmallestContext,
+	                    reinterpret_cast<uintptr_t>(&Libs::Fiber::FiberReturnToThread)};
+	run(fiber, &data, FiberTestSmallestContext, "stack-owner");
+	copy_object = object;
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(copy, "stack-copy", FiberHostCallEntry,
+	                                     reinterpret_cast<uint64_t>(&data), data.context,
+	                                     FiberTestSmallestContext, nullptr, FiberTestBuildVersion),
+	        "initialize copied fiber");
+	Check(test, owned_stack(data.call_rsp).second != 0,
+	      "initializing a copy unmapped the original fiber's stack");
+	Check(test, Libs::Fiber::FiberRun(fiber, 0, nullptr) == FiberErrorState,
+	      "original fiber did not resume after its copy was initialized");
+	Check(test, owned_stack(data.call_rsp).second == 0,
+	      "original fiber kept its stack after returning");
+	CheckOk(test, Libs::Fiber::FiberFinalize(copy), "finalize copied fiber");
+}
+
+struct FiberFpControls {
+	uint32_t mxcsr = 0;
+	uint16_t cw    = 0;
+};
+
+constexpr uint32_t        FiberTestMxcsrFlags = 0x3f;
+constexpr FiberFpControls FiberTestHostFp {0x1f80, 0x027f};
+constexpr FiberFpControls FiberTestGuestFp {0x9fc0, 0x037f};
+constexpr FiberFpControls FiberTestFirstFp {0xffc0, 0x0f7f};
+constexpr FiberFpControls FiberTestSecondFp {0xbfc0, 0x077f};
+
+FiberFpControls ReadFiberFp() {
+	FiberFpControls state;
+	asm volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(state.mxcsr), "=m"(state.cw));
+	return state;
+}
+
+void WriteFiberFp(FiberFpControls state) {
+	asm volatile("ldmxcsr %0\n\tfldcw %1" : : "m"(state.mxcsr), "m"(state.cw) : "memory");
+}
+
+bool FiberFpMatches(FiberFpControls state, FiberFpControls expected) {
+	return (state.mxcsr & ~FiberTestMxcsrFlags) == expected.mxcsr && state.cw == expected.cw;
+}
+
+struct FiberFpSwitch {
+	Libs::Fiber::FiberObject* first  = nullptr;
+	Libs::Fiber::FiberObject* second = nullptr;
+	FiberFpControls           second_entry {};
+	FiberFpControls           first_resumed {};
+	int32_t                   errors = 0;
+};
+
+[[noreturn]] void KYTY_SYSV_ABI FiberFpFirstEntry(uint64_t initial, uint64_t /*arg*/) {
+	auto& data = *reinterpret_cast<FiberFpSwitch*>(initial);
+	WriteFiberFp(FiberTestFirstFp);
+	data.errors |= Libs::Fiber::FiberSwitch(data.second, 0, nullptr);
+	data.first_resumed = ReadFiberFp();
+	for (;;) {
+		data.errors |= Libs::Fiber::FiberReturnToThread(0, nullptr);
+	}
+}
+
+[[noreturn]] void KYTY_SYSV_ABI FiberFpSecondEntry(uint64_t initial, uint64_t /*arg*/) {
+	auto& data        = *reinterpret_cast<FiberFpSwitch*>(initial);
+	data.second_entry = ReadFiberFp();
+	WriteFiberFp(FiberTestSecondFp);
+	for (;;) {
+		data.errors |= Libs::Fiber::FiberSwitch(data.first, 0, nullptr);
+	}
+}
+
+void TestFiberOwnStackFp() {
+	const char* test           = "FiberOwnStackFp";
+	auto        first_backing  = std::make_unique<FiberTestBacking>();
+	auto        second_backing = std::make_unique<FiberTestBacking>();
+	alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> first_object {};
+	alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> second_object {};
+	FiberFpSwitch data {reinterpret_cast<Libs::Fiber::FiberObject*>(first_object.data()),
+	                    reinterpret_cast<Libs::Fiber::FiberObject*>(second_object.data())};
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(data.first, "fp-first", FiberFpFirstEntry,
+	                                     reinterpret_cast<uint64_t>(&data),
+	                                     first_backing->bytes.data() + FiberTestGuardSize,
+	                                     FiberTestSmallestContext, nullptr, FiberTestBuildVersion),
+	        "initialize first fiber");
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(data.second, "fp-second", FiberFpSecondEntry,
+	                                     reinterpret_cast<uint64_t>(&data),
+	                                     second_backing->bytes.data() + FiberTestGuardSize,
+	                                     FiberTestSmallestContext, nullptr, FiberTestBuildVersion),
+	        "initialize second fiber");
+	const auto saved = ReadFiberFp();
+	WriteFiberFp(FiberTestHostFp);
+	const auto run_result = Libs::Fiber::FiberRun(data.first, 0, nullptr);
+	const auto caller     = ReadFiberFp();
+	WriteFiberFp(saved);
+	CheckOk(test, run_result, "run first fiber");
+	Check(test, data.errors == 0, "switching between the fibers failed");
+	Check(test, FiberFpMatches(data.second_entry, FiberTestGuestFp),
+	      "a fiber on its own stack did not start with the console's FP environment");
+	Check(test, FiberFpMatches(data.first_resumed, FiberTestFirstFp),
+	      "a fiber on its own stack lost its FP controls across a switch");
+	Check(test, FiberFpMatches(caller, FiberTestHostFp),
+	      "the fibers' FP controls leaked to the thread that ran them");
+	CheckOk(test, Libs::Fiber::FiberFinalize(data.first), "finalize first fiber");
+	CheckOk(test, Libs::Fiber::FiberFinalize(data.second), "finalize second fiber");
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr DWORD FiberTestExceptionCode      = 0xe0422162;
+constexpr DWORD FiberTestExceptionArguments = 1;
+
+struct FiberExceptionData {
+	bool     handled       = false;
+	bool     continued     = false;
+	uint64_t exception_rsp = 0;
+	uint64_t stack_base    = 0;
+	uint64_t stack_limit   = 0;
+	uint64_t owned_start   = 0;
+	uint64_t owned_end     = 0;
+};
+
+LONG CALLBACK FiberExceptionHandler(EXCEPTION_POINTERS* exception) {
+	const auto* record = exception->ExceptionRecord;
+	if (record->ExceptionCode != FiberTestExceptionCode ||
+	    record->NumberParameters != FiberTestExceptionArguments) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	auto&       data   = *reinterpret_cast<FiberExceptionData*>(record->ExceptionInformation[0]);
+	const auto* tib    = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+	data.exception_rsp = exception->ContextRecord->Rsp;
+	data.stack_base    = reinterpret_cast<uint64_t>(tib->StackBase);
+	data.stack_limit   = reinterpret_cast<uint64_t>(tib->StackLimit);
+	void* start        = nullptr;
+	void* end          = nullptr;
+	if (Libs::LibKernel::Memory::KernelIsStack(reinterpret_cast<void*>(data.exception_rsp), &start,
+	                                           &end) == OK) {
+		data.owned_start = reinterpret_cast<uint64_t>(start);
+		data.owned_end   = reinterpret_cast<uint64_t>(end);
+	}
+	data.handled = true;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void KYTY_SYSV_ABI FiberExceptionCall(uint64_t initial, uint64_t) {
+	auto&           data     = *reinterpret_cast<FiberExceptionData*>(initial);
+	const ULONG_PTR argument = initial;
+	RaiseException(FiberTestExceptionCode, 0, FiberTestExceptionArguments, &argument);
+	data.continued = true;
+}
+
+void TestFiberExceptionStack() {
+	const char* test = "FiberExceptionStack";
+	struct HandlerScope {
+		void* handler = AddVectoredExceptionHandler(1, FiberExceptionHandler);
+		~HandlerScope() {
+			if (handler != nullptr) {
+				RemoveVectoredExceptionHandler(handler);
+			}
+		}
+	} scope;
+	Check(test, scope.handler != nullptr, "install fiber exception handler");
+	for (const uint64_t size: {FiberTestSmallestContext, FiberTestLargestContext}) {
+		auto backing = std::make_unique<FiberTestBacking>();
+		backing->bytes.fill(FiberTestCanary);
+		alignas(FiberTestStackAlignment) std::array<uint8_t, FiberTestObjectSize> object {};
+		auto*              fiber = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+		FiberExceptionData exception {};
+		FiberHostCall      data {backing->bytes.data() + FiberTestGuardSize, size,
+		                    reinterpret_cast<uintptr_t>(&FiberExceptionCall)};
+		data.argument = reinterpret_cast<uint64_t>(&exception);
+		CheckOk(test,
+		        Libs::Fiber::FiberInitialize(fiber, "exception-stack", FiberHostCallEntry,
+		                                     reinterpret_cast<uint64_t>(&data), data.context, size,
+		                                     nullptr, FiberTestBuildVersion),
+		        "initialize exception fiber");
+		const auto  tib      = *reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+		const auto  result   = Libs::Fiber::FiberRun(fiber, 0, nullptr);
+		const auto* restored = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+		Check(test, backing->CanariesIntact(size),
+		      "exception dispatch wrote below the supplied fiber context");
+		Check(test, exception.handled && exception.continued && result == FiberErrorState,
+		      "fiber did not continue and return after its exception");
+		Check(test,
+		      exception.stack_base == 0 && exception.stack_limit == 0 &&
+		          exception.owned_start != 0 && exception.exception_rsp >= exception.owned_start &&
+		          exception.exception_rsp < exception.owned_end,
+		      "exception did not run on the fiber's own stack with zeroed TEB bounds");
+		Check(test, restored->StackBase == tib.StackBase && restored->StackLimit == tib.StackLimit,
+		      "exception return did not restore caller bounds");
+	}
+}
+#endif
+
+struct FiberReturnChain {
+	Libs::Fiber::FiberObject* second;
+	uint64_t                  first_local   = 0;
+	uint64_t                  second_local  = 0;
+	int                       switch_result = FiberErrorState;
+	bool                      resumed       = false;
+};
+
+void KYTY_SYSV_ABI FiberChainFirst(uint64_t initial, uint64_t) {
+	auto&             data  = *reinterpret_cast<FiberReturnChain*>(initial);
+	volatile uint64_t local = FiberTestYieldValue;
+	data.first_local        = reinterpret_cast<uint64_t>(&local);
+	data.switch_result      = Libs::Fiber::FiberSwitch(data.second, 0, nullptr);
+	data.resumed            = local == FiberTestYieldValue;
+	Libs::Fiber::FiberReturnToThread(FiberTestYieldValue, nullptr);
+}
+
+void KYTY_SYSV_ABI FiberChainSecond(uint64_t initial, uint64_t) {
+	auto&             data  = *reinterpret_cast<FiberReturnChain*>(initial);
+	volatile uint64_t local = FiberTestYieldValue;
+	data.second_local       = reinterpret_cast<uint64_t>(&local);
+}
+
+void TestFiberSwitchReturnStack() {
+	const char* test = "FiberSwitchReturnStack";
+	struct alignas(FiberTestStackAlignment) Storage {
+		std::array<uint8_t, FiberTestObjectSize>                          object {};
+		std::array<uint8_t, FiberTestGuardSize + FiberTestLargestContext> stack {};
+	};
+	auto             first  = std::make_unique<Storage>();
+	auto             second = std::make_unique<Storage>();
+	auto*            a      = reinterpret_cast<Libs::Fiber::FiberObject*>(first->object.data());
+	auto*            b      = reinterpret_cast<Libs::Fiber::FiberObject*>(second->object.data());
+	FiberReturnChain data {b};
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(a, "chain-a", FiberChainFirst,
+	                                     reinterpret_cast<uint64_t>(&data),
+	                                     first->stack.data() + FiberTestGuardSize,
+	                                     FiberTestLargestContext, nullptr, FiberTestBuildVersion),
+	        "initialize chain A");
+	CheckOk(test,
+	        Libs::Fiber::FiberInitialize(b, "chain-b", FiberChainSecond,
+	                                     reinterpret_cast<uint64_t>(&data),
+	                                     second->stack.data() + FiberTestGuardSize,
+	                                     FiberTestLargestContext, nullptr, FiberTestBuildVersion),
+	        "initialize chain B");
+	Check(test,
+	      Libs::Fiber::FiberRun(a, 0, nullptr) == FiberErrorState && !data.resumed &&
+	          data.first_local != 0 && data.second_local != 0,
+	      "B did not return to the run tail");
+	void* start = nullptr;
+	void* end   = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelIsStack(reinterpret_cast<void*>(data.first_local),
+	                                               &start, &end),
+	        "retained chain A stack");
+	Check(test, start != nullptr && end != nullptr, "suspended A lost its stack mapping");
+	VirtualQueryInfo info {};
+	Check(test,
+	      Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void*>(data.second_local), 0,
+	                                                  &info, sizeof(info)) != OK,
+	      "returning B retained its stack mapping");
+	uint64_t returned = 0;
+	CheckOk(test, Libs::Fiber::FiberRun(a, 0, &returned), "resume chain A");
+	Check(test, data.resumed && data.switch_result == OK && returned == FiberTestYieldValue,
+	      "A did not resume with its stack intact");
+	CheckOk(test, Libs::Fiber::FiberFinalize(a), "finalize chain A");
+	Check(test, Libs::Fiber::FiberFinalize(b) == FiberErrorState, "finalize terminated chain B");
+}
+
 struct FiberRoundTrip {
 	Libs::Fiber::FiberObject* first;
 	Libs::Fiber::FiberObject* second;
@@ -5703,11 +6763,18 @@ void TestSmallFiberStacksAndMigration() {
 		const int main_self_result = Libs::Fiber::FiberGetSelf(&main_self);
 		const int busy_run = running ? Libs::Fiber::FiberRun(data.first, 30, nullptr) : 0;
 		const int busy_finalize = running ? Libs::Fiber::FiberFinalize(data.first) : 0;
+		const int busy_initialize =
+		    running ? Libs::Fiber::FiberInitialize(data.first, "busy", FirstFiberEntry,
+		                                           reinterpret_cast<uint64_t>(&data),
+		                                           first_stack.data() + GuardSize, stack_size,
+		                                           nullptr, FiberTestBuildVersion)
+		            : 0;
 		data.release.store(true, std::memory_order_release);
 		worker.join();
 		Check(test, thread_context_is_clear() && main_self_result == OK && main_self == nullptr,
 		      "migrated fiber changed the original thread's current fiber");
-		Check(test, running && busy_run == FiberErrorState && busy_finalize == FiberErrorState,
+		Check(test, running && busy_run == FiberErrorState && busy_finalize == FiberErrorState &&
+		          busy_initialize == FiberErrorState,
 		      "running fiber was not exclusively owned");
 		CheckOk(test, worker_result, "resume fiber on another thread");
 		CheckOk(test, worker_repeat_result, "repeat run on another thread");
@@ -5734,57 +6801,77 @@ void TestSmallFiberStacksAndMigration() {
 } // namespace
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-KYTY_MS_ABI uint8_t* TlsStubTestAddress() {
-	return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(0x123456789abcull));
-}
-
-void TestTlsStubsPreserveFlags() {
-	const char*    test      = "TlsStubsPreserveFlags";
-	const uint64_t stub_size = Loader::Jit::SafeCall::GetSize();
+void TestGuestTlsReadsUseThreadTcb() {
+	const char*        test      = "GuestTlsReadsUseThreadTcb";
 	constexpr uint64_t CODE_SIZE = 0x1000;
-	constexpr uint8_t  REG       = 1;
 	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
-	    0x0000000906000000ull, stub_size + CODE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
-	    "tls_stub_test");
-	Check(test, mapping != 0, "failed to allocate TLS stub test code");
-	auto* safe_call = new (reinterpret_cast<void*>(mapping)) Loader::Jit::SafeCall;
-	safe_call->SetFunc(TlsStubTestAddress);
-	const auto stub_address = mapping + Loader::Jit::TlsRegStub::GetOffset(REG);
-	auto*      stub         = new (reinterpret_cast<void*>(stub_address)) Loader::Jit::TlsRegStub;
-	stub->SetFunc(mapping);
-	stub->SetOutputReg(REG);
+	    0x0000000906000000ull, CODE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "tls_read_test");
+	Check(test, mapping != 0, "failed to allocate TLS read test code");
 
-	using Fixture  = uint64_t(KYTY_SYSV_ABI*)(uint64_t*);
-	bool preserved = true;
-	for (const auto [input, status]: {std::pair {uint8_t {0x7f}, uint64_t {0x890}},
-	                                  std::pair {uint8_t {0xff}, uint64_t {0x055}}}) {
-		Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping + stub_size));
-		code.push(code.rbx);
-		code.mov(code.rbx, code.rdi);
-		code.mov(code.rax, 0x5555555555555555ull);
-		code.mov(code.al, input);
-		code.add(code.al, 1);
-		code.mov(code.r11, stub_address);
-		code.call(code.r11);
-		code.mov(code.qword[code.rbx], code.rcx);
-		code.mov(code.qword[code.rbx + 8], code.rax);
-		code.pushf();
-		code.pop(code.rax);
-		code.pop(code.rbx);
-		code.ret();
-		Check(test, Xbyak::GetError() == 0, "failed to generate TLS stub fixture");
-		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, stub_size + CODE_SIZE),
-		      "failed to flush TLS stub test code");
-		std::array<uint64_t, 2> registers {};
-		const auto flags = reinterpret_cast<Fixture>(mapping + stub_size)(registers.data());
-		const auto rax   = (0x5555555555555555ull & ~0xffull) | static_cast<uint8_t>(input + 1u);
-		preserved &= (flags & 0x8d5u) == status && registers[0] == 0x123456789abcull &&
-		             registers[1] == rax;
-	}
-	Libs::LibKernel::Memory::FreeGuestMemory(mapping, stub_size + CODE_SIZE);
-	Check(test, preserved, "TLS stubs changed the caller's flags or registers");
+	// Reads the TCB through fs:[0] into rax, into rax behind 66 prefixes and into r9.
+	Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping));
+	const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
+		for (const auto byte: bytes) {
+			code.db(byte);
+		}
+	};
+	emit({0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0});
+	code.mov(code.qword[code.rdi], code.rax);
+	emit({0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0});
+	code.mov(code.qword[code.rdi + 8], code.rax);
+	emit({0x64, 0x4c, 0x8b, 0x0c, 0x25, 0, 0, 0, 0});
+	code.mov(code.qword[code.rdi + 16], code.r9);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate TLS read fixture");
+	Loader::RuntimeLinker::PatchGuestCode(mapping, code.getSize());
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE),
+	      "failed to flush TLS read test code");
+
+	Loader::RuntimeLinker::CreateThreadTls();
+	std::array<uint64_t, 3> out {};
+	reinterpret_cast<void(KYTY_SYSV_ABI*)(uint64_t*)>(mapping)(out.data());
+	const auto tcb = reinterpret_cast<uint64_t>(Loader::RuntimeLinker::GetThreadTcb());
+	Loader::RuntimeLinker::DeleteThreadTls();
+	Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE);
+
+	Check(test, out[0] == tcb && out[1] == tcb && out[2] == tcb,
+	      "patched fs:[0] reads did not return the thread TCB");
+	std::printf("[host]    %-48s ok\n", test);
 }
 #endif
+
+void TestGuestTlsGetAddrUsesPerThreadBlocks() {
+	const char* test = "GuestTlsGetAddrUsesPerThreadBlocks";
+
+	const std::array<uint8_t, 4> image {1, 2, 3, 4};
+	Loader::Program              module;
+	module.tls = {reinterpret_cast<uint64_t>(image.data()), image.size(), 64, 7};
+	const auto initialized = [&](const uint8_t* block) {
+		return std::equal(image.begin(), image.end(), block) &&
+		       std::all_of(block + image.size(), block + 64, [](uint8_t b) { return b == 0; });
+	};
+
+	Loader::RuntimeLinker::CreateThreadTls();
+	auto* block = Loader::RuntimeLinker::TlsGetAddr(&module);
+	block[4]    = 5;
+	const bool same_block = Loader::RuntimeLinker::TlsGetAddr(&module) == block;
+
+	uint8_t* other_block = nullptr;
+	bool     other_ok    = false;
+	std::thread([&] {
+		Loader::RuntimeLinker::CreateThreadTls();
+		other_block = Loader::RuntimeLinker::TlsGetAddr(&module);
+		other_ok    = initialized(other_block);
+		Loader::RuntimeLinker::DeleteThreadTls();
+	}).join();
+	Loader::RuntimeLinker::DeleteThreadTls();
+
+	Check(test, same_block, "a module's TLS block changed within a thread");
+	Check(test, other_block != block && other_ok,
+	      "a second thread did not get its own initialized TLS block");
+	std::printf("[host]    %-48s ok\n", test);
+}
 
 int RunTrinityTests();
 
@@ -5807,6 +6894,8 @@ int main(int argc, char** argv) {
 		RunTest(TestDirectTrimmedAliasRelease);
 		RunTest(TestDirectMappingNamesTypesAndValidation);
 		RunTest(TestAutomaticMemoryReuseAndAliases);
+		RunTest(TestAmmMapAsPrt);
+		RunTest(TestAmmRemapIntoPrt);
 		RunTest(TestAutomaticMemoryFragmentedMap);
 		RunTest(TestFragmentedMemoryPoolBacking);
 		RunTest(TestMemoryPoolMiddleDecommitAndReuse);
@@ -5843,6 +6932,7 @@ int main(int argc, char** argv) {
 		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
+		RunTest(TestSparseCopyCacheMatchesLockedCopy);
 		RunTest(TestSparseReadDuringDirectCommit);
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestFlexibleMemoryUsesSharedBacking);
@@ -5857,6 +6947,13 @@ int main(int argc, char** argv) {
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		RunTest(TestFiberExceptionStack);
+#endif
+		RunTest(TestFiberHostStack);
+		RunTest(TestFiberStackExtents);
+		RunTest(TestFiberOwnStackFp);
+		RunTest(TestFiberSwitchReturnStack);
 		RunTest(TestSmallFiberStacksAndMigration);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
@@ -5878,6 +6975,12 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--guest-stack-debug-print-only") == 0) {
+		RunTest(TestGuestStackDebugPrint);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -5885,6 +6988,13 @@ int main(int argc, char** argv) {
 
 	RunTest(TestFlexibleZeroingTracksBackingLifetime);
 #if defined(__x86_64__) || defined(_M_X64)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestFiberExceptionStack);
+#endif
+	RunTest(TestFiberHostStack);
+	RunTest(TestFiberStackExtents);
+	RunTest(TestFiberOwnStackFp);
+	RunTest(TestFiberSwitchReturnStack);
 	RunTest(TestSmallFiberStacksAndMigration);
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -5900,6 +7010,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestCopySparseMemoryMappings);
+	RunTest(TestSparseCopyCacheMatchesLockedCopy);
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
@@ -5921,12 +7032,15 @@ int main(int argc, char** argv) {
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
+	RunTest(TestUnalignedFlexibleMunmapLengthRoundsToGuestPage);
 	RunTest(TestFlexibleRangeEditsCoalesce);
 	RunTest(TestPageTableStatsTrackRangeEdits);
 	RunTest(TestReserveMapFixedAndNoOverwrite);
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestMunmapReservedSpanWithReleasedHole);
+	RunTest(TestVmaMemoInvalidation);
 	RunTest(TestMunmapGpuRuns);
 	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
@@ -5955,6 +7069,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
+	RunTest(TestFixedMapOverIdenticalRangeIsNoOp);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
 #if defined(__linux__)
@@ -5964,6 +7079,9 @@ int main(int argc, char** argv) {
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
+	RunTest(TestAmmMapAsPrt);
+	RunTest(TestAmmRemapIntoPrt);
+	RunTest(TestAmmSubmitReusedHeaderStorage);
 	RunTest(TestAutomaticMemoryFragmentedMap);
 	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolAlignmentContracts);
@@ -5976,9 +7094,11 @@ int main(int argc, char** argv) {
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 	RunTest(TestModuleSegmentsUseFlexibleMemory);
+	RunTest(TestRelocationSkipsNoneEntries);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	RunTest(TestTlsStubsPreserveFlags);
+	RunTest(TestGuestTlsReadsUseThreadTcb);
 #endif
+	RunTest(TestGuestTlsGetAddrUsesPerThreadBlocks);
 	// Memory callbacks remain registered for the rest of the process.
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
 	RunTest(TestAsanAliasedPhysicalRelease);

@@ -8,6 +8,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
+#include "libs/libcStdio.h"
 #include "libs/libs.h"
 #include "libs/vaContext.h"
 #include "loader/runtimeLinker.h"
@@ -24,7 +25,11 @@
 #include <ctime>
 #include <fmt/format.h>
 #include <list>
+#include <memory>
 #include <mutex>
+#include <new>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -59,6 +64,65 @@ using InitEnvParams = Loader::EntryParams;
 static int                g_argc = 0;
 static const char* const* g_argv = nullptr;
 static const char* const* g_envp = nullptr;
+static std::mutex g_environment_mutex;
+// Values live in non-throwing buffers: the Clang build has no exceptions, so a guest value too
+// large for memory must fail with ENOMEM instead of aborting the emulator.
+// shortcut: the key string and the map node still allocate with throwing new; both are small,
+// make them non-throwing too if a guest ever exhausts memory with names.
+static std::unordered_map<std::string, std::unique_ptr<char[]>> g_environment;
+
+static std::unique_ptr<char[]> CopyEnvironmentValue(std::string_view value) {
+	std::unique_ptr<char[]> copy(new (std::nothrow) char[value.size() + 1]);
+	if (copy != nullptr) {
+		std::memcpy(copy.get(), value.data(), value.size());
+		copy[value.size()] = '\0';
+	}
+	return copy;
+}
+
+static void InitializeEnvironment(const char* const* envp) {
+	std::lock_guard lock(g_environment_mutex);
+	g_environment.clear();
+	for (const char* const* entry = envp; entry != nullptr && *entry != nullptr; ++entry) {
+		const std::string_view variable(*entry);
+		const auto equals = variable.find('=');
+		if (equals != std::string_view::npos && equals != 0) {
+			auto value = CopyEnvironmentValue(variable.substr(equals + 1));
+			if (value != nullptr) {
+				g_environment.try_emplace(std::string(variable.substr(0, equals)), std::move(value));
+			}
+		}
+	}
+}
+
+static char* GetGuestEnvironmentVariable(const char* name) {
+	if (name == nullptr || name[0] == '\0' || std::strchr(name, '=') != nullptr) {
+		return nullptr;
+	}
+
+	std::lock_guard lock(g_environment_mutex);
+	const auto variable = g_environment.find(name);
+	return variable == g_environment.end() ? nullptr : variable->second.get();
+}
+
+// Returns false when the value cannot be copied (out of memory).
+static bool SetGuestEnvironmentVariable(const char* name, const char* value, int overwrite) {
+	std::lock_guard lock(g_environment_mutex);
+	auto variable = g_environment.find(name);
+	if (variable != g_environment.end() && overwrite == 0) {
+		return true;
+	}
+	auto copy = CopyEnvironmentValue(value);
+	if (copy == nullptr) {
+		return false;
+	}
+	if (variable == g_environment.end()) {
+		g_environment.emplace(name, std::move(copy));
+	} else {
+		variable->second = std::move(copy);
+	}
+	return true;
+}
 
 int GetArgc() {
 	return g_argc;
@@ -264,6 +328,7 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 		g_argc = 0;
 		g_argv = nullptr;
 		g_envp = nullptr;
+		InitializeEnvironment(nullptr);
 		return;
 	}
 
@@ -272,6 +337,7 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 	g_argc = params->argc;
 	g_argv = params->argv;
 	g_envp = params->argv + params->argc + 1;
+	InitializeEnvironment(g_envp);
 
 	LOGF("\t argc = %d\n"
 	     "\t argv = 0x%016" PRIx64 "\n"
@@ -321,7 +387,11 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 		return -1;
 	}
 
-	// Guest environment changes must not leak into emulator host libraries.
+	// Keep guest changes separate from the emulator process environment.
+	if (!SetGuestEnvironmentVariable(name, value, overwrite)) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		return -1;
+	}
 	return 0;
 }
 
@@ -613,6 +683,10 @@ LIB_VERSION("LibcInternal", 1, "LibcInternal", 1, 1);
 
 static uint32_t g_need_flag = 1;
 
+char* KYTY_SYSV_ABI getenv(const char* name) {
+	return LibC::GetGuestEnvironmentVariable(name);
+}
+
 int KYTY_SYSV_ABI vprintf(const char* str, VaList* c) {
 	PRINT_NAME();
 
@@ -630,9 +704,7 @@ static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
 int KYTY_SYSV_ABI fflush(FILE* stream) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(stream != stdout);
-
-	return ::fflush(stream);
+	return LibcStdio::Fflush(stream, stdout);
 }
 
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
@@ -766,6 +838,7 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_OBJECT("2sWzhYqFH4E", stdout);
 
 	LIB_FUNC("GMpvxPFW924", LibcInternal::vprintf);
+	LIB_FUNC("smbQukfxYJM", LibcInternal::getenv);
 	LIB_FUNC("MUjC4lbHrK4", LibcInternal::fflush);
 	LIB_FUNC("8zTFvBIAIN8", LibcInternal::memset);
 	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);
@@ -808,6 +881,11 @@ LIB_DEFINE(InitLibC_1) {
 	LibcInternal::InitLibcInternal_1(s);
 
 	LIB_OBJECT("P330P3dFF68", &LibC::g_need_flag);
+
+	// Games read these slots to get the FILE* of the guest libc, filled in by RuntimeLinker.
+	LIB_OBJECT("bgAcsbcEznc", &LibcStdio::Slots().stdin_file);  // __stdinp
+	LIB_OBJECT("zqJhBxAKfsc", &LibcStdio::Slots().stdout_file); // __stdoutp
+	LIB_OBJECT("as8Od-tH1BI", &LibcStdio::Slots().stderr_file); // __stderrp
 
 	LIB_FUNC("uMei1W9uyNo", LibC::exit);
 	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);

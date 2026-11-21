@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStore.h"
 
 #include "common/assert.h"
@@ -28,6 +29,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <deque>
 #include <array>
 #include <atomic>
@@ -517,6 +519,8 @@ struct PipelineCache::ProgramCache {
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (diag_log) diag_module_us = PerfStats::SteadyUs() - module_begin;
+		SetVulkanObjectNameF(graphics.device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
+		                     options.shader_hash);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -698,8 +702,36 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		const bool tess_stage = options.stage == ShaderType::Local ||
+		                        options.stage == ShaderType::TessellationControl ||
+		                        options.stage == ShaderType::TessellationEvaluation;
+		// KYTY_TESS_PRETRANSLATE: a new LS, HS or DS program is translated by a worker while its draw
+		// is skipped (GetGraphicsPrograms); the next draw only emits it here.
+		ShaderRecompiler::TranslateResult translated;
+		bool                              pretranslated = false;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			if (tess_defer && tess_stage && entry == programs.end() && params.back_code.empty()) {
+				finish_options();
+				pretranslate_words = lookup_key.static_state;
+				pretranslate_words.insert(pretranslate_words.end(),
+				                          {static_cast<uint32_t>(options.stage), params.user_data_count,
+				                           lookup_key.code_size});
+				const auto take = ShaderPretranslate::TakeTess(params.hash, pretranslate_words, params.code,
+				                                               options, input_info, translated, tess_deferred);
+				if (take == TessPretranslateTake::Pending || take == TessPretranslateTake::Queue) {
+					tess_deferred = true;
+					return {};
+				}
+				pretranslated = take == TessPretranslateTake::Ready;
+			} else if (tess_defer && tess_stage && tess_deferred) {
+				// The draw is skipped and an earlier stage did not advance the push data cursor: a
+				// translation here would be emitted at the wrong cursor. The next draw does it.
+				return {};
+			}
+		}
 		PerfStats::ScopedTimer recompile_timer(PerfStats::Counter::RecompileNs,
 		                                       PerfStats::Counter::RecompileCount);
+		const auto tess_begin = tess_stage && PerfStats::Enabled() ? PerfStats::SteadyUs() : 0;
 		// KYTY_COMPILE_LOG: classify the miss (N new code, S new static state of known code, P new
 		// resource permutation, C changed callee) and time its phases.
 		const auto diag_begin = diag_log ? PerfStats::SteadyUs() : 0;
@@ -726,8 +758,6 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		// KYTY_SHADER_PRETRANSLATE: a pixel program without calls may have been translated by a
 		// worker since its registration; only the per-draw specialization (emission) is left.
-		ShaderRecompiler::TranslateResult translated;
-		bool                              pretranslated = false;
 		std::optional<ShaderRecompiler::TranslateResult> verify_local;
 		if (ShaderPretranslate::Enabled() && options.stage == ShaderType::Pixel &&
 		    params.back_code.empty() &&
@@ -742,15 +772,15 @@ struct PipelineCache::ProgramCache {
 				ShaderPretranslate::Remember(params.hash, pretranslate_words, params.code,
 				                             *options.input_info.pixel, params.user_data_count);
 			}
-			if (pretranslated && ShaderPretranslate::VerifyEnabled()) {
-				verify_local = ShaderRecompiler::TranslateProgram(params.code, options);
-				const bool equal = ShaderRecompiler::IR::ProgramToString(verify_local->program) ==
-				                   ShaderRecompiler::IR::ProgramToString(translated.program);
-				if (!equal) {
-					ShaderPretranslate::NoteVerify(false);
-					PipelineCacheLog("pretranslate verify: IR differs for PS 0x{:016x}", params.hash);
-					verify_local.reset();
-				}
+		}
+		if (pretranslated && ShaderPretranslate::VerifyEnabled()) {
+			verify_local = ShaderRecompiler::TranslateProgram(params.code, options);
+			const bool equal = ShaderRecompiler::IR::ProgramToString(verify_local->program) ==
+			                   ShaderRecompiler::IR::ProgramToString(translated.program);
+			if (!equal) {
+				ShaderPretranslate::NoteVerify(false);
+				PipelineCacheLog("pretranslate verify: IR differs for {} 0x{:016x}", stage_name, params.hash);
+				verify_local.reset();
 			}
 		}
 		ShaderRecompiler::ShaderSource source;
@@ -781,6 +811,7 @@ struct PipelineCache::ProgramCache {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
 		const auto diag_translated = diag_log ? PerfStats::SteadyUs() : 0;
+		const auto tess_translated = tess_begin != 0 ? PerfStats::SteadyUs() : 0;
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
@@ -813,7 +844,7 @@ struct PipelineCache::ProgramCache {
 			const bool equal = verify_spirv_hash == last_spirv_hash;
 			ShaderPretranslate::NoteVerify(equal);
 			if (!equal) {
-				PipelineCacheLog("pretranslate verify: SPIR-V differs for PS 0x{:016x}", params.hash);
+				PipelineCacheLog("pretranslate verify: SPIR-V differs for {} 0x{:016x}", stage_name, params.hash);
 			}
 		}
 		if (diag_log) {
@@ -830,6 +861,16 @@ struct PipelineCache::ProgramCache {
 			    pretranslated ? 1 : 0);
 		}
 
+		if (tess_begin != 0) {
+			using PerfStats::Counter;
+			const auto index = static_cast<uint32_t>(options.stage) - static_cast<uint32_t>(ShaderType::Local);
+			PerfStats::Add(static_cast<Counter>(static_cast<uint32_t>(Counter::TessMissLs) + index), 1);
+			if (!pretranslated) {
+				PerfStats::Add(static_cast<Counter>(static_cast<uint32_t>(Counter::TessInlineLs) + index), 1);
+				PerfStats::Add(Counter::TessInlineNs, (tess_translated - tess_begin) * 1000u);
+			}
+			PerfStats::Add(Counter::TessMissNs, (PerfStats::SteadyUs() - tess_begin) * 1000u);
+		}
 		auto& counts = compiled;
 		counts[static_cast<size_t>(options.stage)]++;
 		// Guest geometry shaders are compiled through the host mesh stage.
@@ -841,7 +882,11 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::Local)],
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-		return bind(entry->second.permutations.back());
+		const auto handle = bind(entry->second.permutations.back());
+		if (pretranslated && tess_stage && StageWritesAnything(input_info.stage)) {
+			ShaderPretranslate::NoteTessWrites();
+		}
+		return handle;
 	}
 
 	// Reads the plan of a loaded program at its first lookup. Should the store fail to read it
@@ -999,6 +1044,10 @@ struct PipelineCache::ProgramCache {
 	uint64_t              verify_failed  = 0;
 	// KYTY_SHADER_PRETRANSLATE (GPU thread).
 	std::vector<uint32_t> pretranslate_words;
+	// KYTY_TESS_PRETRANSLATE (GetGraphicsPrograms): new tessellation stages may be left to a worker;
+	// set when one was, and the draw is then skipped.
+	bool tess_defer    = false;
+	bool tess_deferred = false;
 	uint64_t              verify_spirv_hash = 0;
 	uint64_t              last_spirv_hash   = 0;
 };
@@ -1073,7 +1122,8 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 						return pool.stop || !pool.skipped.empty() || !pool.queue.empty();
 					});
 					if (pool.stop) return;
-					auto job = AsyncPipelinePop(pool.skipped, pool.queue);
+					auto job = AsyncPipelinePop(pool.skipped, pool.queue,
+					                            [this](const auto& queued) { return AsyncUncapped(*queued); });
 					uint32_t queued = 0;
 					if (!job->state.compare_exchange_strong(queued, 1)) continue; // taken inline
 					pool.running++;
@@ -1090,6 +1140,14 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		const char* async = std::getenv("KYTY_ASYNC_PIPELINE");
 		m_async           = async == nullptr || std::strcmp(async, "0") != 0;
 		if (m_async) PipelineCacheLog("Pipeline async: draws skipped while their pipeline is created (KYTY_ASYNC_PIPELINE)");
+		const char* async_tess = std::getenv("KYTY_ASYNC_TESS");
+		m_async_tess           = m_async && (async_tess == nullptr || std::strcmp(async_tess, "0") != 0);
+		if (m_async_tess) PipelineCacheLog("Pipeline async: tessellation draws skipped until created, no cap, depth-only too (KYTY_ASYNC_TESS)");
+		if (ShaderPretranslate::TessEnabled()) {
+			PipelineCacheLog("Tess pretranslate: {} (KYTY_TESS_PRETRANSLATE)",
+			                 m_async_tess ? "new LS/HS/DS translated by workers, their draws skipped meanwhile"
+			                              : "inactive without KYTY_ASYNC_TESS");
+		}
 	}
 	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
 		// The verify shaders embed this launch's counter address.
@@ -1372,7 +1430,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
         }
         SetPipelineCreationQuiet(false);
 	};
-	const auto               workers = std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
+	// Several threads compiling pipelines at once trips a crash inside NVIDIA's
+	// libnvidia-glvkspirv, so that driver warms up serially.
+	const auto workers = m_graphics.physical_device_properties.vendorID == 0x10DEu
+	                         ? 1u
+	                         : std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
 	std::vector<std::thread> threads;
 	for (uint32_t i = 1; i < workers && i < jobs.size(); i++) {
 		threads.emplace_back(work);
@@ -1675,8 +1737,10 @@ void PipelineCache::WriteDriverCache() {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state,
-                                        bool single_sample, const AliasedColorTargets* aliased) {
+                                        bool single_sample, const AliasedColorTargets* aliased,
+                                        bool may_defer_tess) {
 	WaitWarmUp();
+	state.tess_deferred           = false;
 	const auto& context           = command.GetRegisters();
 	const auto& user_config       = command.GetUserConfig();
 	const auto& sh                = context.GetShaderRegisters();
@@ -1937,8 +2001,25 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			}
 		}
 	}
+	// KYTY_TESS_PRETRANSLATE: with skipped tessellation draws (KYTY_ASYNC_TESS), the new LS, HS and DS
+	// programs of a draw go to workers together and the draw is skipped; it then has no vertex program.
+	// A draw whose pixel program (translated above) writes memory is not deferred, as the async rules
+	// would not skip it. Aliased-target passes only lose colors, like any skipped draw.
+	// shortcut: only the untranslated LS/HS/DS writes are unknown, so a draw whose stages write is
+	// skipped too until translated ("PERF tesspre writes" counts them); check them first if one does.
+	auto& cache         = *m_program_cache;
+	cache.tess_defer    = may_defer_tess && tess_active && m_async_tess && ShaderPretranslate::TessEnabled() &&
+	                      !command.GetContext().GetOcclusionQueries().Counting() &&
+	                      !(pixel_active && pixel_info.stage.program != nullptr && StageWritesAnything(pixel_info.stage));
+	cache.tess_deferred = false;
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	}
+	cache.tess_defer = false;
+	if (cache.tess_deferred) {
+		state.tess_deferred = true;
+		vertex_info[0].stage = {};
+		PerfStats::Add(PerfStats::Counter::TessDeferredDraws, 1);
 	}
 }
 
@@ -2178,6 +2259,42 @@ bool PipelineCache::MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig
 }
 #undef KYTY_KEY_CHECK
 
+// shortcut: measurement only (KYTY_PERF_STATS=1), no behaviour change; remove once the
+// SPI_PS_INPUT_CNTL DEFAULT_VAL rule is decided. For each new pipeline, counts the pixel inputs
+// the hardware fills with DEFAULT_VAL (OFFSET bit 5 set, or no export at OFFSET in the last
+// vertex stage) where we read something else: the VS parameter at OFFSET & 0x1f, or an
+// unwritten location while DEFAULT_VAL is not 0,0,0,0.
+static void CountPixelInputDefaults(const ShaderVertexInputInfo& last_stage,
+                                    const ShaderPixelInputInfo&  pixel) {
+	if (!PerfStats::Enabled() || last_stage.stage.program == nullptr ||
+	    pixel.stage.program == nullptr || pixel.parameter_mode == ShaderPixelParameterMode::Rectangle) {
+		return;
+	}
+	static std::atomic<uint64_t> pipelines {0}, hit_pipelines {0};
+	const auto exports = last_stage.stage.program->param_export_mask;
+	uint32_t read_vs = 0, read_unwritten = 0, custom = 0;
+	for (uint32_t input = 0; input < pixel.input_num && input < 32u; input++) {
+		const auto setting  = pixel.interpolator_settings[input];
+		const bool exported = ((exports >> (setting & 0x1fu)) & 1u) != 0;
+		if ((setting & 0x20u) == 0 && exported) continue;
+		if (!exported && ((setting >> 8u) & 3u) == 0) continue;
+		(exported ? read_vs : read_unwritten)++;
+		custom += (pixel.custom_interpolation_mask >> input) & 1u;
+	}
+	const auto seen = ++pipelines;
+	const auto hits = read_vs + read_unwritten != 0 ? ++hit_pipelines : hit_pipelines.load();
+	if (read_vs + read_unwritten != 0) {
+		std::printf("PERF arifix-s3 vs=0x%016" PRIx64 " ps=0x%016" PRIx64
+		            " inputs=%u read_vs=%u read_unwritten=%u custom=%u exports=0x%08x\n",
+		            last_stage.stage.program->shader_hash, pixel.stage.program->shader_hash,
+		            read_vs + read_unwritten, read_vs, read_unwritten, custom, exports);
+	}
+	if (std::has_single_bit(seen)) {
+		std::printf("PERF arifix-s3-seen pipelines=%" PRIu64 " hit_pipelines=%" PRIu64 "\n", seen,
+		            hits);
+	}
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
                                                             std::span<const RenderColorInfo> colors,
@@ -2222,6 +2339,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 	if (ps_active) {
 		LoadStoredModule(ps_input_info.stage.module);
+		CountPixelInputDefaults(vertex_info.back(), ps_input_info);
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -2359,7 +2477,8 @@ bool PipelineCache::SkipMissing(const CommandBuffer& command, const DrawRenderSt
 	// Past the cap the draw waits; a job still queued is then created inline (TakePending). One a
 	// worker is creating stays skipped: waiting would block the CP for the rest of its creation,
 	// and the hole lasts at most one creation longer.
-	const bool may_skip = AsyncPipelineMaySkip(job->first_skip, Frame());
+	const bool may_skip =
+	    AsyncPipelineMaySkip(job->first_skip, Frame(), AsyncUncapped(*job));
 	if (PerfStats::CompileLogEnabled()) [[unlikely]] {
 		LogSkip(*job, may_skip);
 	}
@@ -2409,13 +2528,20 @@ void PipelineCache::LogSkip(PendingPipeline& job, bool may_skip) {
 	size_t  len   = 0;
 	{
 		std::scoped_lock lock(m_pool->mutex);
-		// Position in the workers' order: the skipped queue, then the predicted one.
+		// Position in the workers' order (AsyncPipelinePop): the capped skipped keys, the uncapped
+		// ones, then the predicted queue.
 		const auto& skipped = m_pool->skipped;
 		const auto& queue   = m_pool->queue;
 		len                 = skipped.size() + queue.size();
-		for (size_t i = 0; i < len && pos < 0; i++) {
-			if ((i < skipped.size() ? skipped[i] : queue[i - skipped.size()]).get() == &job) {
-				pos = static_cast<int64_t>(i);
+		int64_t ahead       = 0;
+		for (int pass = 0; pass < 3 && pos < 0; pass++) {
+			for (const auto& queued: pass < 2 ? skipped : queue) {
+				if (pass < 2 && AsyncUncapped(*queued) != (pass == 1)) continue;
+				if (queued.get() == &job) {
+					pos = ahead;
+					break;
+				}
+				ahead++;
 			}
 		}
 	}
@@ -2425,6 +2551,10 @@ void PipelineCache::LogSkip(PendingPipeline& job, bool may_skip) {
 	                          !may_skip ? 'X' : first ? 'A' : 'Q', PerfStats::SteadyUs(),
 	                          GraphicsPipelineKeyHash {}(job.key), age, pos, len,
 	                          job.state.load(std::memory_order_acquire), job.skip_miss ? 1 : 0);
+}
+
+bool PipelineCache::AsyncUncapped(const PendingPipeline& job) const {
+	return m_async_tess && job.stage_count == 3;
 }
 
 void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {

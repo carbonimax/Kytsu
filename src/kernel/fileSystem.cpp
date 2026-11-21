@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -31,6 +32,7 @@
 #include <random>
 #include <string_view>
 #include <system_error>
+#include <string>
 #include <vector>
 
 namespace Libs::LibKernel::FileSystem {
@@ -51,6 +53,7 @@ public:
 		std::filesystem::path dir;
 		std::string           point;
 		std::shared_ptr<Common::ArchiveReader> archive;
+		bool                                   read_only;
 	};
 
 	MountPoints() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
@@ -58,10 +61,11 @@ public:
 
 	KYTY_CLASS_NO_COPY(MountPoints);
 
-	void Mount(const std::filesystem::path& folder, const std::string& point);
+	void Mount(const std::filesystem::path& folder, const std::string& point, bool read_only);
 	void Umount(const std::string& folder_or_point);
 
-	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
+	[[nodiscard]] std::filesystem::path ResolvePath(std::string_view mounted_name,
+	                                                bool*            read_only = nullptr);
 	[[nodiscard]] bool                  IsMountPoint(const std::string& point);
 
 private:
@@ -292,7 +296,8 @@ void FileDescriptors::CloseAll() {
 	}
 }
 
-void MountPoints::Mount(const std::filesystem::path& folder, const std::string& point) {
+void MountPoints::Mount(const std::filesystem::path& folder, const std::string& point,
+                        bool read_only) {
 	Common::LockGuard lock(m_mutex);
 
 	auto point_str  = Common::FixDirectorySlash(point);
@@ -303,6 +308,7 @@ void MountPoints::Mount(const std::filesystem::path& folder, const std::string& 
 	p.dir   = folder;
 	p.point = point_str;
 	p.archive = Common::OpenArchive(folder);
+	p.read_only = read_only || Common::IsArchivePath(folder);
 
 	m_mount_pairs.push_back(std::move(p));
 }
@@ -323,7 +329,7 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 }
 
 // Guests join mount points and names with extra slashes (e.g. "/addcont0//file").
-static std::string NormalizeGuestPath(const std::string& mounted_name) {
+static std::string NormalizeGuestPath(std::string_view mounted_name) {
 	std::string normalized = Common::FixFilenameSlash(mounted_name);
 	normalized.erase(std::unique(normalized.begin(), normalized.end(),
 	                             [](char a, char b) { return a == '/' && b == '/'; }),
@@ -389,7 +395,7 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 }
 #endif
 
-std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
+std::filesystem::path MountPoints::ResolvePath(std::string_view mounted_name, bool* read_only) {
 	Common::LockGuard lock(m_mutex);
 
 	const std::string normalized = NormalizeGuestPath(mounted_name);
@@ -401,6 +407,9 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
 	if (it != m_mount_pairs.end()) {
 		const auto& p = *it;
+		if (read_only != nullptr) {
+			*read_only = p.read_only;
+		}
 		auto rel_path = Common::RemoveFirst(normalized, p.point.size());
 		while (rel_path.starts_with('/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
@@ -413,7 +422,8 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n", mounted_name.c_str());
+			::printf("FileSystem: Windows-incompatible guest filename: %.*s\n",
+			         static_cast<int>(mounted_name.size()), mounted_name.data());
 		}
 		return p.dir / native_rel_path;
 #else
@@ -444,9 +454,9 @@ void Shutdown() {
 	g_mount_points = nullptr;
 }
 
-void Mount(const std::filesystem::path& folder, const std::string& point) {
+void Mount(const std::filesystem::path& folder, const std::string& point, bool read_only) {
 
-	g_mount_points->Mount(folder, point);
+	g_mount_points->Mount(folder, point, read_only);
 }
 
 void Umount(const std::string& folder_or_point) {
@@ -462,6 +472,52 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 bool IsOpenDescriptor(int d) {
 	const auto* file = g_files->GetFile(d);
 	return file != nullptr && file->opened;
+}
+
+bool IsUnrealCommandLinePath(const std::string& guest_path) {
+	std::string lower(guest_path.size(), '\0');
+	std::ranges::transform(guest_path, lower.begin(),
+	                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return lower == "/app0/ue4commandline.txt" || lower == "/app0/uecommandline.txt";
+}
+
+std::string AppendUnrealScreenPercentage(std::string command_line, uint32_t percentage) {
+	while (!command_line.empty() && (command_line.back() == '\n' || command_line.back() == '\r' ||
+	                                 command_line.back() == '\0')) {
+		command_line.pop_back();
+	}
+	// The engine takes the console variable from either form, depending on its version.
+	const auto option = "r.ScreenPercentage=" + std::to_string(percentage);
+	return command_line + " -ini:Engine:[SystemSettings]:" + option + " -dpcvars=" + option;
+}
+
+// With --unreal-screen-percentage, what an Unreal Engine game reads from its command line file: the
+// file's text with r.ScreenPercentage appended (KernelOpen serves it through a host temp copy), so
+// that the engine renders its scene at that share of its output and upscales it, as its own
+// settings would. Nothing when the option is off, the path is another file, or the file can't be
+// read whole.
+static std::optional<std::string> UnrealCommandLine(const std::string&           guest_path,
+                                                    const std::filesystem::path& real_name) {
+	constexpr uint64_t MaxSize    = 64 * 1024;
+	const auto         percentage = Config::UnrealScreenPercentage();
+	if (percentage == 0 || !IsUnrealCommandLinePath(guest_path)) {
+		return std::nullopt;
+	}
+	Common::File original;
+	if (!original.Open(real_name, Common::File::Mode::Read)) {
+		return std::nullopt;
+	}
+	const auto size = original.Size();
+	if (size > MaxSize) {
+		return std::nullopt;
+	}
+	std::string content(size, '\0');
+	uint32_t    bytes_read = 0;
+	original.Read(content.data(), static_cast<uint32_t>(size), &bytes_read);
+	if (bytes_read != size) {
+		return std::nullopt;
+	}
+	return AppendUnrealScreenPercentage(std::move(content), percentage);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -531,20 +587,11 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	IoStats::Timer io(IoStats::Api::Open);
-	file->real_name = g_mount_points->ResolvePath(file->name);
+	bool read_only  = false;
+	file->real_name = g_mount_points->ResolvePath(file->name, &read_only);
 	if (file->real_name.empty()) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
-	}
-	if (Common::IsArchivePath(file->real_name) &&
-	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {
-		g_files->DeleteDescriptor(descriptor);
-		return KERNEL_ERROR_EROFS;
-	}
-
-	if (trunc && rw_mode == Common::File::Mode::Read) {
-		g_files->DeleteDescriptor(descriptor);
-		return KERNEL_ERROR_EACCES;
 	}
 
 	const auto info = Common::File::GetInfo(file->real_name);
@@ -557,14 +604,29 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
+	if (excl && creat && info) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_EEXIST;
+	}
+
+	// Only O_CREAT of a missing path writes.
+	if (read_only && (rw_mode != Common::File::Mode::Read || trunc || !info)) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_EROFS;
+	}
+
+	if (trunc && rw_mode == Common::File::Mode::Read) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_EACCES;
+	}
+
 	if (directory || dir_exist) {
 		if (!dir_exist) {
 			g_files->DeleteDescriptor(descriptor);
 			return KERNEL_ERROR_ENOTDIR;
 		}
 
-		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
-		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
+		EXIT_NOT_IMPLEMENTED(rw_mode != Common::File::Mode::Read);
 
 		const auto entries = Common::File::GetDirEntries(file->real_name);
 		file->dirents      = PackDirents(entries);
@@ -581,17 +643,33 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	} else {
 		bool result = false;
 
-		if (excl && creat && file_exist) {
-			g_files->DeleteDescriptor(descriptor);
-			return KERNEL_ERROR_EEXIST;
-		}
-
 		if (creat && (!file_exist || trunc)) {
 			Common::File::CreateDirectories(file->real_name.parent_path());
 			result = file->f.Create(file->real_name);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
+		} else if (auto served = rw_mode == Common::File::Mode::Read
+		                             ? UnrealCommandLine(file->name, file->real_name)
+		                             : std::nullopt) {
+			// Common::File has no in-memory mode: serve a host temp copy, one per descriptor.
+			const auto copy_path = std::filesystem::temp_directory_path() /
+			                       ("kyty-" + std::to_string(descriptor) + "-" +
+			                        Common::PathToString(file->real_name.filename()));
+			Common::File copy;
+			if (copy.Create(copy_path)) {
+				copy.Write(served->data(), static_cast<uint32_t>(served->size()));
+				copy.Close();
+				result = file->f.Open(copy_path, rw_mode);
+			}
+			if (!result) {
+				result = file->f.Open(file->real_name, rw_mode);
+			}
+
+			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red,
+			           "\tOpen: %s, served command line: %s, %s\n",
+			           Common::PathToString(file->real_name).c_str(), served->c_str(),
+			           result ? "[ok]" : "[fail]");
 		} else {
 			result = file->f.Open(file->real_name, rw_mode);
 			if (result && IoStats::Enabled()) {
@@ -1211,7 +1289,14 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		return OK;
 	}
 
-	return StatHostPath(g_mount_points->ResolvePath(path), sb);
+	const auto real_file_name = g_mount_points->ResolvePath(path);
+	const int  result         = StatHostPath(real_file_name, sb);
+	if (result == OK && Config::UnrealScreenPercentage() != 0) {
+		if (const auto served = UnrealCommandLine(path, real_file_name)) {
+			SetStatSize(sb, served->size(), false);
+		}
+	}
+	return result;
 }
 
 int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {
@@ -1310,12 +1395,17 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	if (IsRandomDevice(path)) {
 		return OK;
 	}
-	const auto real_name = g_mount_points->ResolvePath(path);
+	bool       read_only = false;
+	const auto real_name = g_mount_points->ResolvePath(path, &read_only);
 	if (real_name.empty()) {
 		return KERNEL_ERROR_ENOENT;
 	}
-	if (Common::IsArchivePath(real_name)) {
-		return KERNEL_ERROR_EROFS;
+	if (read_only) {
+		const auto info = Common::File::GetInfo(real_name);
+		if (!info) {
+			return KERNEL_ERROR_ENOENT;
+		}
+		return info->is_file ? KERNEL_ERROR_EROFS : KERNEL_ERROR_EISDIR;
 	}
 
 	std::error_code error;
@@ -1427,8 +1517,9 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto real_file_name = g_mount_points->ResolvePath(path);
-	if (Common::IsArchivePath(real_file_name)) {
+	bool read_only      = false;
+	auto real_file_name = g_mount_points->ResolvePath(path, &read_only);
+	if (read_only) {
 		return KERNEL_ERROR_EROFS;
 	}
 
@@ -1462,11 +1553,11 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto from_path = std::string(from);
-	auto to_path   = std::string(to);
-	auto real_from = g_mount_points->ResolvePath(from_path);
-	auto real_to   = g_mount_points->ResolvePath(to_path);
-	if (Common::IsArchivePath(real_from) || Common::IsArchivePath(real_to)) {
+	bool from_read_only = false;
+	bool to_read_only   = false;
+	auto real_from      = g_mount_points->ResolvePath(from, &from_read_only);
+	auto real_to        = g_mount_points->ResolvePath(to, &to_read_only);
+	if (from_read_only || to_read_only) {
 		return KERNEL_ERROR_EROFS;
 	}
 
@@ -1549,16 +1640,17 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	     "\t mode = %04" PRIx16 "\n",
 	     path, mode);
 
-	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	bool read_only = false;
+	auto real_name = g_mount_points->ResolvePath(path, &read_only);
 	if (real_name.empty()) {
 		return KERNEL_ERROR_ENOENT;
-	}
-	if (Common::IsArchivePath(real_name)) {
-		return KERNEL_ERROR_EROFS;
 	}
 
 	if (Common::File::GetInfo(real_name)) {
 		return KERNEL_ERROR_EEXIST;
+	}
+	if (read_only) {
+		return KERNEL_ERROR_EROFS;
 	}
 
 	return Common::File::CreateDirectory(real_name) ? OK : KERNEL_ERROR_EIO;
@@ -1586,8 +1678,9 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 		return KERNEL_ERROR_EBUSY;
 	}
 
-	const auto real_name = g_mount_points->ResolvePath(path);
-	if (Common::IsArchivePath(real_name)) {
+	bool       read_only = false;
+	const auto real_name = g_mount_points->ResolvePath(path, &read_only);
+	if (read_only) {
 		return KERNEL_ERROR_EROFS;
 	}
 

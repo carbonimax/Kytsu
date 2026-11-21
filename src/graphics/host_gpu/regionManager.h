@@ -2,10 +2,12 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -28,9 +30,21 @@
 
 namespace Libs::Graphics {
 
+// KYTY_TRACKING_LOCK (default 1): owner check of TrackingSpinLock.
+//   0: OS thread id at every lock and unlock (the former path, also used before static init);
+//   1: thread id cached per thread, same check;
+//   2: no owner (a recursive lock spins forever, a non-owner unlock goes unnoticed).
+// Bit 4 (set from KYTY_MEMTRACK_PROF=1): acquisitions counted for the "PERF memtrack" line.
+// One value, so either path costs a single load and branch. Defined in memTrackProf.cpp.
+extern const uint32_t g_tracking_lock_flags;
+
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
+		if (g_tracking_lock_flags != 0) [[likely]] {
+			LockWith(g_tracking_lock_flags);
+			return;
+		}
 		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
@@ -48,12 +62,54 @@ public:
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
 	void unlock() noexcept {
-		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
-		m_owner.store(0, std::memory_order_relaxed);
+		const auto mode = g_tracking_lock_flags & 15u;
+		if (mode != 2) {
+			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) !=
+			                     (mode == 1 ? CachedThread() : CurrentThread()));
+			m_owner.store(0, std::memory_order_relaxed);
+		}
 		m_lock.clear(std::memory_order_release);
 	}
 
 private:
+	static void Pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+		_mm_pause();
+#elif defined(_M_ARM64)
+		__yield();
+#elif defined(__aarch64__)
+		asm volatile("yield");
+#endif
+	}
+
+	void LockWith(uint32_t flags) noexcept {
+		const auto mode      = flags & 15u;
+		const auto thread    = mode == 1 ? CachedThread() : mode == 2 ? 0u : CurrentThread();
+		bool       contended = false;
+		while (m_lock.test_and_set(std::memory_order_acquire)) {
+			EXIT_NOT_IMPLEMENTED(mode != 2 && m_owner.load(std::memory_order_relaxed) == thread);
+			contended = true;
+			while (m_lock.test(std::memory_order_relaxed)) {
+				Pause();
+			}
+		}
+		if (mode != 2) {
+			m_owner.store(thread, std::memory_order_relaxed);
+		}
+		if ((flags & 16u) != 0) {
+			MemTrackProf::NoteTrackingLock(contended);
+		}
+	}
+
+	// Constant-initialized (no TLS guard); a thread id is never 0 (the "no owner" sentinel).
+	static uint32_t CachedThread() noexcept {
+		static thread_local uint32_t tid = 0;
+		if (tid == 0) [[unlikely]] {
+			tid = CurrentThread();
+		}
+		return tid;
+	}
+
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
@@ -85,9 +141,23 @@ public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
 		m_cpu_dirty.Fill();
+		for (auto& epoch: m_block_cpu_epoch) {
+			epoch.store(1, std::memory_order_relaxed); // an untracked region reads 0
+		}
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
+
+	// KYTY_BIND_MEMO: per 64 KiB block, advances (before the pages are unprotected) whenever one of
+	// its pages becomes CPU-modified. Unchanged since a synchronization left a range clean = the
+	// guest wrote none of its bytes since (pages already CPU-modified do not fault, so they do not
+	// advance it: callers only keep ranges that were clean).
+	static constexpr size_t DirtyBlockPages = std::max<size_t>(1, (64ull * 1024ull) / TRACKER_PAGE_SIZE);
+	static constexpr size_t DirtyBlocks     = TRACKER_REGION_PAGES / DirtyBlockPages;
+	[[nodiscard]] uint64_t BlockCpuEpoch(size_t block) const {
+		return m_block_cpu_epoch[block].load(std::memory_order_acquire);
+	}
+	[[nodiscard]] uint64_t RegionCpuEpoch() const { return m_region_cpu_epoch.load(std::memory_order_acquire); }
 
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
@@ -124,6 +194,16 @@ public:
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			if (!changed.None()) {
+				for (const auto [first, last]: changed) {
+					for (auto block = first / DirtyBlockPages; block <= (last - 1) / DirtyBlockPages; block++) {
+						m_block_cpu_epoch[block].fetch_add(1, std::memory_order_acq_rel);
+					}
+				}
+				m_region_cpu_epoch.fetch_add(1, std::memory_order_acq_rel);
+			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>(changed);
@@ -204,6 +284,8 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	std::array<std::atomic<uint32_t>, DirtyBlocks> m_block_cpu_epoch {};
+	std::atomic<uint64_t>                          m_region_cpu_epoch {1};
 };
 
 } // namespace Libs::Graphics

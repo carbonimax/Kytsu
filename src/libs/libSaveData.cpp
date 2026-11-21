@@ -1260,7 +1260,8 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 		}
 	}
 	// Kyty keeps a single save format, so there is nothing to rewrite: the conversion ends at
-	// once, copying the save when the title names a destination, and reports a CONVERT_END event.
+	// once and reports a CONVERT_END event. A named destination gets a copy, never a rename, so
+	// the source save stays intact whatever happens to the copy.
 	const auto* dst    = convert->dst_dir_name != nullptr ? convert->dst_dir_name : convert->src_dir_name;
 	auto        target = source;
 	int32_t     error  = OK;
@@ -1269,6 +1270,8 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 		std::error_code ec;
 		std::filesystem::copy(source, target, std::filesystem::copy_options::recursive, ec);
 		if (ec) {
+			LOGF("\t copy of %s to %s failed: %s\n", convert->src_dir_name->data,
+			     convert->dst_dir_name->data, ec.message().c_str());
 			error = SAVE_DATA_ERROR_INTERNAL;
 		}
 	}
@@ -1276,8 +1279,15 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 		error = write_save_file(target / "sce_sys" / "blocks.bin", &convert->dst_blocks,
 		                        sizeof(convert->dst_blocks));
 	}
+	if (error != OK && convert->dst_dir_name != nullptr) {
+		// A partial copy would make the next attempt fail with SAVE_DATA_ERROR_EXISTS.
+		std::error_code ec;
+		std::filesystem::remove_all(target, ec);
+	}
 	LOGF("\t result = 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
-	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, nullptr, dst, error);
+	SceSaveDataTitleId title {};
+	std::snprintf(title.data, sizeof(title.data), "%s", get_title_id().c_str());
+	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, &title, dst, error);
 	return OK;
 }
 

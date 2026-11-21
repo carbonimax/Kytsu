@@ -248,12 +248,14 @@ void Run(const RunOptions& options) {
 	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
-	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
+	// /hostapp mounts the same folder writable.
+	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0", true);
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
 
 	MountSandboxDirs();
 
-	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
+	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id,
+	                       Common::ReadLocalEntitlements(options.app0_dir / "dlc_emu.ini", title_id));
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 

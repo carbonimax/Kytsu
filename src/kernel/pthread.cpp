@@ -638,6 +638,8 @@ PThreadContext*             g_pthread_context        = nullptr;
 thread_local uintptr_t      g_guest_entry_return_rsp = 0;
 static std::atomic<int32_t> g_pthread_thread_id      = 0;
 
+static thread_local bool g_thread_destructors_started = false;
+
 static Common::Mutex g_guest_stack_mutex;
 static uint64_t      g_guest_stack_last = 0;
 struct CachedGuestStack {
@@ -3174,11 +3176,14 @@ bool PthreadHasAnyPendingSignal(Pthread thread) {
 }
 
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
-	if (thread == nullptr || signum < 0 || signum >= 64) {
+	if (thread == nullptr || thread->almost_done || signum < 0 || signum >= 64) {
 		return false;
 	}
 
 	const auto mask = 1ull << static_cast<uint32_t>(signum);
+	if ((thread->pending_signal_mask.load(std::memory_order_acquire) & mask) == 0) {
+		return false;
+	}
 	return (thread->pending_signal_mask.fetch_and(~mask, std::memory_order_acq_rel) & mask) != 0;
 }
 
@@ -3224,13 +3229,10 @@ int PthreadGetCurrentPriorityForKernel() {
 	return PthreadGetPriorityForKernel(g_pthread_self);
 }
 
-static void CleanupThread(void* arg) {
-	auto* thread = static_cast<Pthread>(arg);
-
-	if (thread->attr != nullptr) {
-		Memory::ReleaseGuestStack(reinterpret_cast<uint64_t>(thread->attr->stack_addr));
+static void RunThreadDestructors() {
+	if (std::exchange(g_thread_destructors_started, true)) {
+		return;
 	}
-
 	LibcInternalExt::RunThreadAtexitDestructors();
 
 	auto thread_dtors = g_pthread_context->GetThreadDtors();
@@ -3240,11 +3242,20 @@ static void CleanupThread(void* arg) {
 	}
 
 	DestructPthreadSpecific();
+}
 
-	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-	rt->DeleteTlss(thread->unique_id);
+static void CleanupThread(void* arg) {
+	auto* thread = static_cast<Pthread>(arg);
 
+	if (thread->attr != nullptr) {
+		Memory::ReleaseGuestStack(reinterpret_cast<uint64_t>(thread->attr->stack_addr));
+	}
+
+	RunThreadDestructors();
+
+	// Guest signal handlers stop here: they would run on freed TLS.
 	thread->almost_done = true;
+	Loader::RuntimeLinker::DeleteThreadTls();
 }
 
 static void* RunThread(void* arg) {
@@ -3260,7 +3271,9 @@ static void* RunThread(void* arg) {
 
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
+	Loader::RuntimeLinker::CreateThreadTls();
 	g_pthread_self = thread;
+	g_thread_destructors_started = false;
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3425,6 +3438,7 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 	if (result == 0) {
 		FreeGuestStack(thread->attr);
 
+		thread->pending_signal_mask.store(0, std::memory_order_relaxed);
 		thread->almost_done = false;
 		thread->free        = true;
 	}
@@ -3627,6 +3641,8 @@ void KYTY_SYSV_ABI PthreadTestcancel() {
 
 void KYTY_SYSV_ABI PthreadExit(void* value) {
 	PRINT_NAME();
+
+	Fiber::FiberExitThread(value, RunThreadDestructors);
 
 #if defined(__x86_64__) || defined(_M_X64)
 	if (g_guest_entry_return_rsp != 0) {

@@ -49,6 +49,7 @@ private:
 	Decoder::Operand PlainOperand(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> BallotMask(IR::U1 value);
 	std::array<IR::U32, 2> ExecMask();
+	std::array<IR::U32, 2> PresentMask();
 	std::array<IR::U32, 2> VectorMask(IR::U1 value);
 	IR::U32                ReadRawU32(const Decoder::Operand& operand);
 	IR::U32                ReadScalarCode(uint32_t code);
@@ -217,6 +218,7 @@ private:
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
+	void V_MSAD_U8(const Decoder::Instruction& inst);
 	void S_BITSET_B32(const Decoder::Instruction& inst, bool set);
 	void S_BITSET_B64(const Decoder::Instruction& inst, bool set);
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);
@@ -238,8 +240,9 @@ private:
 	void    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 
 	void S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin);
-	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,
-	                bool negate_source, bool write_64);
+	enum class SaveExecOp { And, Or, Xor };
+	void S_SAVEEXEC(const Decoder::Instruction& inst, SaveExecOp operation, bool negate_exec,
+	                bool negate_source, bool negate_result, bool write_64);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
 	void SUB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
 	void SUBB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);

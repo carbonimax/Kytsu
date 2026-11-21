@@ -477,6 +477,41 @@ void TestAtrac9Vibration() {
 	}
 }
 
+void TestAtrac9SampleEncodingsShareScale() {
+	using namespace Libs::Audio::Ajm;
+	const std::array<uint8_t, 4> config {0xfe, 0x70, 0x0b, 0xf0};
+	std::array<uint8_t, 384> encoded {}; // One superframe; frames use the leading blocks.
+	for (int frame = 0; frame < 4; ++frame) {
+		auto block = encoded.begin() + frame * ATRAC9_MONO_BLOCK.size();
+		std::copy(ATRAC9_MONO_BLOCK.begin(), ATRAC9_MONO_BLOCK.end(), block);
+		if (frame != 0) *block |= 0x80;
+	}
+	auto decode = [&]<typename T>(AjmSampleEncoding encoding, std::vector<T>& pcm) {
+		AjmAt9Decoder decoder(1, 48000, encoding, 0);
+		Check(decoder.Initialize(config.data(), config.size()).result == OK,
+		      "ATRAC9 encoding fixture initialization failed");
+		pcm.assign(4 * 256, T {});
+		const auto decoded = decoder.Decode(encoded.data(), encoded.size(), pcm.data(),
+		                                    pcm.size() * sizeof(T), true, nullptr);
+		Check(decoded.result == OK && decoded.frames == 4 &&
+		          decoded.output_written == pcm.size() * sizeof(T),
+		      "ATRAC9 encoding fixture did not decode");
+	};
+	std::vector<int16_t> s16;
+	std::vector<int32_t> s32;
+	std::vector<float>   f32;
+	decode(AjmSampleEncoding::S16, s16);
+	decode(AjmSampleEncoding::S32, s32);
+	decode(AjmSampleEncoding::Float, f32);
+	Check(std::ranges::any_of(s16, [](int16_t sample) { return sample != 0; }),
+	      "ATRAC9 encoding fixture decoded to silence");
+	for (size_t i = 0; i < s16.size(); ++i) {
+		Check(std::abs(static_cast<int64_t>(s32[i]) - int64_t {s16[i]} * 65536) <= 33000,
+		      "ATRAC9 S32 PCM is not full scale");
+		Check(std::abs(f32[i] * 32768.0f - s16[i]) <= 2.0f, "ATRAC9 float PCM is not unit scale");
+	}
+}
+
 void TestAtrac9Discrete() {
 	using namespace Libs::Audio::Ajm;
 	constexpr std::array<uint8_t, 4> captured {0x30, 0x72, 0xc0, 0xfe};
@@ -570,10 +605,18 @@ void TestAtrac9Discrete() {
 						result = Atrac9Decode(reference.get(), input.data(),
 						                      reinterpret_cast<int16_t*>(mono.data()), &used, 0);
 						break;
-					case AjmSampleEncoding::S32:
-						result = Atrac9DecodeS32(reference.get(), input.data(),
-						                         reinterpret_cast<int32_t*>(mono.data()), &used, 0);
+					case AjmSampleEncoding::S32: {
+						// AJM S32 PCM is the float output at full 32-bit scale.
+						auto* pcm = reinterpret_cast<float*>(mono.data());
+						result    = Atrac9DecodeF32(reference.get(), input.data(), pcm, &used, 0);
+						for (unsigned sample = 0; sample < 256; ++sample) {
+							const auto scaled = static_cast<int32_t>(std::clamp(
+							    std::round(static_cast<double>(pcm[sample]) * 32767.0 * 65536.0),
+							    -2147483648.0, 2147483647.0));
+							std::memcpy(mono.data() + sample * sizeof(int32_t), &scaled, sizeof(scaled));
+						}
 						break;
+					}
 					case AjmSampleEncoding::Float:
 						result = Atrac9DecodeF32(reference.get(), input.data(),
 						                         reinterpret_cast<float*>(mono.data()), &used, 0);
@@ -641,6 +684,47 @@ void TestAtrac9Discrete() {
 		          std::equal(expected.begin() + 17 * row_bytes,
 		                     expected.begin() + 717 * row_bytes, actual.begin() + 16),
 		      "ATRAC9 discrete gapless trim or superframe drain changed channel order");
+		if (encoding == AjmSampleEncoding::S16) {
+			const auto set_carry = [](const char* value) {
+#if defined(_WIN32)
+				_putenv_s("KYTY_ATRAC9_PARTIAL_INPUT", value);
+#else
+				value[0] != '\0' ? setenv("KYTY_ATRAC9_PARTIAL_INPUT", value, 1)
+				                 : unsetenv("KYTY_ATRAC9_PARTIAL_INPUT");
+#endif
+			};
+			set_carry("1");
+			AjmAt9Decoder carry(12, 48000, encoding, 0);
+			set_carry("");
+			Check(carry.Initialize(captured.data(), captured.size()).result == OK,
+			      "ATRAC9 partial-input option decoder initialization failed");
+			std::fill(actual.begin(), actual.end(), 0xa5);
+			const auto head = carry.Decode(encoded.data(), encoded.size() - 1, actual.data() + 16,
+			                               expected.size(), true, nullptr);
+			const auto last = carry.Decode(encoded.data() + encoded.size() - 1, 1, actual.data() + 16,
+			                               expected.size(), true, nullptr);
+			Check(head.result == AJM_RESULT_PARTIAL_INPUT && head.frames == 0 &&
+			          head.input_consumed == encoded.size() - 1 && head.output_written == 0 &&
+			          last.result == OK && last.frames == 4 && last.input_consumed == 1 &&
+			          last.output_written == expected.size() &&
+			          std::equal(expected.begin(), expected.end(), actual.begin() + 16),
+			      "ATRAC9 partial-input option did not carry the superframe across jobs");
+			(void)carry.Decode(encoded.data(), encoded.size() - 1, actual.data() + 16,
+			                   expected.size(), true, nullptr);
+			carry.Reset();
+			const auto after_reset = carry.Decode(encoded.data(), encoded.size(), actual.data() + 16,
+			                                      expected.size(), true, nullptr);
+			Check(after_reset.result == OK && after_reset.frames == 4 &&
+			          after_reset.input_consumed == encoded.size() &&
+			          std::equal(expected.begin(), expected.end(), actual.begin() + 16),
+			      "ATRAC9 partial-input option kept bytes across Reset");
+			AjmAt9Decoder plain(12, 48000, encoding, 0);
+			Check(plain.Initialize(captured.data(), captured.size()).result == OK &&
+			          plain.Decode(encoded.data(), encoded.size() - 1, actual.data() + 16,
+			                       expected.size(), true, nullptr)
+			                  .input_consumed == 0,
+			      "ATRAC9 decoder created after clearing the option still carries partial input");
+		}
 	}
 	for (auto invalid: {std::array<uint8_t, 4> {0x31, 0x72, 0xc0, 0xfe},
 	                   std::array<uint8_t, 4> {0x30, 0xf2, 0xc0, 0xfe},
@@ -2445,6 +2529,7 @@ int main() {
 	TestWaveformQueueCapacity();
 	TestWaveformRingReuse();
 	TestAtrac9Vibration();
+	TestAtrac9SampleEncodingsShareScale();
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
 	TestPatchToRackHandle();

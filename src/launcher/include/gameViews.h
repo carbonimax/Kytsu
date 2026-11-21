@@ -2,12 +2,14 @@
 #define GAME_VIEWS_H
 
 #include "gameContent.h"
+#include "gameGridView.h"
 
 #include <QGuiApplication>
 #include <QIcon>
 #include <QListView>
 #include <QPaintEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPalette>
 #include <QPixmap>
 #include <QResizeEvent>
@@ -91,64 +93,86 @@ inline void PaintProBadge(QPainter* painter, const QRect& cover, QFont font, con
 	painter->restore();
 }
 
-// A card on a translucent panel, so the text keeps its contrast over the game background.
+// The carousel tile: the cover, enlarged, outlined and named when it is the selected game.
 class GameGridDelegate: public QStyledItemDelegate {
 public:
 	using QStyledItemDelegate::QStyledItemDelegate;
 
-	QSize sizeHint(const QStyleOptionViewItem& option,
-	               const QModelIndex& /*index*/) const override {
-		return option.decorationSize +
-		       QSize(2 * CARD_PADDING, 3 * CARD_PADDING + 2 * option.fontMetrics.lineSpacing());
+	// PS5-style carousel: a single row of square tiles; only the selected one is enlarged and
+	// outlined. The slider value is the size of the selected tile.
+	// Cells are as wide as the largest tile, so they always cover the drawn (packed) tiles and
+	// Qt never culls a visible one.
+	QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override {
+		const int big = option.decorationSize.width() * 3 / 4;
+		return QSize(big + GameGridView::TileGap, big + 12);
 	}
 
 	void paint(QPainter* painter, const QStyleOptionViewItem& option,
 	           const QModelIndex& index) const override {
-		// The stylesheet made the view's own palette transparent, so take the panel from the app's.
-		auto panel      = QGuiApplication::palette().color(QPalette::Window);
-		auto text_color = option.palette.color(QPalette::Text);
-		panel.setAlpha(210);
+		const auto* view = dynamic_cast<const GameGridView*>(option.widget);
+		if (view == nullptr) {
+			return;
+		}
+		const bool  selected = view->TileScale(index.row()) > 0.5;
+		const QRect slot     = view->TileRect(index.row());
+		const qreal pop      = view->PopScale(index.row());
+		const QSize psize(qRound(slot.width() * qMax<qreal>(pop, 0.0)),
+		                  qRound(slot.height() * qMax<qreal>(pop, 0.0)));
+		QRect rect(QPoint(0, 0), psize);
+		rect.moveCenter(slot.center());
 		painter->save();
+		painter->setOpacity(qBound<qreal>(0.0, pop * 1.5, 1.0));
 		painter->setRenderHint(QPainter::Antialiasing);
-		painter->setPen(option.state.testFlag(QStyle::State_Selected) ? QPen(text_color)
-		                                                              : Qt::NoPen);
-		painter->setBrush(panel);
-		painter->drawRoundedRect(QRectF(option.rect).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+		painter->setRenderHint(QPainter::SmoothPixmapTransform);
 
-		const QRect cover(option.rect.topLeft() + QPoint(CARD_PADDING, CARD_PADDING),
-		                  option.decorationSize);
-		index.data(Qt::DecorationRole).value<QIcon>().paint(painter, cover);
+		QPainterPath clip;
+		clip.addRoundedRect(rect, 12, 12);
+		painter->setClipPath(clip);
+		painter->fillRect(rect, QColor(30, 34, 44));
+		const auto icon = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
+		if (!icon.isNull()) {
+			const auto pixmap = icon.pixmap(rect.size());
+			painter->drawPixmap(rect, pixmap.scaled(rect.size(), Qt::KeepAspectRatioByExpanding,
+			                                        Qt::SmoothTransformation));
+		}
+		painter->setClipping(false);
 		if (index.data(Qt::UserRole).toBool()) {
-			PaintProBadge(painter, cover, option.font, QStringLiteral("PS5 PRO"));
+			PaintProBadge(painter, rect, option.font, QStringLiteral("PS5 PRO"));
 		}
 
-		QRect line(cover.left(), cover.bottom() + 1 + CARD_PADDING, cover.width(),
-		           option.fontMetrics.lineSpacing());
-		auto  title_font = option.font;
-		title_font.setBold(true);
-		painter->setFont(title_font);
-		painter->setPen(text_color);
-		painter->drawText(line, Qt::AlignLeft | Qt::AlignVCenter,
-		                  painter->fontMetrics().elidedText(index.data().toString(), Qt::ElideRight,
-		                                                    line.width()));
+		if (selected) {
+			const QRectF outline = QRectF(rect).adjusted(-2, -2, 2, 2);
+			painter->setBrush(Qt::NoBrush);
+			painter->setPen(QPen(QColor(255, 255, 255, 110), 3));
+			painter->drawRoundedRect(outline, 14, 14);
 
-		line.translate(0, line.height());
-		const auto size    = index.siblingAtColumn(GAME_SIZE_COLUMN).data().toString();
-		const auto details = QStringLiteral("%1  %2").arg(
-		    index.siblingAtColumn(GAME_SERIAL_COLUMN).data().toString(),
-		    index.siblingAtColumn(GAME_VERSION_COLUMN).data().toString());
-		text_color.setAlpha(200);
-		painter->setFont(option.font);
-		painter->setPen(text_color);
-		painter->drawText(line, Qt::AlignRight | Qt::AlignVCenter, size);
-		line.setRight(line.right() - option.fontMetrics.horizontalAdvance(size) - CARD_PADDING);
-		painter->drawText(line, Qt::AlignLeft | Qt::AlignVCenter,
-		                  option.fontMetrics.elidedText(details, Qt::ElideRight, line.width()));
+			// A bright comet circling the outline, with a soft halo.
+			QConicalGradient glow(outline.center(), view->GlowAngle());
+			glow.setColorAt(0.0, QColor(255, 255, 255, 255));
+			glow.setColorAt(0.22, QColor(120, 190, 255, 160));
+			glow.setColorAt(0.45, QColor(120, 190, 255, 0));
+			glow.setColorAt(1.0, QColor(255, 255, 255, 0));
+			painter->setPen(QPen(QBrush(glow), 9));
+			painter->setOpacity(painter->opacity() * 0.35);
+			painter->drawRoundedRect(outline, 14, 14);
+			painter->setOpacity(painter->opacity() / 0.35);
+			painter->setPen(QPen(QBrush(glow), 3.5));
+			painter->drawRoundedRect(outline, 14, 14);
+
+			const auto name = index.data(Qt::DisplayRole).toString();
+			if (!name.isEmpty()) {
+				auto label_font = option.font;
+				label_font.setPointSizeF(option.font.pointSizeF() * 1.1);
+				label_font.setWeight(QFont::DemiBold);
+				painter->setFont(label_font);
+				painter->setPen(Qt::white);
+				const QRect label(rect.center().x() - 180, rect.bottom() + 8, 360, 24);
+				painter->drawText(label, Qt::AlignHCenter | Qt::AlignTop,
+				                  QFontMetrics(label_font).elidedText(name, Qt::ElideRight, label.width()));
+			}
+		}
 		painter->restore();
 	}
-
-private:
-	static constexpr int CARD_PADDING = 8;
 };
 
 // The list's name cell, with the PS5 Pro badge over its icon.
@@ -172,20 +196,5 @@ public:
 		PaintProBadge(painter, icon, font, QStringLiteral("PRO"));
 	}
 };
-
-// Shows the list's games as cards in the grid: both views share the items and the current game.
-inline void SetupGameGrid(QTreeWidget* list, QListView* grid) {
-	grid->setModel(list->model());
-	grid->setSelectionModel(list->selectionModel());
-	grid->setViewMode(QListView::IconMode);
-	grid->setMovement(QListView::Static);
-	grid->setResizeMode(QListView::Adjust);
-	grid->setSpacing(8);
-	grid->setUniformItemSizes(true);
-	grid->setItemDelegate(new GameGridDelegate(grid));
-	// A card also shows other columns (the size arrives late), which the grid does not repaint on.
-	QObject::connect(list->model(), &QAbstractItemModel::dataChanged, grid->viewport(),
-	                 qOverload<>(&QWidget::update));
-}
 
 #endif // GAME_VIEWS_H
