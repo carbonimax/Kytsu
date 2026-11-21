@@ -16,7 +16,7 @@ static auto FindLabel(std::string_view label) {
 }
 
 void AddContentLoad(const std::filesystem::path& dir, const std::vector<AddContentEntry>& user,
-                    const std::string& title_id) {
+                    const std::string& title_id, const std::vector<AddContentEntry>& local) {
 	g_add_content = Common::FindAddContent(dir, title_id);
 	for (const auto& entry: user) {
 		const auto it = FindLabel(entry.entitlement_label);
@@ -24,6 +24,11 @@ void AddContentLoad(const std::filesystem::path& dir, const std::vector<AddConte
 			g_add_content.push_back(entry);
 		} else {
 			*it = entry;
+		}
+	}
+	for (const auto& entry: local) {
+		if (FindLabel(entry.entitlement_label) == g_add_content.end()) {
+			g_add_content.push_back(entry);
 		}
 	}
 	for (const auto& entry: g_add_content) {

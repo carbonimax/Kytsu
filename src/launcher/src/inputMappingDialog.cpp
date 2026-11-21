@@ -7,10 +7,12 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QFile>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHash>
+#include <QIcon>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
@@ -127,6 +129,88 @@ QString PadSourceLabel(const QString& id) {
 		}
 	}
 	return id;
+}
+
+// Icons come from :/input/<alias>.png. No such resource is bundled yet (asset licence to
+// confirm), so every lookup returns a null icon and the dialog stays text-only.
+QIcon InputIcon(const QString& alias) {
+	const auto path = QStringLiteral(":/input/%1.png").arg(alias);
+	return alias.isEmpty() || !QFile::exists(path) ? QIcon() : QIcon(path);
+}
+
+QString PadControlIconAlias(const QString& id) {
+	static const QHash<QString, QString> icons = {
+	    {QStringLiteral("Cross"), QStringLiteral("pad/cross")},
+	    {QStringLiteral("Circle"), QStringLiteral("pad/circle")},
+	    {QStringLiteral("Square"), QStringLiteral("pad/square")},
+	    {QStringLiteral("Triangle"), QStringLiteral("pad/triangle")},
+	    {QStringLiteral("Up"), QStringLiteral("pad/dpad_up")},
+	    {QStringLiteral("Down"), QStringLiteral("pad/dpad_down")},
+	    {QStringLiteral("Left"), QStringLiteral("pad/dpad_left")},
+	    {QStringLiteral("Right"), QStringLiteral("pad/dpad_right")},
+	    {QStringLiteral("L1"), QStringLiteral("pad/l1")},
+	    {QStringLiteral("R1"), QStringLiteral("pad/r1")},
+	    {QStringLiteral("L2"), QStringLiteral("pad/l2")},
+	    {QStringLiteral("R2"), QStringLiteral("pad/r2")},
+	    {QStringLiteral("L3"), QStringLiteral("pad/l3")},
+	    {QStringLiteral("R3"), QStringLiteral("pad/r3")},
+	    {QStringLiteral("Options"), QStringLiteral("pad/options")},
+	    {QStringLiteral("TouchPad"), QStringLiteral("pad/touchpad")},
+	    {QStringLiteral("TouchPadRight"), QStringLiteral("pad/touchpad")},
+	    {QStringLiteral("LeftStickUp"), QStringLiteral("pad/lstick_up")},
+	    {QStringLiteral("LeftStickDown"), QStringLiteral("pad/lstick_down")},
+	    {QStringLiteral("LeftStickLeft"), QStringLiteral("pad/lstick_left")},
+	    {QStringLiteral("LeftStickRight"), QStringLiteral("pad/lstick_right")},
+	    {QStringLiteral("RightStickUp"), QStringLiteral("pad/rstick_up")},
+	    {QStringLiteral("RightStickDown"), QStringLiteral("pad/rstick_down")},
+	    {QStringLiteral("RightStickLeft"), QStringLiteral("pad/rstick_left")},
+	    {QStringLiteral("RightStickRight"), QStringLiteral("pad/rstick_right")},
+	};
+	return icons.value(id);
+}
+
+// Maps a captured keyboard/mouse binding name (KeyName, mousePressEvent) to its key prompt icon.
+QIcon HostInputIcon(const QString& binding) {
+	static const QHash<QString, QString> named = {
+	    {QStringLiteral("Return"), QStringLiteral("key/return")},
+	    {QStringLiteral("Backspace"), QStringLiteral("key/backspace")},
+	    {QStringLiteral("Tab"), QStringLiteral("key/tab")},
+	    {QStringLiteral("Space"), QStringLiteral("key/space")},
+	    {QStringLiteral("Left Shift"), QStringLiteral("key/shift")},
+	    {QStringLiteral("Left Ctrl"), QStringLiteral("key/ctrl")},
+	    {QStringLiteral("Left Alt"), QStringLiteral("key/alt")},
+	    {QStringLiteral("Insert"), QStringLiteral("key/insert")},
+	    {QStringLiteral("Delete"), QStringLiteral("key/delete")},
+	    {QStringLiteral("Home"), QStringLiteral("key/home")},
+	    {QStringLiteral("End"), QStringLiteral("key/end")},
+	    {QStringLiteral("PageUp"), QStringLiteral("key/pageup")},
+	    {QStringLiteral("PageDown"), QStringLiteral("key/pagedown")},
+	    {QStringLiteral("CapsLock"), QStringLiteral("key/capslock")},
+	    {QStringLiteral("Numlock"), QStringLiteral("key/numlock")},
+	    {QStringLiteral("PrintScreen"), QStringLiteral("key/printscreen")},
+	    {QStringLiteral("Left"), QStringLiteral("key/arrow_left")},
+	    {QStringLiteral("Right"), QStringLiteral("key/arrow_right")},
+	    {QStringLiteral("Up"), QStringLiteral("key/arrow_up")},
+	    {QStringLiteral("Down"), QStringLiteral("key/arrow_down")},
+	    {QStringLiteral("Mouse:Left"), QStringLiteral("mouse/left")},
+	    {QStringLiteral("Mouse:Right"), QStringLiteral("mouse/right")},
+	    {QStringLiteral("Mouse:Middle"), QStringLiteral("mouse/middle")},
+	    {QStringLiteral("Mouse:X1"), QStringLiteral("mouse/x1")},
+	    {QStringLiteral("Mouse:X2"), QStringLiteral("mouse/x2")},
+	};
+	auto alias = named.value(binding);
+	if (alias.isEmpty() && binding.size() == 1 && binding.at(0).isLetterOrNumber()) {
+		alias = QStringLiteral("key/") + binding.at(0).toLower();
+	}
+	if (alias.isEmpty() && binding.size() >= 2 && binding.size() <= 3 &&
+	    binding.at(0).toUpper() == QLatin1Char('F')) {
+		bool      ok = false;
+		const int n  = binding.mid(1).toInt(&ok);
+		if (ok && n >= 1 && n <= 12) {
+			alias = QStringLiteral("key/f%1").arg(n);
+		}
+	}
+	return InputIcon(alias);
 }
 
 QString KeypadName(int key) {
@@ -508,6 +592,10 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 			const auto label = !pad && id == QLatin1String("TouchPad") ? tr("Touch pad left")
 			                                                           : tr(control.label);
 			auto* name = new QLabel(label, group);
+			if (const auto alias = PadControlIconAlias(id); !InputIcon(alias).isNull()) {
+				name->setText(QStringLiteral("<img src=\":/input/%1.png\" width=24 height=24> %2")
+				                  .arg(alias, label.toHtmlEscaped()));
+			}
 			auto* button = new QPushButton(group);
 			button->setObjectName((pad ? QStringLiteral("padBinding_") : QStringLiteral("binding_")) +
 			                      id);
@@ -687,6 +775,7 @@ void InputMappingDialog::UpdateButtons() {
 		const auto binding = m_bindings.value(item.key());
 		const auto label   = binding.isEmpty() ? tr("None") : binding;
 		button->setText(QString(label).replace(QLatin1Char('&'), QLatin1String("&&")));
+		button->setIcon(HostInputIcon(binding));
 		button->setToolTip(
 		    tr("%1: %2. Click to change, right-click to clear.").arg(button->accessibleName(), label));
 	}
