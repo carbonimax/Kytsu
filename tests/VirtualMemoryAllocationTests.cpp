@@ -855,7 +855,7 @@ void TestDriverMemoryStartup() {
 		return size;
 	};
 	const auto before = available();
-	CheckOk(test, Libs::Graphics::Gen5Driver::Initialize(), "Gen5Driver::Initialize");
+	CheckOk(test, Libs::Graphics::AgcDriver::Initialize(), "AgcDriver::Initialize");
 	Libs::LibKernel::Memory::VirtualQueryInfo info {};
 	const bool mapped = Libs::LibKernel::Memory::KernelVirtualQuery(
 	                        reinterpret_cast<void*>(driver_base), 0, &info, sizeof(info)) == OK;
@@ -877,7 +877,7 @@ void TestDriverMemoryStartup() {
 	(void)before;
 #endif
 	const auto after_first = available();
-	CheckOk(test, Libs::Graphics::Gen5Driver::Initialize(), "Gen5Driver::Initialize(repeat)");
+	CheckOk(test, Libs::Graphics::AgcDriver::Initialize(), "AgcDriver::Initialize(repeat)");
 	Check(test, available() == after_first, "repeated startup allocated direct memory again");
 	std::printf("[host]    %-48s ok\n", test);
 }

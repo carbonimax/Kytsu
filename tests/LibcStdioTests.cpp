@@ -76,13 +76,10 @@ KYTY_SYSV_ABI int FakeGuestFflush(FILE* stream) {
 /// Adds one export to a fake libc.prx export table.
 void AddExport(SymbolDatabase& exports, const char* nid, SymbolType type, uint64_t vaddr) {
 	SymbolResolve sr {};
-	sr.name                 = nid;
-	sr.library              = "libc";
-	sr.library_version      = 1;
-	sr.module               = "libc";
-	sr.module_version_major = 1;
-	sr.module_version_minor = 1;
-	sr.type                 = type;
+	sr.name    = nid;
+	sr.library = "libc";
+	sr.module  = "libc";
+	sr.type    = type;
 	exports.Add(sr, vaddr);
 }
 

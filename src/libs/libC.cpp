@@ -41,7 +41,7 @@ void KernelDispatchPendingSignalForCurrentThread();
 
 namespace LibC {
 
-LIB_VERSION("libc", 1, "libc", 1, 1);
+LIB_NAME("libc", "libc");
 
 static uint32_t g_need_flag = 1;
 
@@ -313,12 +313,6 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 
 	EXIT("Guest abort()\n");
 	std::abort();
-}
-
-static KYTY_SYSV_ABI int* libc_error() {
-	PRINT_NAME();
-
-	return Posix::GetErrorAddr();
 }
 
 static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
@@ -619,7 +613,7 @@ void KYTY_SYSV_ABI cxa_finalize(void* d) {
 
 namespace LibcInternalExt {
 
-LIB_VERSION("LibcInternalExt", 1, "LibcInternal", 1, 1);
+LIB_NAME("LibcInternalExt", "LibcInternal");
 
 static uint64_t g_mspace_atomic_id_mask = 0;
 static uint64_t g_mstate_table[64]      = {0};
@@ -679,7 +673,7 @@ LIB_DEFINE(InitLibcInternalExt_1) {
 
 namespace LibcInternal {
 
-LIB_VERSION("LibcInternal", 1, "LibcInternal", 1, 1);
+LIB_NAME("LibcInternal", "LibcInternal");
 
 static uint32_t g_need_flag = 1;
 
@@ -865,12 +859,7 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("jMB7EFyu30Y", LibcInternal::sincos);
 	LIB_FUNC("eLdDw6l0-bU", LibcInternal::snprintf);
 
-	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);
-	LIB_FUNC("tsvEmnenz48", LibC::cxa_atexit);
-	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
-	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
-
-	LIB_FUNC("al3JzFI9MQ0", LibcInternal::LibcHeapErrorReportForGame);
+	LIB_FUNC_IN("LibcInternalExt", "al3JzFI9MQ0", LibcInternal::LibcHeapErrorReportForGame);
 }
 
 } // namespace LibcInternal
@@ -889,7 +878,6 @@ LIB_DEFINE(InitLibC_1) {
 
 	LIB_FUNC("uMei1W9uyNo", LibC::exit);
 	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);
-	LIB_FUNC("9BcDykPmo1I", LibC::libc_error);
 	LIB_FUNC("bzQExy189ZI", LibC::init_env);
 	LIB_FUNC("8G2LB+A3rzg", LibC::atexit);
 	LIB_FUNC("hcuQgD53UxM", LibC::libc_printf);

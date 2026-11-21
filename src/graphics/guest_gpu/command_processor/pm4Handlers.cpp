@@ -1390,7 +1390,7 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 			cp.ResetQueue(buffer[1]);
 			return KYTY_PM4_LEN(cmd_id) - 1u;
 		}
-		if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+		if (Agc::AgcIsInternalDataPacket(cmd_id, buffer)) {
 			return KYTY_PM4_LEN(cmd_id) - 1u;
 		}
 	}
