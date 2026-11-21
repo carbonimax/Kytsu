@@ -191,6 +191,8 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 // blocking on those is allowed (Windows vectored handler, or a signal handler that defers to such).
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t guest_vaddr,
                                   uint64_t guest_pc = 0) noexcept;
+[[nodiscard]] bool DescribeNearestGpuMapping(uint64_t fault_vaddr, uint64_t* begin,
+                                              uint64_t* end) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

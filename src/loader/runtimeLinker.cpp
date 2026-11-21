@@ -455,6 +455,34 @@ bool TestMainEntryUsesGuestStack() {
 	return state.called && rsp_ok && root_ok && teb_ok && freed;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static KYTY_SYSV_ABI void TestDebugPrintCallback(EntryParams* params,
+                                                 atexit_func_t /*atexit_func*/) {
+	auto* returned = reinterpret_cast<bool*>(const_cast<char*>(params->argv[0]));
+	// Host libraries (SDL, loaders, drivers) call these from HLE code that runs on
+	// guest stacks; both raise informational exceptions internally.
+	OutputDebugStringW(L"kyty guest-stack debug print (wide)\n");
+	OutputDebugStringA("kyty guest-stack debug print (ansi)\n");
+	*returned = true;
+}
+
+bool TestDebugPrintOnGuestStack() {
+	constexpr uint64_t stack_size = 0x10000;
+	const auto         stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "debug_print_stack_test");
+	if (stack_base == 0) {
+		return false;
+	}
+	bool        returned = false;
+	EntryParams params {};
+	params.argv[0] = reinterpret_cast<const char*>(&returned);
+	RunEntry(reinterpret_cast<uint64_t>(TestDebugPrintCallback), &params, nullptr,
+	         reinterpret_cast<void*>(stack_base + stack_size));
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size);
+	return returned && freed;
+}
+#endif
+
 bool TestModuleRelocationUsesWritableHostMapping() {
 	constexpr uint64_t page_size = 0x4000;
 	constexpr uint64_t value     = 0x4b59545950415443;
@@ -829,6 +857,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			                           info->r11, info->r12, info->r13, info->r14, info->r15};
 			Libs::Graphics::DescribeImportFault(values, sizeof(values) / sizeof(values[0]));
 		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			uint64_t nearest_begin = 0;
+			uint64_t nearest_end   = 0;
+			if (Libs::LibKernel::Memory::DescribeNearestGpuMapping(info->access_violation_vaddr,
+			                                                     &nearest_begin, &nearest_end)) {
+				std::printf("nearest guest mapping: [0x%016" PRIx64 " .. 0x%016" PRIx64 ")\n",
+				            nearest_begin, nearest_end);
+			} else {
+				std::printf("nearest guest mapping: (none known)\n");
+			}
+		}
 		std::fflush(stdout);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Host call stack from the faulting context (unwind data only, no symbols): identifies
@@ -1029,6 +1068,11 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool jmprela_table) {
 	KYTY_PROFILER_FUNCTION();
 
+	// A no-op; report it as done so it is not stubbed and patched at base_vaddr + r_offset.
+	if (r->GetType() == R_X86_64_NONE) {
+		return true;
+	}
+
 	const auto ri      = GetRelocationInfo(r, program);
 	auto       value   = ri.value;
 	bool       stubbed = false;
@@ -1069,6 +1113,24 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	}
 	return ri.resolved;
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestRelocationSkipsNoneEntries() {
+	constexpr uint64_t sentinel = 0x4b59545950415443;
+	uint64_t           words[2] = {sentinel, sentinel};
+
+	Program program;
+	program.base_vaddr   = reinterpret_cast<uint64_t>(words);
+	program.dynamic_info = std::make_unique<DynamicInfo>();
+	Elf64_Rela none {};
+	Elf64_Rela relative {.r_offset = 8, .r_info = R_X86_64_RELATIVE, .r_addend = 0x40};
+
+	const bool none_done     = RelocateRecord(0, &none, &program, false);
+	const bool relative_done = RelocateRecord(1, &relative, &program, false);
+	return none_done && relative_done && words[0] == sentinel &&
+	       words[1] == program.base_vaddr + 0x40;
+}
+#endif
 
 static void ForEachRelocation(Program* program, auto&& func) {
 	const auto& info = *program->dynamic_info;

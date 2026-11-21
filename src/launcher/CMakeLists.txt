@@ -95,6 +95,14 @@ add_custom_command(TARGET launcher POST_BUILD
 	VERBATIM)
 install(FILES presets.json DESTINATION "${launcher_presets_install}")
 
+if(WIN32)
+	add_executable(launcher_cmd_command_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/LauncherCmdCommandTests.cpp"
+	)
+	target_link_libraries(launcher_cmd_command_tests Qt6::Core)
+	target_include_directories(launcher_cmd_command_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+endif()
+
 # Registered in the root CMakeLists.txt (launcher_settings).
 add_executable(launcher_settings_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LauncherSettingsTests.cpp"

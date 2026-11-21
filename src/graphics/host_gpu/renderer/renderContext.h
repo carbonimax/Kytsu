@@ -73,6 +73,8 @@ public:
 	void RestorePageProtection(uint64_t vaddr, uint64_t size) noexcept {
 		m_page_manager.RestoreProtection(vaddr, size);
 	}
+	[[nodiscard]] bool DescribeNearestMapping(uint64_t vaddr, uint64_t* begin,
+	                                           uint64_t* end) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
