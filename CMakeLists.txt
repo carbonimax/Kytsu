@@ -902,6 +902,9 @@ target_link_libraries(net_resolver_tests kyty_test_gtest)
 add_kyty_full_emulator_test(agc_tests "${KYTY_TESTS_DIR}/AgcTests.cpp")
 target_link_libraries(agc_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(kernel_event_flag_tests "${KYTY_TESTS_DIR}/KernelEventFlagTests.cpp")
+target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests shader_optimization_tests
