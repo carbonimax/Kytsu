@@ -12770,6 +12770,78 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // KYTY_RESOLVE_INPLACE knows a program texture by its address. One program, at one address, binds
+  // the same T# in two render contexts in a row, its resource changed in between: r128 takes the
+  // view's last level as max mip (1 level) instead of the T# max mip (2 levels). The second context
+  // must not bind the description the first one kept for that address.
+  void CheckResolveInplaceNewContext() {
+    constexpr const char *name = "ResolveInplaceNewContext";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "texture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "texture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+        (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) | (1u << 30u), 1u << 14u,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+            (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+        0, 0x00700000u | (1u << 4u), 0, 0}}; // Last level 0, max mip 1.
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.stage = ShaderType::Pixel;
+    program.info.images.resize(1);
+    auto &resource = program.info.images[0];
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.read = true;
+    ShaderRecompiler::IR::ResourceSnapshot snapshot;
+    snapshot.images.resize(1);
+    snapshot.images[0].dword_count = 8;
+    std::copy_n(descriptor.fields, 8, snapshot.images[0].dwords.begin());
+    const ShaderStageRuntime runtime{&program, &snapshot};
+    for (const bool r128 : {false, true}) {
+      resource.r128 = r128;
+      const uint32_t expected_levels = r128 ? 1u : 2u;
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &executor = context.GetRenderExecutor();
+      // The first bind keeps the description, the second binds it in place.
+      for (int bind = 0; bind < 2; bind++) {
+        PreparedBindings prepared;
+        executor.PrepareBindings(runtime, prepared);
+        Require(name, "mip levels",
+                prepared.images.size() == 1 && prepared.images[0].image_id &&
+                    prepared.images[0].desc.info.resources.levels == expected_levels,
+                "a texture kept by an earlier render context was bound in a new one");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "texture mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "texture allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorDiscovery() {
     constexpr const char *name = "RenderExecutorColorDiscovery";
     constexpr uintptr_t base = 0x0000000203c00000ull;
@@ -62722,6 +62794,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageSampleSrgb8_8<1>());
     RunCase(&vulkan, ImageSampleSrgb8_8<2>());
     vulkan.CheckSampledSrgbViews();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--resolve-inplace-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResolveInplaceNewContext();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-capture-replay-only") == 0) {

@@ -599,6 +599,9 @@ struct TextureDescMemoEntry {
 	ResolvedTextureDesc                 resolved;
 	// The image FindImage gave for resolved.desc (KYTY_FIND_IMAGE_MEMO); reset with the entry.
 	TextureCache::FindImageMemo find;
+	// KYTY_RESOLVE_INPLACE: the program-owned resource equal to `resource` (PrepareBindings only); a
+	// published program's info never changes or moves, so its address stands for its content.
+	const ShaderRecompiler::IR::ImageResource* stable = nullptr;
 };
 
 // Direct-mapped, one per host thread that resolves textures (the GPU thread, and the
@@ -606,6 +609,23 @@ struct TextureDescMemoEntry {
 constexpr size_t TextureDescMemoSlots = 4096;
 thread_local std::unique_ptr<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>
     t_texture_desc_memo;
+// Bumped when a RenderExecutor (so a render context) is created or destroyed: the programs and images
+// an entry names may be gone, and the next context may reuse their addresses and image ids.
+std::atomic<uint64_t> g_texture_desc_memo_generation {0};
+thread_local uint64_t t_texture_desc_memo_generation = 0;
+
+// The calling thread's memo (null when it has none and !create), emptied if a context came or went.
+std::array<TextureDescMemoEntry, TextureDescMemoSlots>* TextureDescMemo(bool create) {
+	const auto generation = g_texture_desc_memo_generation.load(std::memory_order_relaxed);
+	if (t_texture_desc_memo_generation != generation) {
+		t_texture_desc_memo.reset();
+		t_texture_desc_memo_generation = generation;
+	}
+	if (create && !t_texture_desc_memo) {
+		t_texture_desc_memo = std::make_unique<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>();
+	}
+	return t_texture_desc_memo.get();
+}
 
 size_t TextureDescMemoSlot(const ShaderRecompiler::IR::ImageResource& resource,
                            const ShaderRecompiler::IR::DescriptorValue& value) noexcept {
@@ -677,11 +697,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto          memo_mode = resource.heap ? 0u : TextureDescMemoMode();
 	TextureDescMemoEntry* memo     = nullptr;
 	if (memo_mode != 0) {
-		if (!t_texture_desc_memo) {
-			t_texture_desc_memo =
-			    std::make_unique<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>();
-		}
-		memo = &(*t_texture_desc_memo)[TextureDescMemoSlot(resource, value)];
+		memo = &(*TextureDescMemo(true))[TextureDescMemoSlot(resource, value)];
 		if (!(memo->valid && memo->value == value && memo->resource == resource)) {
 			memo = nullptr;
 		} else if (memo_mode == 2) {
@@ -713,6 +729,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			entry.resource = resource;
 			entry.resolved = resolved_storage;
 			entry.find     = {};
+			entry.stable   = nullptr;
 			find_memo      = &entry.find;
 		}
 	}
@@ -754,6 +771,138 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	TextureBinding binding {id, nullptr, std::move(desc)};
 	return binding;
+}
+
+namespace {
+
+// KYTY_RESOLVE_INPLACE (default 1 = on; 0 = off, every bind through ResolveTexture as before; 2 =
+// verify), with KYTY_TEXTURE_DESC_MEMO=1 only: when PrepareBindings binds a program texture whose kept
+// description is in the memo, it writes the binding straight into its slot (one copy of the
+// description instead of three, no scratch description) and knows the resource by its address
+// instead of comparing it field by field. An address holds for one render context: the memos are
+// dropped when a RenderExecutor is created or destroyed. Any other case runs ResolveTexture. 2 = also
+// resolve each such binding through ResolveTexture and compare ("PERF resolveinplace"). Switchable
+// between frames: KYTY_AB_FLAG=resolve_inplace.
+uint32_t ResolveInplaceMode() noexcept {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_RESOLVE_INPLACE");
+		const auto  m     = value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		if (value != nullptr) {
+			std::printf("KYTY_RESOLVE_INPLACE=%u\n", m);
+		}
+		return m;
+	}();
+	return mode;
+}
+
+// After ResolveTexture: marks the memo entry it kept or stored for `resource` (owned by a program).
+void MarkStableTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                       const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto* const table = TextureDescMemo(false);
+	if (table == nullptr) {
+		return;
+	}
+	auto& entry = (*table)[TextureDescMemoSlot(resource, value)];
+	if (entry.valid && entry.value == value && entry.resource == resource) {
+		entry.stable = &resource;
+	}
+}
+
+// KYTY_RESOLVE_INPLACE=2: every field (ImageInfo has no operator==).
+bool SameImageDescExact(const TextureCache::ImageDesc& a, const TextureCache::ImageDesc& b) {
+	const auto& x = a.info;
+	const auto& y = b.info;
+	const auto& m = x.metadata;
+	const auto& n = y.metadata;
+	return a.type == b.type && a.heap == b.heap && a.view_info == b.view_info && x.data == y.data &&
+	       x.stencil == y.stencil && m.range == n.range && m.kind == n.kind && m.clear_word == n.clear_word &&
+	       m.compression == n.compression && m.stencil_compressed == n.stencil_compressed &&
+	       m.clear_register_valid == n.clear_register_valid && m.dcc_alpha_msb == n.dcc_alpha_msb &&
+	       x.htile_initial_clear == y.htile_initial_clear && x.pixel_format == y.pixel_format &&
+	       x.guest_format == y.guest_format && x.type == y.type && x.extent == y.extent &&
+	       x.resources == y.resources && x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
+	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.bgra16 == y.bgra16 &&
+	       x.mip_layout == y.mip_layout && std::memcmp(&x.tiling, &y.tiling, sizeof(x.tiling)) == 0 &&
+	       x.tiled_slice_stride == y.tiled_slice_stride && x.first_tail_level == y.first_tail_level;
+}
+
+} // namespace
+
+void RenderExecutor::DropTextureDescMemos() noexcept {
+	g_texture_desc_memo_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ResolveTexture's path for a description kept in the memo, written into `out`; false, with nothing
+// done, when the memo does not hold this program resource and T#.
+bool RenderExecutor::ResolveKeptTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                        const ShaderRecompiler::IR::DescriptorValue& value,
+                                        TextureBinding& out, bool verify) {
+	auto* const table = resource.heap ? nullptr : TextureDescMemo(false);
+	if (table == nullptr) {
+		return false;
+	}
+	auto& memo = (*table)[TextureDescMemoSlot(resource, value)];
+	if (memo.stable != &resource || !memo.valid || !(memo.value == value)) {
+		return false;
+	}
+	if (verify && !(memo.resource == resource)) {
+		PerfStats::Add(PerfStats::Counter::RiResourceDiffs, 1);
+	}
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	// Not null: the memo keeps no null T#.
+	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage    = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+	if (m_lod_stats && descriptor.MipStatsCntEn() && !storage) {
+		auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
+		const uint8_t base    = descriptor.BaseLevel();
+		counter.finest_level  = std::min(counter.finest_level, base);
+		if (descriptor.MinLod() > base << 8u) {
+			counter.clamped = true;
+		} else {
+			counter.unclamped = true;
+		}
+	}
+	auto&      texture_cache     = m_context.GetTextureCache();
+	const auto pixel_format      = memo.resolved.pixel_format;
+	const auto view_format       = memo.resolved.view_format;
+	const bool shader_conversion = memo.resolved.shader_conversion;
+	out.desc       = memo.resolved.desc;
+	out.image_view = nullptr;
+	out.layout     = vk::ImageLayout::eUndefined;
+	out.mip_views.clear();
+	auto id = [&] {
+		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
+		return texture_cache.FindImage(out.desc, shader_conversion, &memo.find);
+	}();
+	out.image_id = id;
+	if (!id) {
+		out.layout = vk::ImageLayout::eGeneral;
+		return true;
+	}
+	auto* image = &texture_cache.GetImage(id);
+	if (image->depth_id) {
+		id    = image->depth_id;
+		image = &texture_cache.GetImage(id);
+	} else if (image->info.IsDepth()) {
+		if (storage) {
+			EXIT("depth target cannot be bound as a storage image\n");
+		}
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, out.desc.info.data.size);
+	} else if (storage) {
+		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else {
+		out.desc.view_info.format = SampledViewFormat(m_context.GetGraphics(), out.desc.info.guest_format,
+		                                              pixel_format, resource.skip_degamma);
+		(void)SelectSampledColorView(image->info.pixel_format, out.desc.view_info.format,
+		                             descriptor.DstSelXYZW());
+	}
+	out.image_id = id;
+	return true;
 }
 
 static bool ResolveTextureDesc(const RenderContext& context,
@@ -973,6 +1122,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	const uint32_t inplace = ResolveInplaceMode() == 0 || TextureDescMemoMode() != 1 ||
+	                                 (ResolveInplaceMode() == 1 && PerfStats::AbOff("resolve_inplace"))
+	                             ? 0u
+	                             : ResolveInplaceMode();
+	uint32_t kept = 0;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (program.info.images[i].heap) {
 			prepared.images[i] = {};
@@ -987,6 +1141,32 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				MipStats::Mark(descriptor.MipStatsCntId());
 			}
 		}
+		if (inplace != 0) {
+			auto&          out   = prepared.images[i];
+			const uint64_t epoch = inplace == 2 ? m_context.GetTextureCache().ImageIndexEpoch() : 0;
+			if (ResolveKeptTexture(program.info.images[i], snapshot.images[i], out, inplace == 2)) {
+				kept++;
+				if (inplace == 2) {
+					const auto check = ResolveTexture(program.info.images[i], snapshot.images[i]);
+					const bool same_rest = check.image_view == out.image_view && check.layout == out.layout &&
+					                       check.mip_views.empty() && SameImageDescExact(check.desc, out.desc);
+					PerfStats::Add(PerfStats::Counter::RiChecked, 1);
+					if (!same_rest || check.image_id != out.image_id) {
+						const bool raced = same_rest &&
+						                   m_context.GetTextureCache().ImageIndexEpoch() != epoch;
+						PerfStats::Add(raced ? PerfStats::Counter::RiRaced : PerfStats::Counter::RiDiffs, 1);
+						static std::atomic<uint32_t> logged {0};
+						if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+							std::printf("KYTY_RESOLVE_INPLACE=2: %s addr=0x%016" PRIx64 " image %u/%u desc %s\n",
+							            raced ? "raced" : "diff", out.desc.info.data.address,
+							            out.image_id.index, check.image_id.index, same_rest ? "same" : "differs");
+						}
+					}
+				}
+				BindImage(out.image_id, out.desc.type == TextureCache::BindingType::Storage);
+				continue;
+			}
+		}
 		t_binding_shader_hash = program.shader_hash;
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		t_binding_shader_hash = 0;
@@ -994,6 +1174,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
+		if (inplace != 0) {
+			MarkStableTexture(program.info.images[i], snapshot.images[i]);
+		}
+	}
+	if (kept != 0) {
+		// Batched: no atomic per binding in the arm being timed.
+		thread_local uint64_t pending = 0;
+		if ((pending += kept) >= 4096) {
+			PerfStats::Add(PerfStats::Counter::RiKept, pending);
+			pending = 0;
+		}
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	PerfStats::ScopedTimer sampler_timer(PerfStats::Counter::BindSamplerNs,

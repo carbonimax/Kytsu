@@ -344,6 +344,12 @@ void MaybeReport() noexcept {
 	std::printf("PERF frames %.1fs: f33=%" PRIu64 " f50=%" PRIu64 " f67=%" PRIu64 " flong=%" PRIu64 "\n",
 	            seconds, n(Counter::Frames33), n(Counter::Frames50), n(Counter::Frames67),
 	            n(Counter::FramesLong));
+	if (n(Counter::RiKept) + n(Counter::RiChecked) != 0) {
+		std::printf("PERF resolveinplace %.1fs: frames=%" PRIu64 " kept=%" PRIu64 " checked=%" PRIu64 " diffs=%" PRIu64
+		            " resource_diffs=%" PRIu64 " raced=%" PRIu64 "\n",
+		            seconds, n(Counter::Frames), n(Counter::RiKept), n(Counter::RiChecked), n(Counter::RiDiffs),
+		            n(Counter::RiResourceDiffs), n(Counter::RiRaced));
+	}
 	if (n(Counter::TessMissLs) + n(Counter::TessMissHs) + n(Counter::TessMissDs) +
 	        n(Counter::TessDeferredDraws) !=
 	    0) {
