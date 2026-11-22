@@ -850,6 +850,10 @@ void BufferCache::EagerNoteWrite(uint64_t vaddr, uint64_t size) {
 // after it (PerfStats::NoteWork): a submission while a draw is prepared (a stream-buffer wrap, a
 // synchronous readback) comes before that draw's writes are recorded.
 void BufferCache::EagerRecord() {
+	if (m_sync_download != 0) {
+		// A synchronous download is submitting: its bytes left the dirty set, unpublished. Next submission.
+		return;
+	}
 	const auto work = PerfStats::t_work_recorded.load(std::memory_order_relaxed);
 	RangeSet   ready;
 	{
@@ -861,6 +865,18 @@ void BufferCache::EagerRecord() {
 			ready.Add(write.begin, write.end - write.begin);
 			return true;
 		});
+		// A page also bound by the draw being prepared waits for that draw (it stays noted).
+		for (const auto& write: m_eager_writes) {
+			ready.Subtract(write.begin, write.end - write.begin);
+		}
+	}
+	{
+		// Pages with a fault readback in flight: their bytes left the dirty set, unpublished.
+		std::lock_guard lock(m_pending_mutex);
+		for (const auto& pending: m_pending_publishes) {
+			const auto first = Common::AlignDown(pending.begin, TRACKER_PAGE_SIZE);
+			ready.Subtract(first, Common::AlignUp(pending.end, TRACKER_PAGE_SIZE) - first);
+		}
 	}
 	if (ready.Empty()) {
 		return;
@@ -887,8 +903,11 @@ void BufferCache::EagerRecord() {
 		ready.ForEachInRange(buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
 			const auto before = copies.size();
 			CollectDownload(buffer, begin, end - begin, copies, total_size);
-			if (copies.size() != before) {
-				entry->ranges.Add(begin, end - begin);
+			// Only the pages these copies cover get published (and their mark cleared).
+			for (auto i = before; i < copies.size(); i++) {
+				const auto first = Common::AlignDown(buffer.CpuAddress() + copies[i].srcOffset, TRACKER_PAGE_SIZE);
+				entry->ranges.Add(first, Common::AlignUp(buffer.CpuAddress() + copies[i].srcOffset + copies[i].size,
+				                                         TRACKER_PAGE_SIZE) - first);
 			}
 		});
 		if (copies.empty()) {
@@ -927,7 +946,9 @@ void BufferCache::EagerPublishRun(EagerPublish& entry, Common::UniqueFunction<vo
 	RangeSet clean = entry.ranges;
 	keep.ForEach([&](uint64_t begin, uint64_t end) {
 		clean.Subtract(begin, end - begin);
-		EagerReadback::S().kept.fetch_add(end - begin, std::memory_order_relaxed);
+		entry.ranges.ForEachInRange(begin, end - begin, [](uint64_t b, uint64_t e) {
+			EagerReadback::S().kept.fetch_add(e - b, std::memory_order_relaxed);
+		});
 	});
 	if (EagerReadback::Mode() == 1) {
 		clean.ForEach(
@@ -1161,7 +1182,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		const auto tick = m_scheduler.CurrentTick();
 		{
 			MemTrackProf::Timer timer(MemTrackProf::Counter::DownloadSyncNs, MemTrackProf::Counter::DownloadSyncCount);
+			m_sync_download++; // KYTY_EAGER_READBACK leaves this submission alone (EagerRecord)
 			m_scheduler.Wait(tick);
+			m_sync_download--;
 			m_scheduler.WaitPriorityOperations(tick);
 		}
 		publish();

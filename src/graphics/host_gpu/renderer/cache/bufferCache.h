@@ -397,6 +397,7 @@ private:
 	std::vector<SideCopy> m_side_copies; // readback-queue copies that may still run (GPU thread)
 	// KYTY_EAGER_READBACK. Leaf lock, like m_pending_mutex.
 	bool                                        m_eager = false;
+	uint32_t                                    m_sync_download = 0; // GPU thread: DownloadBufferMemory<false> waiting
 	std::mutex                                  m_eager_mutex;
 	RangeSet                                    m_eager_pages; // read back while GPU-written, never forgotten
 	std::vector<EagerWrite>                     m_eager_writes;
