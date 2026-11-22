@@ -25,6 +25,34 @@ inline constexpr uint64_t ASYNC_PIPELINE_NOT_SKIPPED = UINT64_MAX;
 	return uncapped || frame - first_skip < ASYNC_PIPELINE_SKIP_FRAMES;
 }
 
+// KYTY_ASYNC_PIPELINE: guest frames after which a target not drawn since is taken as new: its
+// memory may hold another target of the same format now (a level reusing a menu's memory).
+inline constexpr uint64_t ASYNC_TARGET_STALE_FRAMES = 60;
+
+// KYTY_ASYNC_PIPELINE: the first and last guest frames a draw was really drawn (not skipped) into one
+// target subresource, since it was last taken as new.
+struct AsyncTargetHistory {
+	uint64_t first_drawn = ASYNC_PIPELINE_NOT_SKIPPED;
+	uint64_t last_drawn  = 0;
+};
+
+// A draw into the target may be skipped while its pipeline is created only once the target holds a
+// real render from an earlier frame, drawn again within ASYNC_TARGET_STALE_FRAMES. A target the game
+// draws once (a baked sky, a LUT, a probe) and then samples would otherwise lose a skipped draw for
+// good; one updated rarely keeps at least its first render. All draws of the first frame wait: a
+// bake may take several draws in one frame.
+[[nodiscard]] constexpr bool AsyncTargetDrawnBefore(const AsyncTargetHistory& history, uint64_t frame) {
+	return history.first_drawn < frame && frame - history.last_drawn <= ASYNC_TARGET_STALE_FRAMES;
+}
+
+// Notes a draw drawn into the target at `frame`.
+constexpr void AsyncTargetNoteDrawn(AsyncTargetHistory& history, uint64_t frame) {
+	if (history.first_drawn == ASYNC_PIPELINE_NOT_SKIPPED || frame - history.last_drawn > ASYNC_TARGET_STALE_FRAMES) {
+		history.first_drawn = frame;
+	}
+	history.last_drawn = frame;
+}
+
 // The next job for a pipeline worker: the skipped keys first, in first-skip order (the nearest cap
 // first), then the predicted ones. LIFO among skipped keys left the oldest queued until their cap,
 // and the draw then created it inline. `uncapped(job)` (KYTY_ASYNC_TESS, tessellation): such skipped

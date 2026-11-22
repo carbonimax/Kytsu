@@ -29,6 +29,26 @@ constexpr bool CappedFirst() {
 }
 static_assert(CappedFirst(), "capped skipped keys must go before uncapped ones");
 
+// A target may be skipped from the frame after its first real draw, while it is drawn again within
+// ASYNC_TARGET_STALE_FRAMES; after a longer gap it is new again.
+constexpr bool TargetDrawnBefore() {
+	using Libs::Graphics::ASYNC_TARGET_STALE_FRAMES;
+	using Libs::Graphics::AsyncTargetDrawnBefore;
+	using Libs::Graphics::AsyncTargetHistory;
+	using Libs::Graphics::AsyncTargetNoteDrawn;
+	AsyncTargetHistory target {};
+	if (AsyncTargetDrawnBefore(target, 5)) return false;
+	AsyncTargetNoteDrawn(target, 5);
+	if (AsyncTargetDrawnBefore(target, 5) || !AsyncTargetDrawnBefore(target, 6)) return false;
+	AsyncTargetNoteDrawn(target, 9);
+	if (!AsyncTargetDrawnBefore(target, 9 + ASYNC_TARGET_STALE_FRAMES)) return false;
+	const uint64_t later = 10 + ASYNC_TARGET_STALE_FRAMES;
+	if (AsyncTargetDrawnBefore(target, later)) return false;
+	AsyncTargetNoteDrawn(target, later);
+	return !AsyncTargetDrawnBefore(target, later) && AsyncTargetDrawnBefore(target, later + 1);
+}
+static_assert(TargetDrawnBefore(), "only targets drawn in an earlier frame may be skipped");
+
 void Check(bool value, const char* message) {
 	if (!value) {
 		std::fprintf(stderr, "AsyncPipelinePolicyTests: failed: %s\n", message);
@@ -48,6 +68,23 @@ int main() {
 	Check(!AsyncPipelineMaySkip(first, 100 + 10 * ASYNC_PIPELINE_SKIP_FRAMES),
 	      "a draw long after the cap was skipped");
 	Check(first == 100, "a later skip moved the cap start");
+
+	// A target baked once at a load (then only sampled) waits; memory reused long after by a new target
+	// of the same format is new again.
+	using Libs::Graphics::ASYNC_TARGET_STALE_FRAMES;
+	using Libs::Graphics::AsyncTargetDrawnBefore;
+	using Libs::Graphics::AsyncTargetNoteDrawn;
+	Libs::Graphics::AsyncTargetHistory target {};
+	Check(!AsyncTargetDrawnBefore(target, 900), "a never drawn target may be skipped");
+	AsyncTargetNoteDrawn(target, 900);
+	AsyncTargetNoteDrawn(target, 900);
+	Check(!AsyncTargetDrawnBefore(target, 900), "a later draw of the target's first frame may be skipped");
+	Check(AsyncTargetDrawnBefore(target, 901), "a target drawn in the previous frame waits");
+	Check(AsyncTargetDrawnBefore(target, 900 + ASYNC_TARGET_STALE_FRAMES), "a recently drawn target waits");
+	Check(!AsyncTargetDrawnBefore(target, 901 + ASYNC_TARGET_STALE_FRAMES), "a stale target may be skipped");
+	AsyncTargetNoteDrawn(target, 3900);
+	Check(!AsyncTargetDrawnBefore(target, 3900), "a reused target may be skipped in its first frame");
+	Check(AsyncTargetDrawnBefore(target, 3901), "a reused target waits after its first frame");
 
 	uint64_t from_zero = ASYNC_PIPELINE_NOT_SKIPPED;
 	Check(AsyncPipelineMaySkip(from_zero, 0) && from_zero == 0, "frame 0 was not a valid start");
