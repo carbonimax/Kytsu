@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1316,6 +1317,8 @@ static bool PredictTargets(const CpPipeline::DrawRecord& record, DrawRenderState
 	                               DrawUsesSingleSample(colors, state.depth_info, hw.GetAaConfig());
 }
 
+static void CheckResolvedDrawState(const DrawRenderState& state);
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                        DrawRenderState& state, CpPipeline::DrawRecord* record,
                                             DrawPrepared prepared) {
@@ -1571,6 +1574,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		} else if (!reused) {
 			t_targets_current ^= 1u;
 		}
+	}
+	if (prepared != DrawPrepared::No && DrawStateInPlaceMode() == 2) {
+		CheckResolvedDrawState(state);
 	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
@@ -2176,6 +2182,18 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer,
 	return DrawIndexBody(buffer, args, nullptr, nullptr, DrawPrepared::No);
 }
 
+// `prepared`, or a value-initialized local state, which KYTY_DRAW_STATE_IN_PLACE=0 builds in both cases.
+[[gnu::noinline]] static DrawRenderState& DrawStateOf(DrawRenderState*                prepared,
+                                                      std::optional<DrawRenderState>& local,
+                                                      ShaderIndirectOffsets offsets, uint32_t count) {
+	if (prepared == nullptr || DrawStateInPlaceMode() == 0) {
+		auto& state            = local.emplace();
+		state.indirect_offsets = offsets;
+		state.indirect_count   = count;
+	}
+	return prepared != nullptr ? *prepared : *local;
+}
+
 // `prepared`: the draw's programs were already looked up into it (KYTY_CP_PIPELINE); `record`: run
 // from a pipeline record.
 bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
@@ -2230,9 +2248,9 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 
 	hw_check(buffer);
 
-	DrawRenderState  local_state {.indirect_offsets = args.indirect.offsets,
-	                              .indirect_count   = MeshIndirectGpuEnabled() ? args.indirect.count : 0};
-	DrawRenderState& state = prepared != nullptr ? *prepared : local_state;
+	std::optional<DrawRenderState> local_state;
+	DrawRenderState&               state = DrawStateOf(prepared, local_state, args.indirect.offsets,
+	                                                   MeshIndirectGpuEnabled() ? args.indirect.count : 0);
 	if (prepared == nullptr) {
 		NotePatchDraw(ucfg);
 	}
@@ -2342,9 +2360,9 @@ bool RenderExecutor::DrawAutoBody(CommandBuffer& buffer,
 
 	const DrawCallInfo draw {false, args.vertex_count, args.instance_count};
 
-	DrawRenderState  local_state {.indirect_offsets = args.indirect.offsets,
-	                              .indirect_count   = MeshIndirectGpuEnabled() ? args.indirect.count : 0};
-	DrawRenderState& state = prepared != nullptr ? *prepared : local_state;
+	std::optional<DrawRenderState> local_state;
+	DrawRenderState&               state = DrawStateOf(prepared, local_state, args.indirect.offsets,
+	                                                   MeshIndirectGpuEnabled() ? args.indirect.count : 0);
 	if (prepared == nullptr) {
 		NotePatchDraw(ucfg);
 	}
@@ -2421,6 +2439,195 @@ static bool DrawWritesMemory(const DrawRenderState& state) {
 // GPU thread: a re-lookup serves a draw that already began its image heap draw.
 static bool g_pipeline_relookup = false;
 
+static_assert(std::is_trivially_copyable_v<DrawRenderState>); // filled with 0xa5 and compared bytewise
+
+int DrawStateInPlaceMode() noexcept {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_DRAW_STATE_IN_PLACE");
+		const int   m     = value != nullptr && (*value == '0' || *value == '2') ? *value - '0' : 1;
+		if (m != 1) std::printf("KYTY_DRAW_STATE_IN_PLACE=%d\n", m);
+		return m;
+	}();
+	// In-session A/B: arm 0 forces the old path (0), arm 1 keeps the default (1).
+	return mode == 1 && PerfStats::AbOff("draw_state_in_place") ? 0 : mode;
+}
+
+// Not inlined: both modes are one symbol in a CPU profile.
+[[gnu::noinline]] void ResetDrawStateForLookup(DrawRenderState& state, vk::PrimitiveTopology topology,
+                                               int mode) {
+	if (mode == 0) {
+		state          = {};
+		state.topology = topology;
+		return;
+	}
+	if (mode == 2) std::memset(static_cast<void*>(&state), 0xa5, sizeof(state));
+	// The lookup rebuilds the pixel stage and the stages it uses (PrepareProgram), the target resolution
+	// the color entries it uses; the rest is read before being written.
+	std::construct_at(&state.depth_info);    // ResolveRenderDepthTarget may leave it untouched
+	std::construct_at(&state.color_info[0]); // the pass sample count reads it without color targets
+	state.color_count              = 0;
+	state.aliased_passes           = 0;
+	state.mrt_mask                 = 0;
+	state.topology                 = topology;
+	state.primitive_restart_enable = false;
+	state.ps_active                = false;
+	for (auto& stage: state.vertex_info) {
+		std::construct_at(&stage.stage); // VertexStages, CopySnapshots, and a lookup that returns early
+	}
+	state.indirect_offsets = {};
+	state.indirect_count   = 0;
+	state.tess_deferred    = false;
+}
+
+// Bytes of a DrawRenderState that value-initialization leaves as they were: padding, which nothing reads
+// and copies may or may not carry.
+static const std::vector<bool>& DrawStatePadding() {
+	static const std::vector<bool> mask = [] {
+		static DrawRenderState zeros, ones;
+		std::memset(static_cast<void*>(&zeros), 0x00, sizeof(zeros));
+		std::memset(static_cast<void*>(&ones), 0xff, sizeof(ones));
+		std::construct_at(&zeros);
+		std::construct_at(&ones);
+		const auto*       x = reinterpret_cast<const unsigned char*>(&zeros);
+		const auto*       y = reinterpret_cast<const unsigned char*>(&ones);
+		std::vector<bool> m(sizeof(DrawRenderState));
+		for (size_t i = 0; i < m.size(); i++) m[i] = x[i] != y[i];
+		// Also what the stage resets of the lookup (`info = {}`, a copy) leave as they were.
+		std::memset(static_cast<void*>(&zeros), 0x00, sizeof(zeros));
+		std::memset(static_cast<void*>(&ones), 0xff, sizeof(ones));
+		for (auto* s: {&zeros, &ones}) {
+			for (auto& stage: s->vertex_info) stage = {};
+			s->ps_input_info = {};
+		}
+		const auto mark = [&](const auto& field) {
+			const auto base = static_cast<size_t>(reinterpret_cast<const unsigned char*>(&field) - x);
+			for (size_t i = base; i < base + sizeof(field); i++) m[i] = m[i] || x[i] != y[i];
+		};
+		for (const auto& stage: zeros.vertex_info) mark(stage);
+		mark(zeros.ps_input_info);
+		return m;
+	}();
+	return mask;
+}
+
+// `field` (of `a`, `size` bytes) against the same bytes of `b`, padding left out; `offset` from the state start.
+static bool BytesDiffer(const DrawRenderState& a, const DrawRenderState& b, const void* field, size_t size,
+                        size_t& offset) {
+	const auto* x    = reinterpret_cast<const unsigned char*>(&a);
+	const auto* y    = reinterpret_cast<const unsigned char*>(&b);
+	const auto  base = static_cast<size_t>(static_cast<const unsigned char*>(field) - x);
+	const auto& pad  = DrawStatePadding();
+	for (size_t i = base; i < base + size; i++) {
+		if (!pad[i] && x[i] != y[i]) {
+			offset = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+const char* DrawStateLookupDiff(const DrawRenderState& state, const DrawRenderState& reference,
+                                size_t& offset) {
+	offset = 0;
+	if (static_cast<bool>(state.vertex_info[0].stage) != static_cast<bool>(reference.vertex_info[0].stage)) {
+		return "vertex_info[0].stage";
+	}
+	if (!reference.vertex_info[0].stage) return nullptr; // skipped draw
+#define KYTY_DRAW_STATE_FIELD(f)          \
+	if (state.f != reference.f) return #f
+	KYTY_DRAW_STATE_FIELD(tess_deferred);
+	KYTY_DRAW_STATE_FIELD(topology);
+	KYTY_DRAW_STATE_FIELD(primitive_restart_enable);
+	KYTY_DRAW_STATE_FIELD(ps_active);
+	KYTY_DRAW_STATE_FIELD(mrt_mask);
+	KYTY_DRAW_STATE_FIELD(aliased_passes);
+	KYTY_DRAW_STATE_FIELD(color_count);
+	KYTY_DRAW_STATE_FIELD(indirect_offsets);
+	KYTY_DRAW_STATE_FIELD(indirect_count);
+	KYTY_DRAW_STATE_FIELD(VertexStages().size());
+#undef KYTY_DRAW_STATE_FIELD
+	const auto differs = [&](const auto& field) {
+		return BytesDiffer(state, reference, &field, sizeof(field), offset);
+	};
+	if (differs(state.depth_info)) return "depth_info";
+	if (differs(state.color_info[0])) return "color_info[0]";
+	if (differs(state.ps_input_info)) return "ps_input_info";
+	static constexpr const char* Names[] = {"vertex_info[0]", "vertex_info[1]", "vertex_info[2]"};
+	static_assert(offsetof(ShaderVertexInputInfo, pixel_input) == 0);
+	for (size_t i = 0; i < reference.VertexStages().size(); i++) {
+		// pixel_input points into its own state.
+		const auto& a = state.vertex_info[i];
+		const auto& b = reference.vertex_info[i];
+		if ((a.pixel_input == &state.ps_input_info) != (b.pixel_input == &reference.ps_input_info) ||
+		    BytesDiffer(state, reference, &a.pixel_input + 1, sizeof(a) - sizeof(a.pixel_input), offset)) {
+			return Names[i];
+		}
+	}
+	return nullptr;
+}
+
+// KYTY_DRAW_STATE_IN_PLACE=2: entries of a resolved draw state still holding the fill.
+static std::atomic<uint64_t> g_draw_state_back_checked {0};
+static std::atomic<uint64_t> g_draw_state_back_filled {0};
+
+static bool HoldsFill(const void* data, size_t size) {
+	const auto* bytes = static_cast<const unsigned char*>(data);
+	for (size_t i = 0; i + 8 <= size; i += 8) {
+		uint64_t word = 0;
+		std::memcpy(&word, bytes + i, 8);
+		if (word == 0xa5a5a5a5a5a5a5a5ull) return true;
+	}
+	return false;
+}
+
+static void CheckResolvedDrawState(const DrawRenderState& state) {
+	bool filled = HoldsFill(&state.depth_info, sizeof(state.depth_info));
+	for (uint32_t i = 0; i < std::max(state.color_count, 1u); i++) {
+		filled = filled || HoldsFill(&state.color_info[i], sizeof(state.color_info[i]));
+	}
+	g_draw_state_back_checked.fetch_add(1, std::memory_order_relaxed);
+	if (filled && g_draw_state_back_filled.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("KYTY_DRAW_STATE_IN_PLACE=2: resolved targets hold the fill (colors=%u)\n",
+		            state.color_count);
+	}
+}
+
+// GPU thread: the same lookup on a value-initialized state (as PipelineRelookup does it), compared.
+static void VerifyDrawStateLookup(CommandBuffer& buffer, const DrawRenderState& state,
+                                  vk::PrimitiveTopology topology, bool single_sample) {
+	static DrawRenderState reference;
+	static uint64_t        compared = 0, diffs = 0, skipped = 0;
+	if (state.tess_deferred) {
+		skipped++; // its stages are still translating: a second lookup would wait for them
+	} else {
+		// The values of `= {}` (mode 0), with its padding set: the comparison leaves padding out anyway.
+		std::memset(static_cast<void*>(&reference), 0, sizeof(reference));
+		std::construct_at(&reference);
+		reference.topology  = topology;
+		g_pipeline_relookup = true;
+		CpPipeline::SetInLookup(true);
+		RefreshShaders(buffer, reference, single_sample);
+		CpPipeline::SetInLookup(false);
+		(void)CpPipeline::TakeHeapInline();
+		g_pipeline_relookup = false;
+		compared++;
+		size_t      offset = 0;
+		const char* field  = DrawStateLookupDiff(state, reference, offset);
+		if (field != nullptr && ++diffs <= 16) {
+			std::printf("KYTY_DRAW_STATE_IN_PLACE=2: %s differs at state byte %zu (0x%02x, reset 0x%02x)\n", field,
+			            offset, reinterpret_cast<const unsigned char*>(&state)[offset],
+			            reinterpret_cast<const unsigned char*>(&reference)[offset]);
+		}
+	}
+	if ((compared + skipped) % 20000 == 0) {
+		std::printf("KYTY_DRAW_STATE_IN_PLACE=2: compared=%llu diffs=%llu skipped=%llu resolved=%llu filled=%llu\n",
+		            static_cast<unsigned long long>(compared), static_cast<unsigned long long>(diffs),
+		            static_cast<unsigned long long>(skipped),
+		            static_cast<unsigned long long>(g_draw_state_back_checked.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(g_draw_state_back_filled.load(std::memory_order_relaxed)));
+	}
+}
+
 bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
                                   const DrawIndexArgs* index_args, const DrawAutoArgs* auto_args) {
 	const bool indexed  = index_args != nullptr;
@@ -2460,9 +2667,9 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	}();
 	(void)initialized;
 
-	auto& record          = CpPipeline::Acquire();
-	record.state          = {};
-	record.state.topology = topology;
+	auto&     record   = CpPipeline::Acquire();
+	const int in_place = DrawStateInPlaceMode();
+	ResetDrawStateForLookup(record.state, topology, in_place);
 	const bool guessed    = GuessSingleSample(buffer.GetShaders().GetPs().ps_regs.data_addr);
 	CpPipeline::SetInLookup(true);
 	{
@@ -2471,6 +2678,9 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	}
 	CpPipeline::SetInLookup(false);
 	const bool heap = CpPipeline::TakeHeapInline();
+	if (in_place == 2) {
+		VerifyDrawStateLookup(buffer, record.state, topology, guessed);
+	}
 	// KYTY_TESS_PRETRANSLATE: a skipped draw writes nothing, so queued records need not drain first.
 	if (!heap && record.state.tess_deferred) {
 		return true;
