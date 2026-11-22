@@ -44,6 +44,7 @@ using callback_func_t = void (*)(uintptr_t addr, size_t size);
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
 constexpr uint64_t kExtendedMemoryBase       = 0x080000000000ull;
 constexpr uint64_t kExtendedMemorySize       = 512ull * 1024 * 1024 * 1024;
+constexpr int      AMM_ERROR_REGION_NOT_FULLY_MAPPED = static_cast<int>(0x81912011);
 
 struct VirtualQueryInfo {
 	uintptr_t start;
@@ -129,9 +130,20 @@ void                   RegisterCallbacks(callback_func_t alloc_func, callback_fu
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+int MapPrtMemory(uint64_t vaddr, size_t size);
+int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// KYTY_SPARSE_COPY_CACHE totals since start. checked (lock-free copies) and locked (misses, of
+// which stale_bytes/stale_maps hit a slot flushed by a byte write / a mapping change) count in
+// mode 2 only; map_bumps and byte_bumps (generation bumps by kind) count in modes 1 and 2.
+struct SparseCopyStats {
+	int      mode;
+	uint64_t checked, locked, stale_bytes, stale_maps, map_bumps, byte_bumps;
+};
+SparseCopyStats GetSparseCopyStats();
+void            ReportSparseCopyCache(); // one PERF line (KYTY_PERF_STATS), none with the cache off
 // KYTY_MEM_IMPORT: host address of the writable backing alias of [vaddr, vaddr + size) when the whole
 // range is mapped from one contiguous run of direct memory (never protected: importable by the GPU);
 // 0 otherwise. BackingAliasBase/Size: the whole alias (0 when there is no backing).
@@ -153,6 +165,9 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
 // True when vaddr lies in a guest virtual range, committed or only reserved (sparse PRT hole).
 [[nodiscard]] bool IsVirtualAddressKnown(uint64_t vaddr);
+// Advances on every edit of the guest virtual ranges: answers of IsVirtualAddressKnown and
+// TryClampRangeSize seen under an unchanged value still hold (read it before the query).
+[[nodiscard]] uint64_t VirtualRangesGeneration();
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // A guest thread stack or fiber context about to be used (Graphics::GuestStacks): registers it for
@@ -179,6 +194,8 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 // blocking on those is allowed (Windows vectored handler, or a signal handler that defers to such).
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t guest_vaddr,
                                   uint64_t guest_pc = 0) noexcept;
+[[nodiscard]] bool DescribeNearestGpuMapping(uint64_t fault_vaddr, uint64_t* begin,
+                                              uint64_t* end) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
@@ -219,6 +236,9 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size);
 int KYTY_SYSV_ABI KernelConfiguredFlexibleMemorySize(size_t* size);
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot);
 int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int prot);
+int KYTY_SYSV_ABI KernelWriteRemapIntoPrtCommand(uint32_t* record, uint64_t prt_vaddr,
+                                                 uint64_t old_vaddr, uint64_t size, int prot,
+                                                 int prot_mask, uint64_t* record_size);
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
                                  int* num_entries_out);
 int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
@@ -255,6 +275,7 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
+void     TestSetSparseCopyCacheMode(int mode); // -1 = KYTY_SPARSE_COPY_CACHE
 void     TestSetVmaMemoMode(int mode); // -1 = KYTY_VMA_MEMO
 uint64_t TestVmaMemoHits();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);

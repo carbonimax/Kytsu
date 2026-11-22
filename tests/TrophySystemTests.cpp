@@ -228,8 +228,8 @@ void TestEventExtraction(const std::filesystem::path &directory) {
 			{"bad":1}
 		]})"}});
   package.event_rules = Trophies::LoadUdsRules(path);
-  Check(package.event_rules.size() == 4,
-        "skip unsupported extraction and aggregation");
+  Check(package.event_rules.size() == 6,
+        "count and sum rules join the supported latest and max ones");
   Check(EvaluateEvent(package, "MULTI",
                       {{"first", uint64_t{10}}, {"last", uint64_t{0}}}) ==
             std::vector<int>{1},
@@ -281,6 +281,22 @@ void TestEventExtraction(const std::filesystem::path &directory) {
         "missing stat definitions cannot infer aggregation");
   Check(Trophies::LoadUdsRules(directory / "missing.ucp").empty(),
         "missing UDS package has no rules");
+}
+
+void TestActivityIds(const std::filesystem::path &directory) {
+  const auto path = directory / "uds00.ucp";
+  WritePackage(path, {{"enum_definition.json", R"({"enumArray":[
+			{"sourceId":"activity_pattern1","enumValueArray":[{"name":"story"},{"name":"bonus"}]},
+			{"sourceId":"difficulty","enumValueArray":[{"name":"hard"}]},
+			{"sourceId":"activity","enumValueArray":[{"name":"finale"},{"name":"story"},{"id":3}]},
+			{"sourceId":1,"enumValueArray":[{"name":"numeric"}]}
+		]})"}});
+  Check(Trophies::LoadActivityIds(path) ==
+            std::set<std::string>{"bonus", "finale", "story"},
+        "activity IDs come from activity enums only, without duplicates");
+  WritePackage(path, {{"stats_extraction.json", "{}"}});
+  Check(Trophies::LoadActivityIds(path).empty(),
+        "package without enum definitions has no activities");
 }
 
 void TestProgress(const std::filesystem::path &directory) {
@@ -338,37 +354,37 @@ Trophies::Package TestMaximumStats(const std::filesystem::path &directory) {
         Trophies::UdsInteger{uint64_t{5}}}) {
     const auto result = post("MAX", value);
     Check(result.trophies.empty() && !result.stats_changed &&
-              unlocks.max_stats.empty(),
+              unlocks.stats.empty(),
           "invalid signed stat input never mutates progress");
   }
-  Check(post("MAX", int64_t{1}).stats_changed && unlocks.max_stats.at(10) == 2,
+  Check(post("MAX", int64_t{1}).stats_changed && unlocks.stats.at(10) == 2,
         "maximum includes configured initial value");
   Check(post("MAX", int64_t{4}).trophies.empty() &&
-            unlocks.max_stats.at(10) == 4,
+            unlocks.stats.at(10) == 4,
         "subthreshold progress is retained");
   Check(!post("MAX", int64_t{2}).stats_changed &&
             !post("MAX", int64_t{4}).stats_changed &&
-            unlocks.max_stats.at(10) == 4,
+            unlocks.stats.at(10) == 4,
         "lower and repeated inputs do not change maximum");
   const auto saved = directory / "maximum.json";
   Check(Trophies::SaveUnlockData(saved, unlocks), "save subthreshold progress");
   unlocks = Trophies::LoadUnlockData(saved);
-  Check(unlocks.max_stats.at(10) == 4 &&
+  Check(unlocks.stats.at(10) == 4 &&
             post("MAX", int64_t{5}).trophies == std::vector<int>{1},
         "reloaded progress reaches exact unlock threshold");
   unlocks.unlocked.insert(1);
   Check(post("MAX", int64_t{6}).trophies.empty(),
         "unlocked trophies are not reported again");
   Check(post("MAX", int64_t{INT64_MAX}).stats_changed &&
-            unlocks.max_stats.at(10) == INT64_MAX,
+            unlocks.stats.at(10) == INT64_MAX,
         "retain full signed 64-bit precision");
   Check(post("MAX32", uint32_t{UINT32_MAX}).stats_changed &&
             post("MAX64", uint64_t{UINT64_MAX}).stats_changed &&
-            unlocks.max_stats.at(20) == UINT32_MAX &&
-            unlocks.max_stats.at(30) == UINT64_MAX,
+            unlocks.stats.at(20) == UINT32_MAX &&
+            unlocks.stats.at(30) == UINT64_MAX,
         "retain unsigned maxima without signed overflow");
   Check(Trophies::SaveUnlockData(saved, unlocks) &&
-            Trophies::LoadUnlockData(saved).max_stats == unlocks.max_stats,
+            Trophies::LoadUnlockData(saved).stats == unlocks.stats,
         "persist full-width stat values");
   return package;
 }
@@ -435,7 +451,7 @@ void TestMaximumEventHle(const std::filesystem::path &directory,
   post(context, 6);
   Check(state->unlocks.timestamps == timestamps &&
             Libs::Graphics::notifications == 3 &&
-            Trophies::LoadUnlockData(state->path).max_stats.at(10) == 6,
+            Trophies::LoadUnlockData(state->path).stats.at(10) == 6,
         "later progress persists without duplicate unlocks");
   int guest_context = 0;
   const auto guest = Config::GetPlayerUserId(1);
@@ -444,7 +460,7 @@ void TestMaximumEventHle(const std::filesystem::path &directory,
         "register guest UDS context");
   post(guest_context, 5);
   const auto *guest_state = Trophy::LoadTrophyState({guest, 0});
-  Check(guest_state->unlocks.max_stats.empty() &&
+  Check(guest_state->unlocks.stats.empty() &&
             guest_state->unlocks.unlocked.empty() &&
             guest_state->path.empty() && Libs::Graphics::notifications == 3,
         "guests do not earn or save progress");
@@ -455,6 +471,127 @@ void TestMaximumEventHle(const std::filesystem::path &directory,
   Trophy::g_packages.clear();
   Config::Shutdown();
   std::filesystem::current_path(previous);
+}
+
+// A title posts gameplay events into
+// unsigned count, sum and min stats alongside the int64 maxima tested by
+// TestMaximumStats; count rules carry no input property.
+void TestAggregatedStats(const std::filesystem::path &directory) {
+  const auto trophy_path = directory / "trophy03.ucp";
+  WritePackage(
+      trophy_path,
+      {{"tropconf.json", R"({"defaultLanguage":"en-US","trophies":[
+			{"id":"0","grade":"P"},
+			{"id":"1","grade":"B","unlockCondition":{"udsStatId":"113","comparator":"ge","targetValue":"5","progressive":true}},
+			{"id":"2","grade":"B","unlockCondition":{"udsStatId":"200","comparator":"ge","targetValue":"3","progressive":false}},
+			{"id":"3","grade":"B","unlockCondition":{"udsStatId":"300","comparator":"gt","targetValue":"10","progressive":false}},
+			{"id":"4","grade":"B","unlockCondition":{"udsStatId":"400","comparator":"le","targetValue":"10","progressive":false}}
+		]})"},
+       {"tropmeta_en-US.json",
+        R"({"metadata":{"titleMetadata":{"name":"Stats"},"trophyMetadata":[]}})"}});
+  auto package = Trophies::LoadPackage(trophy_path, 1);
+  const auto uds_path = directory / "uds03.ucp";
+  WritePackage(
+      uds_path,
+      {{"stats_definition.json", R"({"statDefinitionArray":[
+			{"statId":113,"dataType":"int64","aggregation":"max","minValue":"0","initialValue":"2"},
+			{"statId":200,"dataType":"uint64","aggregation":"count"},
+			{"statId":300,"dataType":"uint64","aggregation":"sum"},
+			{"statId":400,"dataType":"uint32","aggregation":"min"},
+			{"statId":500,"dataType":"uint32","aggregation":"sum"},
+			{"statId":600,"dataType":"uint64","aggregation":"sum","initialValue":"3"},
+			{"statId":700,"dataType":"uint64","aggregation":"count","initialValue":"2"}
+		]})"},
+       {"stats_extraction.json", R"({"statsExtractionRuleArray":[
+			{"condition":{"eventName":"UpdateKillCount"},"action":{"input":"$.newValue","output":{"statId":113}}},
+			{"condition":{"eventName":"KILL"},"action":{"output":{"statId":200}}},
+			{"condition":{"eventName":"SCORE"},"action":{"input":"$.delta","output":{"statId":300}}},
+			{"condition":{"eventName":"LAP"},"action":{"input":"$.seconds","output":{"statId":400}}},
+			{"condition":{"eventName":"RAID"},"action":{"input":"$.hits","output":{"statId":500}}},
+			{"condition":{"eventName":"BONUS"},"action":{"input":"$.points","output":{"statId":600}}},
+			{"condition":{"eventName":"STEP"},"action":{"output":{"statId":700}}}
+		]})"}});
+  package.event_rules = Trophies::LoadUdsRules(uds_path);
+  Check(package.trophies.size() == 5 && package.event_rules.size() == 7,
+        "load aggregated rules and count rules without input");
+
+  Trophies::UnlockData unlocks;
+  const auto post = [&](std::string_view event,
+                        std::map<std::string, Trophies::UdsInteger> properties = {}) {
+    return Trophies::ApplyUdsEvent(package, unlocks, event, properties);
+  };
+  Check(post("UpdateKillCount", {{"newValue", int64_t{1}}}).trophies.empty() &&
+            unlocks.stats.at(113) == 2,
+        "maximum stats floor at the configured initial value");
+  Check(Trophies::TrophyProgress(package.trophies.at(1), unlocks) == 2,
+        "a locked progressive stat reports as trophy progress");
+  Check(post("UpdateKillCount", {{"newValue", uint64_t{9}}}).trophies.empty() &&
+            unlocks.stats.at(113) == 2,
+        "inputs of the wrong width cannot update a stat");
+  Check(post("UpdateKillCount", {{"newValue", int64_t{5}}}).trophies ==
+            std::vector<int>{1},
+        "maximum unlocks at its target");
+
+  Check(post("KILL").trophies.empty() && unlocks.stats.at(200) == 1,
+        "count stats tally events even without properties");
+  Check(post("KILL", {{"unrelated", int32_t{1}}}).trophies.empty() &&
+            post("KILL").trophies == std::vector<int>{2} && unlocks.stats.at(200) == 3,
+        "count stats accumulate across events of any shape");
+  Check(post("BONUS", {{"points", uint64_t{4}}}).trophies.empty() &&
+            unlocks.stats.at(600) == 7 && post("STEP").trophies.empty() &&
+            unlocks.stats.at(700) == 3,
+        "sums and tallies start at the configured initial value");
+
+  Check(post("SCORE", {{"delta", uint64_t{6}}}).trophies.empty(),
+        "subthreshold sums do not unlock");
+  Check(post("SCORE", {{"delta", uint64_t{5}}}).trophies == std::vector<int>{3} &&
+            unlocks.stats.at(300) == 11,
+        "sums accumulate until their threshold is crossed");
+  Check(post("SCORE", {{"delta", uint32_t{3}}}).trophies.empty() &&
+            unlocks.stats.at(300) == 11,
+        "sum input width must match the stat");
+  Trophies::UnlockData saturated;
+  saturated.stats.emplace(300, UINT64_MAX - 1);
+  Check(
+      Trophies::ApplyUdsEvent(package, saturated, "SCORE", {{"delta", uint64_t{9}}})
+              .stats_changed &&
+          saturated.stats.at(300) == UINT64_MAX,
+      "sums saturate at the stat range");
+  Trophies::UnlockData narrow;
+  narrow.stats.emplace(500, UINT32_MAX - 2);
+  Check(Trophies::ApplyUdsEvent(package, narrow, "RAID", {{"hits", uint32_t{5}}})
+                .stats_changed &&
+            narrow.stats.at(500) == UINT32_MAX,
+        "sums saturate at the narrower stat type");
+
+  Check(post("LAP", {{"seconds", uint32_t{30}}}).trophies.empty() &&
+            unlocks.stats.at(400) == 30,
+        "the first value starts a min stat");
+  Check(!post("LAP", {{"seconds", uint32_t{40}}}).stats_changed &&
+            unlocks.stats.at(400) == 30,
+        "higher values never raise a min stat");
+  Check(!Trophies::TrophyProgress(package.trophies.at(4), unlocks),
+        "le conditions have no progress to report");
+  Check(post("LAP", {{"seconds", uint32_t{10}}}).trophies == std::vector<int>{4},
+        "min stats unlock when they drop to the threshold");
+
+  unlocks.stats.emplace(999, uint64_t{7});
+  const auto path = Trophies::UnlocksPath(directory, "PPSA00001", 1000, 3);
+  Check(Trophies::SaveUnlockData(path, unlocks), "save aggregated stats");
+  Check(Trophies::LoadUnlockData(path).stats == unlocks.stats,
+        "persist aggregated stat values");
+  const auto legacy = directory / "legacy_stats.json";
+  {
+    Common::File file;
+    Check(file.Create(legacy), "create legacy stat save");
+    const std::string text =
+        "{\"unlockedTrophies\":[],\"unlockedAt\":{},\"maxStats\":{\"113\":3}}";
+    uint32_t written = 0;
+    file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
+    Check(written == text.size(), "write legacy stat save");
+  }
+  Check(Trophies::LoadUnlockData(legacy).stats.at(113) == 3,
+        "older saves keep their stat values under the legacy key");
 }
 
 void TestUnlockPersistence(const std::filesystem::path &directory) {
@@ -656,9 +793,11 @@ int main() {
   TestLocalization();
   TempDirectory directory;
   TestEventExtraction(directory.Path());
+  TestActivityIds(directory.Path());
   TestProgress(directory.Path());
   TestUnlockPersistence(directory.Path());
   TestMaximumEventHle(directory.Path(), TestMaximumStats(directory.Path()));
+  TestAggregatedStats(directory.Path());
   TestReportedProgress(directory.Path());
   TestReportedEventHle(directory.Path());
   std::printf("TrophySystemTests: all cases passed\n");

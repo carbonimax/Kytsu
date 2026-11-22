@@ -1,19 +1,23 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "kernel/eventQueue.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/systemService.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -24,6 +28,9 @@ void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase* s);
 }
 namespace LibNpEntitlementAccessPft {
 void InitNet_1_NpEntitlementAccessPft(Loader::SymbolDatabase* s);
+}
+namespace LibNpPartner {
+void InitNet_1_NpPartner(Loader::SymbolDatabase* s);
 }
 namespace LibNpTrophy2 {
 void InitNet_1_NpTrophy2(Loader::SymbolDatabase* s);
@@ -202,7 +209,7 @@ int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optva
 }
 
 int KYTY_SYSV_ABI NetSendto(int s, const void* buf, size_t len, int flags, const void* addr,
-                         uint32_t addrlen) {
+                            uint32_t addrlen) {
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
 	return FinishSocketCall(
 	    static_cast<int>(Net::Sendto(s, buf, size, flags | 0x20000, addr, addrlen)));
@@ -218,7 +225,7 @@ int KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
 }
 
 int KYTY_SYSV_ABI NetRecvfrom(int s, void* buf, size_t len, int flags, void* addr,
-                               uint32_t* addrlen) {
+                              uint32_t* addrlen) {
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
 	return FinishSocketCall(static_cast<int>(Net::Recvfrom(s, buf, size, flags, addr, addrlen)));
 }
@@ -295,6 +302,7 @@ LIB_DEFINE(InitNet_1_Ssl) {
 	LIB_FUNC("0K1yQ6Lv-Yc", Ssl::SslTerm);
 	LIB_FUNC("TDfQqO-gMbY", Ssl::SslGetCaCerts);
 	LIB_FUNC("qIvLs0gYxi0", Ssl::SslFreeCaCerts);
+	LIB_FUNC("-PoIzr3PEk0", Ssl::SslGetMemoryPoolStats);
 }
 
 } // namespace LibSsl
@@ -670,8 +678,10 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 		}
 	}
 
-	const bool with_username = (parts & BUILD_WITH_USERNAME) != 0 && src_element->username != nullptr;
-	const bool with_password = (parts & BUILD_WITH_PASSWORD) != 0 && src_element->password != nullptr;
+	const bool with_username =
+	    (parts & BUILD_WITH_USERNAME) != 0 && src_element->username != nullptr;
+	const bool with_password =
+	    (parts & BUILD_WITH_PASSWORD) != 0 && src_element->password != nullptr;
 	if (with_username) {
 		uri.append(src_element->username);
 	}
@@ -830,6 +840,7 @@ struct Http2Request {
 	uint64_t                                         content_length = 0;
 	std::vector<std::pair<std::string, std::string>> headers;
 	int                                              send_result = HTTP2_ERROR_BEFORE_SEND;
+	bool                                             aborted     = false;
 	int                                              status_code = 0;
 	std::string                                      response_headers;
 	std::string                                      response_body;
@@ -969,7 +980,8 @@ static int KYTY_SYSV_ABI Http2Term(int lib_http2_ctx_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2GetMemoryPoolStats(int lib_http2_ctx_id, Http2MemoryPoolStats* stats) {
+static int KYTY_SYSV_ABI Http2GetMemoryPoolStats(int                   lib_http2_ctx_id,
+                                                 Http2MemoryPoolStats* stats) {
 	PRINT_NAME();
 
 	if (stats == nullptr) {
@@ -1280,6 +1292,13 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	// An aborted request never reached the send step, so it keeps the result it already
+	// carries instead of being moved to a timeout. The console's own code for this case
+	// is not published.
+	if (request->second.aborted) {
+		return request->second.send_result;
+	}
+
 	request->second.send_result = HTTP2_ERROR_TIMEOUT;
 
 	return request->second.send_result;
@@ -1309,6 +1328,13 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (request->second.aborted) {
+		request->second.async_result = request->second.send_result;
+		request->second.async_event  = 0;
+		Http2TriggerUserEvent(kqueue_option);
+		return 0;
 	}
 
 	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
@@ -1504,6 +1530,26 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 	return 0;
 }
 
+static int KYTY_SYSV_ABI Http2AbortRequest(int req_id) {
+	PRINT_NAME();
+
+	LOGF("\t req_id = %d\n", req_id);
+
+	// Abort only moves an unsent request to an aborted state; DeleteRequest is still
+	// the call that frees it. A request that already reached the send step keeps its
+	// result.
+	auto request = g_http2_requests.find(req_id);
+	if (request == g_http2_requests.end()) {
+		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (request->second.send_result == HTTP2_ERROR_BEFORE_SEND) {
+		request->second.aborted = true;
+	}
+
+	return 0;
+}
+
 static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
 	PRINT_NAME();
 
@@ -1544,6 +1590,7 @@ LIB_DEFINE(InitNet_1_Http2) {
 	LIB_FUNC("YrWX+DhPHQY", LibHttp2::Http2SetSslCallback);
 	LIB_FUNC("rbqZig38AT8", LibHttp2::Http2SendRequest);
 	LIB_FUNC("A+NVAFu4eCg", LibHttp2::Http2SendRequestAsync);
+	LIB_FUNC("IZ-qjhRqvjk", LibHttp2::Http2AbortRequest);
 	LIB_FUNC("o0DBQpFE13o", LibHttp2::Http2GetResponseContentLength);
 	LIB_FUNC("9XYJwCf3lEA", LibHttp2::Http2GetStatusCode);
 	LIB_FUNC("-rdXUi2XW90", LibHttp2::Http2GetAllResponseHeaders);
@@ -1728,6 +1775,56 @@ LIB_DEFINE(InitNet_1_NpManager) {
 }
 
 } // namespace LibNpManager
+
+namespace LibNpPartner {
+
+LIB_VERSION("libSceNpPartner001", 1, "libSceNpPartner001", 1, 1);
+
+namespace {
+bool g_np_partner_initialized = false;
+}
+
+// sceNpEAAccessInitialize/Terminate take no arguments on PS5. A title imports both and
+// calls Initialize at startup.
+static int KYTY_SYSV_ABI NpEAAccessInitialize() {
+	PRINT_NAME();
+
+	g_np_partner_initialized = true;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpEAAccessTerminate() {
+	PRINT_NAME();
+
+	g_np_partner_initialized = false;
+	return OK;
+}
+
+// Signature (int userId, bool* result); EA Access has no
+// server here, so report no subscription.
+static int KYTY_SYSV_ABI NpHasEAAccessSubscription(int /*user_id*/, bool* has_subscription) {
+	PRINT_NAME();
+
+	if (has_subscription == nullptr) {
+		return OK;
+	}
+	*has_subscription = false;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpHasEAAccessSubscriptionAbortRequest() {
+	PRINT_NAME();
+	return OK;
+}
+
+LIB_DEFINE(InitNet_1_NpPartner) {
+	LIB_FUNC("pMxXhNozUX8", NpEAAccessTerminate);
+	LIB_FUNC("pQfYTZHznMc", NpHasEAAccessSubscriptionAbortRequest);
+	LIB_FUNC("7CxI50-xlCk", NpEAAccessInitialize);
+	LIB_FUNC("+OnbUs1CV0M", NpHasEAAccessSubscription);
+}
+
+} // namespace LibNpPartner
 
 namespace LibNpSessionSignaling {
 
@@ -1923,10 +2020,10 @@ static int np_auth_complete_unavailable(NpAuthRequest* request, int user_id) {
 		return NP_AUTH_ERROR_ABORTED;
 	}
 
-	request->state  = NpAuthRequestState::Complete;
+	request->state = NpAuthRequestState::Complete;
 	// Emulating sign-in cannot provide a real authorization code or ID token.
-	request->result = Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN
-	                                                        : NP_ERROR_SIGNED_OUT;
+	request->result =
+	    Network::NpManager::IsSignedIn(user_id) ? NP_AUTH_ERROR_SERVICE_DOWN : NP_ERROR_SIGNED_OUT;
 
 	return request->async ? 0 : request->result;
 }
@@ -1949,9 +2046,9 @@ static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
-    int req_id, const NpAuthGetAuthorizationCodeParameterV3* param, void* auth_code,
-    int* issuer_id) {
+static int KYTY_SYSV_ABI
+NpAuthGetAuthorizationCodeV3(int req_id, const NpAuthGetAuthorizationCodeParameterV3* param,
+                             void* auth_code, int* issuer_id) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1983,7 +2080,7 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
 }
 
 static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenParameterV3* param,
-                                        void* id_token) {
+                                            void* id_token) {
 	PRINT_NAME();
 
 	LOGF("\t req_id   = %d\n", req_id);
@@ -2027,12 +2124,13 @@ namespace LibNpGameIntent {
 
 LIB_VERSION("NpGameIntent", 1, "NpGameIntent", 1, 1);
 
-constexpr int    NP_GAME_INTENT_ERROR_INVALID_ARGUMENT = -2141898748; /* 0x80553804 */
-constexpr int    NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND = -2141898746; /* 0x80553806 */
-constexpr int    NP_GAME_INTENT_ERROR_VALUE_NOT_FOUND  = -2141898745; /* 0x80553807 */
-constexpr int    NP_GAME_INTENT_USER_ID_INVALID        = -1;
-constexpr size_t NP_GAME_INTENT_TYPE_MAX_SIZE          = 33;
-constexpr size_t NP_GAME_INTENT_DATA_MAX_SIZE          = 16 * 1024 + 1;
+constexpr int    NP_GAME_INTENT_ERROR_INVALID_ARGUMENT    = -2141898748; /* 0x80553804 */
+constexpr int    NP_GAME_INTENT_ERROR_INSUFFICIENT_BUFFER = -2141898747; /* 0x80553805 */
+constexpr int    NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND    = -2141898746; /* 0x80553806 */
+constexpr int    NP_GAME_INTENT_ERROR_VALUE_NOT_FOUND     = -2141898745; /* 0x80553807 */
+constexpr int    NP_GAME_INTENT_USER_ID_INVALID           = -1;
+constexpr size_t NP_GAME_INTENT_TYPE_MAX_SIZE             = 33;
+constexpr size_t NP_GAME_INTENT_DATA_MAX_SIZE             = 16 * 1024 + 1;
 
 struct NpGameIntentData {
 	uint8_t data[NP_GAME_INTENT_DATA_MAX_SIZE];
@@ -2051,11 +2149,17 @@ struct NpGameIntentInfo {
 static_assert(sizeof(NpGameIntentData) == 16392);
 static_assert(sizeof(NpGameIntentInfo) == 16704);
 
+static std::atomic_int g_launch_intent = 0; // 1: event queued, 2: intent received
+
 static int KYTY_SYSV_ABI NpGameIntentInitialize(const void* init_param) {
 	PRINT_NAME();
 
 	LOGF("\t init_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(init_param));
 
+	int idle = 0;
+	if (!Config::GetLaunchActivity().empty() && g_launch_intent.compare_exchange_strong(idle, 1)) {
+		SystemService::NotifyEvent(SystemService::SYSTEM_SERVICE_EVENT_GAME_INTENT);
+	}
 	return 0;
 }
 
@@ -2070,7 +2174,7 @@ static int KYTY_SYSV_ABI NpGameIntentReceiveIntent(NpGameIntentInfo* intent_info
 
 	LOGF("\t intent_info = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(intent_info));
 
-	if (intent_info == nullptr) {
+	if (intent_info == nullptr || intent_info->size != sizeof(NpGameIntentInfo)) {
 		return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
 	}
 
@@ -2078,7 +2182,15 @@ static int KYTY_SYSV_ABI NpGameIntentReceiveIntent(NpGameIntentInfo* intent_info
 	std::memset(intent_info->intent_type, 0, sizeof(intent_info->intent_type));
 	std::memset(&intent_info->intent_data, 0, sizeof(intent_info->intent_data));
 
-	return NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND;
+	int queued = 1;
+	if (!g_launch_intent.compare_exchange_strong(queued, 2)) {
+		return NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND;
+	}
+	const auto data      = nlohmann::json {{"activityId", Config::GetLaunchActivity()}}.dump();
+	intent_info->user_id = Config::GetUserId();
+	std::strcpy(intent_info->intent_type, "launchActivity");
+	std::memcpy(intent_info->intent_data.data, data.data(), data.size());
+	return 0;
 }
 
 static int KYTY_SYSV_ABI NpGameIntentGetPropertyValueString(const NpGameIntentData* intent_data,
@@ -2093,12 +2205,25 @@ static int KYTY_SYSV_ABI NpGameIntentGetPropertyValueString(const NpGameIntentDa
 	     reinterpret_cast<uint64_t>(intent_data), key != nullptr ? key : "(null)",
 	     reinterpret_cast<uint64_t>(value_buf), buf_size);
 
-	if (intent_data == nullptr || key == nullptr || value_buf == nullptr || buf_size == 0) {
+	if (intent_data == nullptr || key == nullptr || key[0] == '\0' || value_buf == nullptr ||
+	    buf_size == 0) {
 		return NP_GAME_INTENT_ERROR_INVALID_ARGUMENT;
 	}
 
-	value_buf[0] = '\0';
-	return NP_GAME_INTENT_ERROR_VALUE_NOT_FOUND;
+	std::memset(value_buf, 0, buf_size);
+	const auto* json  = reinterpret_cast<const char*>(intent_data->data);
+	const auto  data  = nlohmann::json::parse(json, json + strnlen(json, sizeof(intent_data->data)),
+	                                          nullptr, false);
+	const auto  it    = data.find(key);
+	const auto* value = it != data.end() ? it->get_ptr<const std::string*>() : nullptr;
+	if (value == nullptr || value->empty()) {
+		return NP_GAME_INTENT_ERROR_VALUE_NOT_FOUND;
+	}
+	if (value->size() >= buf_size) {
+		return NP_GAME_INTENT_ERROR_INSUFFICIENT_BUFFER;
+	}
+	std::memcpy(value_buf, value->data(), value->size());
+	return 0;
 }
 
 LIB_DEFINE(InitNet_1_NpGameIntent) {
@@ -2167,8 +2292,8 @@ static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_si
 	return id;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
-                                                   NpWebApi2MemoryPoolStats* stats) {
+static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int                       lib_ctx_id,
+                                                     NpWebApi2MemoryPoolStats* stats) {
 	if (stats == nullptr) {
 		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
 	}
@@ -2176,7 +2301,7 @@ static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
 		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
 	}
 	std::lock_guard lock(g_np_webapi2_context_mutex);
-	const auto context = g_np_webapi2_contexts.find(lib_ctx_id);
+	const auto      context = g_np_webapi2_contexts.find(lib_ctx_id);
 	if (context == g_np_webapi2_contexts.end()) {
 		return NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
 	}
@@ -2472,7 +2597,8 @@ static int KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
 		return NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID;
 	}
 	std::lock_guard lock(g_np_webapi2_context_mutex);
-	return g_np_webapi2_contexts.erase(lib_ctx_id) != 0 ? OK : NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
+	return g_np_webapi2_contexts.erase(lib_ctx_id) != 0 ? OK
+	                                                    : NP_WEBAPI2_ERROR_LIB_CONTEXT_NOT_FOUND;
 }
 
 LIB_DEFINE(InitNet_1_NpWebApi2) {
@@ -2852,7 +2978,8 @@ static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingSta
 	return OK;
 }
 
-static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
+static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int       type,
+                                                                         uint32_t* count) {
 	PRINT_NAME();
 
 	if (type < 1 || type > 3 || count == nullptr) {
@@ -2959,6 +3086,7 @@ LIB_DEFINE(InitNet_1) {
 	LibNetCtl::InitNet_1_NetCtl(s);
 	LibNpCommerce::InitNet_1_NpCommerce(s);
 	LibNpManager::InitNet_1_NpManager(s);
+	LibNpPartner::InitNet_1_NpPartner(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
 	LibNpEntitlementAccessPft::InitNet_1_NpEntitlementAccessPft(s);

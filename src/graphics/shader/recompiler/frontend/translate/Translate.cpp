@@ -5,6 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -77,7 +82,10 @@ Decoder::Operand Translator::ScalarDestinationOperand(const Decoder::Operand& op
 	}
 	code += offset;
 	Decoder::Operand result {};
-	if (code < 106u) {
+	// Trap temporaries stay in the trap range; plain SGPRs keep the
+	// historical VCC crossover so s105+1 still addresses VCC_LO.
+	const bool trap = operand.kind == Decoder::OperandKind::Sgpr && operand.reg >= IR::FirstTrapReg;
+	if (code < 106u || (trap && code < IR::NumScalarRegs)) {
 		result.kind = Decoder::OperandKind::Sgpr;
 		result.reg  = code;
 	} else {
@@ -125,6 +133,12 @@ std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 // a lane the host does not run never clears its bit, and a waterfall loop waiting for EXEC to
 // empty would spin forever (tessellation vertex shaders on a 32-lane host).
 std::array<IR::U32, 2> Translator::PresentMask() {
+	// Wave32 keeps the words as written: EXEC_HI is a plain SGPR there, and a partial wave32
+	// reads back the EXEC_LO it wrote (ScalarOrn2SaveexecB32 cases). Only wave64 is masked.
+	if (program.wave_size != 64u) {
+		const auto all = IR::U32(IR::Value(~0u));
+		return {all, all};
+	}
 	if (program.stage == ShaderType::Pixel) {
 		const auto mask = ir.Emit(IR::ValueOpcode::LiveMask);
 		return {ir.CompositeExtract(mask, 0),
@@ -186,6 +200,9 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 // Scalar operands share one encoded namespace with VCC, M0, and EXEC aliases.
 IR::U32 Translator::ReadScalarCode(uint32_t code) {
 	if (code < 106u) {
+		return ir.GetScalarReg(static_cast<IR::ScalarReg>(code));
+	}
+	if (code >= IR::FirstTrapReg && code < IR::NumScalarRegs) {
 		return ir.GetScalarReg(static_cast<IR::ScalarReg>(code));
 	}
 	switch (code) {
@@ -621,6 +638,17 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 }
 
 IR::U1 Translator::ThreadBit(const std::array<IR::U32, 2>& mask) {
+	const auto constant_bit = [](IR::U32 word) -> std::optional<bool> {
+		if (!word.IsImmediate() || (word.U32() != 0u && word.U32() != UINT32_MAX)) {
+			return std::nullopt;
+		}
+		return word.U32() != 0u;
+	};
+	const auto low  = constant_bit(mask[0]);
+	const auto high = program.wave_size == 64u ? constant_bit(mask[1]) : low;
+	if (low && high && *low == *high) {
+		return IR::U1(IR::Value(*low));
+	}
 	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto word = program.wave_size == 64u
 	                      ? ir.Select(ir.ULessThan(lane, IR::U32(IR::Value(32u))), mask[0], mask[1])
@@ -704,7 +732,7 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value,
 			ir.SetScalarReg(reg, mask[0]);
 			program.scalar_writes.push_back({current_pc, reg, mask[0]});
 			// A wave32 VALU mask destination must not overwrite the neighboring SGPR.
-			if ((write_64 || program.wave_size == 64u) &&
+			if ((write_64 || program.wave_size == 64u) && IR::RegIndex(reg) + 1u != IR::NumSgprs &&
 			    IR::RegIndex(reg) + 1u < IR::NumScalarRegs) {
 				const auto high = static_cast<IR::ScalarReg>(IR::RegIndex(reg) + 1u);
 				ir.SetScalarReg(high, mask[1]);
@@ -1009,11 +1037,47 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	}
 }
 
+// shortcut: measurement only (KYTY_PERF_STATS=1); remove with the S3/S4 counters. Logs the
+// SAVEEXEC forms that were refused before they were decoded.
+void CountNewSaveexecForms(const Decoder::Program& decoded, uint64_t shader_hash) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_STATS");
+		return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	using O = Decoder::Opcode;
+	for (const auto& inst: decoded.instructions) {
+		switch (inst.opcode) {
+			case O::S_OR_SAVEEXEC_B32:
+			case O::S_XOR_SAVEEXEC_B32:
+			case O::S_ANDN2_SAVEEXEC_B32:
+			case O::S_NAND_SAVEEXEC_B32:
+			case O::S_NOR_SAVEEXEC_B32:
+			case O::S_XNOR_SAVEEXEC_B32:
+			case O::S_ORN1_SAVEEXEC_B32:
+			case O::S_OR_SAVEEXEC_B64:
+			case O::S_XOR_SAVEEXEC_B64:
+			case O::S_ANDN2_SAVEEXEC_B64:
+			case O::S_NAND_SAVEEXEC_B64:
+			case O::S_NOR_SAVEEXEC_B64:
+			case O::S_XNOR_SAVEEXEC_B64:
+			case O::S_ORN1_SAVEEXEC_B64:
+				std::printf("PERF arifix-s1 shader=0x%016" PRIx64 " opcode=0x%02x pc=0x%x\n",
+				            shader_hash, inst.opcode_id, inst.pc);
+				break;
+			default: break;
+		}
+	}
+}
+
 } // namespace
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options) {
 	ValidateTranslateOptions(options);
+	CountNewSaveexecForms(decoded, options.shader_hash);
 	if (cfg.blocks.empty()) {
 		EXIT("cannot translate an empty CFG");
 	}
@@ -1145,7 +1209,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		};
 		for (uint32_t index = 0; index < options.user_data_count; index++) {
 			const auto reg = static_cast<IR::ScalarReg>(options.user_data_base + index);
-			if (IR::RegIndex(reg) >= IR::NumScalarRegs) {
+			if (IR::RegIndex(reg) >= IR::NumSgprs) {
 				break;
 			}
 			const auto value = entry_ir.GetUserData(reg);

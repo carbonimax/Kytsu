@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/onceValue.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -294,10 +295,11 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 // the state keeps the union of stages and accesses for the next real transition.
 bool ElideReadOnlyDepthBarrier(const VulkanImageState& state, vk::ImageLayout destination_layout,
                                vk::AccessFlags2 write_access) {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_RO_DEPTH_ELIDE");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	}));
 	if (!enabled || state.layout != destination_layout || (state.access_mask & write_access)) {
 		return false;
 	}
@@ -574,8 +576,11 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	return {source_layers, destination_layers};
 }
 
-void Image::CopyImage(Image& source) {
+void Image::CopyImage(Image& source, bool stencil) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	EXIT_IF(stencil &&
+	        (!(FullAspectMask(source.backing.format) & vk::ImageAspectFlagBits::eStencil) ||
+	         !(FullAspectMask(backing.format) & vk::ImageAspectFlagBits::eStencil)));
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	uint32_t       base_depth = source.backing.extent.depth;
@@ -585,9 +590,11 @@ void Image::CopyImage(Image& source) {
 		base_depth = backing.extent.depth;
 	}
 	const auto source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
+	            : FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
+	            : FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller

@@ -19,7 +19,8 @@ inline const std::string LongFilename = std::string(160, 'a') + ".bin";
 
 // Both Common::File and guest filesystem tests read the same archive layout.
 inline bool CreateArchive(const std::filesystem::path &path,
-                          std::span<const uint8_t> payload) {
+                          std::span<const uint8_t> payload,
+                          std::string_view entitlement_config = {}) {
   struct Output {
     std::filesystem::path path;
     std::ofstream stream;
@@ -55,6 +56,10 @@ inline bool CreateArchive(const std::filesystem::path &path,
         !add("assets/subdir/data.bin", payload.data(), payload.size()) ||
         !add(UnicodeFilename, Eboot.data(), Eboot.size()) ||
         !add(LongFilename, Eboot.data(), Eboot.size())) {
+      return false;
+    }
+    if (!entitlement_config.empty() &&
+        !add("dlc_emu.ini", entitlement_config.data(), entitlement_config.size())) {
       return false;
     }
     writer.Finalize();

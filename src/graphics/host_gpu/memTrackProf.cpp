@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/memTrackProf.h"
+#include "common/onceValue.h"
 
 #include <algorithm>
 #include <array>
@@ -102,10 +103,11 @@ const char* KindName(ThreadKind kind) {
 } // namespace
 
 bool Enabled() noexcept {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_MEMTRACK_PROF");
 		return value != nullptr && std::atoi(value) != 0;
-	}();
+	}));
 	return enabled;
 }
 

@@ -470,6 +470,10 @@ void TestRumbleFallbackGains() {
 	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 16383,
 	      "rumble fallback ignored per-channel gains");
 	queue({0.5f, 0.0f});
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 16383,
+	      "rumble fallback level changes were not rate limited");
+	now += 16; // Level changes are sent at most once per rumble interval.
+	queue({0.5f, 0.0f});
 	Check(pad_rumble[2].large == 32767 && pad_rumble[2].small == 0,
 	      "rumble fallback swapped per-channel gains");
 	queue({0.0f, 0.0f});

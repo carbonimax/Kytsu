@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "common/emulatorConfig.h"
+#include "common/onceValue.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -8,6 +9,7 @@
 #include "graphics/shader/shaderPretranslate.h"
 #include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -72,18 +74,20 @@ std::tm LocalNow() noexcept {
 } // namespace
 
 bool Enabled() noexcept {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && std::atoi(value) != 0;
-	}();
+	}));
 	return enabled;
 }
 
 static int BindProfMode() noexcept {
-	static const int mode = [] {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	const auto mode = static_cast<int>(Common::Once(mode_once, [] {
 		const char* value = std::getenv("KYTY_BIND_PROF");
 		return Enabled() && value != nullptr ? std::atoi(value) : 0;
-	}();
+	}));
 	return mode;
 }
 
@@ -97,11 +101,20 @@ bool BackProfEnabled() noexcept {
 }
 
 bool SrtProfEnabled() noexcept {
-	static const bool enabled = [] {
+	static std::atomic<int64_t> enabled_once {Common::OnceUnset};
+	const auto enabled = static_cast<bool>(Common::Once(enabled_once, [] {
 		const char* value = std::getenv("KYTY_SRT_PROF");
 		return Enabled() && value != nullptr && std::atoi(value) != 0;
-	}();
+	}));
 	return enabled;
+}
+
+bool BindMemoStatsEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BIND_MEMO_STATS");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled && CpPipeline::IsBackThread();
 }
 
 void Add(Counter counter, uint64_t value) noexcept {
@@ -331,6 +344,12 @@ void MaybeReport() noexcept {
 	std::printf("PERF frames %.1fs: f33=%" PRIu64 " f50=%" PRIu64 " f67=%" PRIu64 " flong=%" PRIu64 "\n",
 	            seconds, n(Counter::Frames33), n(Counter::Frames50), n(Counter::Frames67),
 	            n(Counter::FramesLong));
+	if (n(Counter::RiKept) + n(Counter::RiChecked) != 0) {
+		std::printf("PERF resolveinplace %.1fs: frames=%" PRIu64 " kept=%" PRIu64 " checked=%" PRIu64 " diffs=%" PRIu64
+		            " resource_diffs=%" PRIu64 " raced=%" PRIu64 "\n",
+		            seconds, n(Counter::Frames), n(Counter::RiKept), n(Counter::RiChecked), n(Counter::RiDiffs),
+		            n(Counter::RiResourceDiffs), n(Counter::RiRaced));
+	}
 	if (n(Counter::TessMissLs) + n(Counter::TessMissHs) + n(Counter::TessMissDs) +
 	        n(Counter::TessDeferredDraws) !=
 	    0) {
@@ -399,6 +418,25 @@ void MaybeReport() noexcept {
 		            n(Counter::SrtFormatSpec), ms(Counter::BindFindImageNs), ms(Counter::BindSamplerNs),
 		            ms(Counter::BindObtainNs), ms(Counter::BindUploadNs), ms(Counter::BindViewNs));
 	}
+	if (n(Counter::BmCalls) + n(Counter::FbSlots) != 0) {
+		std::printf("PERF bindmemo %.1fs: frames=%" PRIu64 " calls=%" PRIu64 "(%.2fms,clock=%.2fms) null=%" PRIu64
+		            "(%.2fms) written=%" PRIu64 "(%.2fms) stream=%" PRIu64 "(%.2fms) work=%" PRIu64 "(%.2fms) clean=%" PRIu64
+		            "(%.2fms) texel=%" PRIu64 "(%.2fms) slot_hit=%" PRIu64 "(%.2fms) slot_texel=%" PRIu64 "(%.2fms) slot_diff=%" PRIu64
+		            " range_hit=%" PRIu64 "(%.2fms) find=%" PRIu64 "(%.2fms,clock=%.2fms) find_hit=%" PRIu64 "(%.2fms)\n",
+		            seconds, n(Counter::Frames), n(Counter::BmCalls), ms(Counter::BmNs), ms(Counter::BmClockNs),
+		            n(Counter::BmNull), ms(Counter::BmNullNs), n(Counter::BmWritten), ms(Counter::BmWrittenNs),
+		            n(Counter::BmStream), ms(Counter::BmStreamNs), n(Counter::BmWork), ms(Counter::BmWorkNs),
+		            n(Counter::BmClean), ms(Counter::BmCleanNs), n(Counter::BmTexel), ms(Counter::BmTexelNs),
+		            n(Counter::BmSlotHit), ms(Counter::BmSlotHitNs), n(Counter::BmSlotTexel), ms(Counter::BmSlotTexelNs),
+		            n(Counter::BmSlotDiff), n(Counter::BmRangeHit), ms(Counter::BmRangeHitNs), n(Counter::FbSlots),
+		            ms(Counter::FbNs), ms(Counter::FbClockNs), n(Counter::FbHit), ms(Counter::FbHitNs));
+	}
+	if (n(Counter::BvFindChecked) + n(Counter::BvBindChecked) + n(Counter::BvBindMisses) != 0) {
+		std::printf("PERF bindverify %.1fs: find_checked=%" PRIu64 " find_diffs=%" PRIu64 " bind_checked=%" PRIu64
+		            " bind_diffs=%" PRIu64 " bind_raced=%" PRIu64 " bind_misses=%" PRIu64 "\n",
+		            seconds, n(Counter::BvFindChecked), n(Counter::BvFindDiffs), n(Counter::BvBindChecked),
+		            n(Counter::BvBindDiffs), n(Counter::BvBindRaced), n(Counter::BvBindMisses));
+	}
 	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0 || walk.reuse_checks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64
 		            " fault_reads=%" PRIu64 " protected_calls=%" PRIu64 "(%.0fms,synced=%" PRIu64 ") evictions=%" PRIu64
@@ -417,6 +455,14 @@ void MaybeReport() noexcept {
 		            n(Counter::AsyncBlockWrites), n(Counter::AsyncBlockDepthOnly), n(Counter::AsyncBlockQuery),
 		            n(Counter::AsyncBlockPasses), n(Counter::AsyncBlockCap));
 	}
+	if (n(Counter::DescSetAllocs) + n(Counter::DescPoolCreates) != 0) {
+		static uint64_t pools = 0; // pools are only destroyed with their heap: created = alive
+		pools += n(Counter::DescPoolCreates);
+		std::printf("PERF descheap %.1fs: sets=%" PRIu64 " pool_full=%" PRIu64 " resets=%" PRIu64
+		            " created=%" PRIu64 " pools=%" PRIu64 "\n",
+		            seconds, n(Counter::DescSetAllocs), n(Counter::DescPoolFull), n(Counter::DescPoolResets),
+		            n(Counter::DescPoolCreates), pools);
+	}
 	if (const auto* bounds = g_bounds_counters.load(std::memory_order_relaxed); bounds != nullptr) {
 		// Totals since launch; nonzero_loads must stay 0.
 		std::printf("PERF bounds verify: oob_loads=%u nonzero_loads=%u oob_stores=%u tail_reads=%u\n",
@@ -430,6 +476,7 @@ void MaybeReport() noexcept {
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	MemTrackProf::Report(seconds, n(Counter::Frames));
 	LateRead::Report(seconds, n(Counter::Frames));
+	LibKernel::Memory::ReportSparseCopyCache();
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
 	LibKernel::IoStats::Report(seconds);

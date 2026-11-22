@@ -267,12 +267,21 @@ uint32_t GetTrophyDurationSeconds() {
 	return std::clamp(g_config->trophy_duration_seconds, 5u, 10u);
 }
 
+uint32_t UnrealScreenPercentage() {
+	const auto percentage = g_config->unreal_screen_percentage;
+	return percentage >= 10 && percentage <= 200 ? percentage : 0;
+}
+
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
 bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
+}
+
+const std::string& GetLaunchActivity() {
+	return g_config->launch_activity;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

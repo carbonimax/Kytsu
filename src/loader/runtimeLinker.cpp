@@ -21,10 +21,10 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/libcStdio.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
-#include "loader/jit.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -32,6 +32,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -45,7 +46,12 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <pthread.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(__x86_64__)
+#include <asm/prctl.h>
+#endif
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -65,34 +71,8 @@ Program::Program() = default;
 
 Program::~Program() = default;
 
-static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
-	if (block == nullptr || block->ptr == nullptr) {
-		return;
-	}
-
-	if (block->free_func != nullptr) {
-		block->free_func(block->ptr);
-	} else if (block->vm_alloc) {
-		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(reinterpret_cast<uint64_t>(block->ptr),
-		                                                  block->alloc_size));
-	} else {
-		delete[] block->ptr;
-	}
-
-	block->ptr        = nullptr;
-	block->free_func  = nullptr;
-	block->vm_alloc   = false;
-	block->alloc_size = 0;
-}
-
 static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value;
-}
-
-ThreadLocalStorage::~ThreadLocalStorage() {
-	for (auto& [_, block]: tlss) {
-		FreeTlsBlock(&block);
-	}
 }
 
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
@@ -122,9 +102,14 @@ struct StubbedImportRecord {
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
 	std::string program;
+	std::unique_ptr<std::atomic_uint32_t> call_count = std::make_unique<std::atomic_uint32_t>(0);
 };
 
-static std::vector<StubbedImportRecord> g_stubbed_imports;
+constexpr uint32_t UNRESOLVED_STUB_LOGS_PER_SYMBOL = 8;
+
+// A deque: a module loaded later appends records while guest threads call earlier stubs, and
+// push_back must not move the records those calls read.
+static std::deque<StubbedImportRecord>  g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
@@ -175,8 +160,15 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 
 static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
                                       const RelocationInfo& ri) {
-	for (const auto& record: g_stubbed_imports) {
+	const auto program_name = program != nullptr ? Common::PathToString(program->file_name) : "";
+
+	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr == ri.vaddr) {
+			record.index   = index;
+			record.name    = ri.name;
+			record.type    = ri.type;
+			record.bind    = ri.bind;
+			record.program = program_name;
 			return record.thunk_vaddr;
 		}
 	}
@@ -187,8 +179,8 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	record.name        = ri.name;
 	record.type        = ri.type;
 	record.bind        = ri.bind;
-	record.program     = Common::PathToString(program->file_name);
-	g_stubbed_imports.push_back(record);
+	record.program     = program_name;
+	g_stubbed_imports.push_back(std::move(record));
 	const auto record_id                     = g_stubbed_imports.size() - 1;
 	const auto thunk                         = AllocateUnresolvedImportThunk(record_id);
 	g_stubbed_imports[record_id].thunk_vaddr = thunk;
@@ -198,20 +190,20 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
-		if (record_id < g_stubbed_imports.size()) {
-			const auto& record = g_stubbed_imports[record_id];
+	if (record_id < g_stubbed_imports.size()) {
+		const auto& record = g_stubbed_imports[record_id];
+		if (record.call_count->fetch_add(1) < UNRESOLVED_STUB_LOGS_PER_SYMBOL) {
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
 			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
 			     record.program.c_str());
-		} else {
-			printf("Unresolved import stub called: <bad-record>\n");
-			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
-			     log_index, record_id);
 		}
+	} else if (log_index < UNRESOLVED_STUB_LOGS_PER_SYMBOL) {
+		printf("Unresolved import stub called: <bad-record>\n");
+		LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
+		     log_index, record_id);
 	}
 	return 0;
 }
@@ -225,9 +217,7 @@ constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
 static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 static uint64_t g_invalid_memory    = 0;
 
-static Program*              g_tls_main_program        = nullptr;
-static thread_local Program* g_tls_cached_main_program = nullptr;
-static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
+static Program* g_tls_main_program = nullptr;
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
@@ -453,6 +443,34 @@ bool TestMainEntryUsesGuestStack() {
 	const bool freed   = Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size);
 	return state.called && rsp_ok && root_ok && teb_ok && freed;
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static KYTY_SYSV_ABI void TestDebugPrintCallback(EntryParams* params,
+                                                 atexit_func_t /*atexit_func*/) {
+	auto* returned = reinterpret_cast<bool*>(const_cast<char*>(params->argv[0]));
+	// Host libraries (SDL, loaders, drivers) call these from HLE code that runs on
+	// guest stacks; both raise informational exceptions internally.
+	OutputDebugStringW(L"kyty guest-stack debug print (wide)\n");
+	OutputDebugStringA("kyty guest-stack debug print (ansi)\n");
+	*returned = true;
+}
+
+bool TestDebugPrintOnGuestStack() {
+	constexpr uint64_t stack_size = 0x10000;
+	const auto         stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "debug_print_stack_test");
+	if (stack_base == 0) {
+		return false;
+	}
+	bool        returned = false;
+	EntryParams params {};
+	params.argv[0] = reinterpret_cast<const char*>(&returned);
+	RunEntry(reinterpret_cast<uint64_t>(TestDebugPrintCallback), &params, nullptr,
+	         reinterpret_cast<void*>(stack_base + stack_size));
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size);
+	return returned && freed;
+}
+#endif
 
 bool TestModuleRelocationUsesWritableHostMapping() {
 	constexpr uint64_t page_size = 0x4000;
@@ -828,6 +846,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			                           info->r11, info->r12, info->r13, info->r14, info->r15};
 			Libs::Graphics::DescribeImportFault(values, sizeof(values) / sizeof(values[0]));
 		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			uint64_t nearest_begin = 0;
+			uint64_t nearest_end   = 0;
+			if (Libs::LibKernel::Memory::DescribeNearestGpuMapping(info->access_violation_vaddr,
+			                                                     &nearest_begin, &nearest_end)) {
+				std::printf("nearest guest mapping: [0x%016" PRIx64 " .. 0x%016" PRIx64 ")\n",
+				            nearest_begin, nearest_end);
+			} else {
+				std::printf("nearest guest mapping: (none known)\n");
+			}
+		}
 		std::fflush(stdout);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Host call stack from the faulting context (unwind data only, no symbols): identifies
@@ -1028,6 +1057,11 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool jmprela_table) {
 	KYTY_PROFILER_FUNCTION();
 
+	// A no-op; report it as done so it is not stubbed and patched at base_vaddr + r_offset.
+	if (r->GetType() == R_X86_64_NONE) {
+		return true;
+	}
+
 	const auto ri      = GetRelocationInfo(r, program);
 	auto       value   = ri.value;
 	bool       stubbed = false;
@@ -1048,12 +1082,14 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	}
 
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
-	if (patched && stubbed) {
-		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
+	if (patched && !ri.resolved) {
+		// Unresolved objects point at no-access memory, so the first read faults far from here.
+		// This line names the missing data export.
+		LOGF("Relocate: unresolved %s import patched to %s [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
-		     jmprela_table ? "PLT" : "non-PLT", index, ri.vaddr, value, ri.name.c_str(),
-		     magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
-		     Common::PathToString(program->file_name).c_str());
+		     jmprela_table ? "PLT" : "non-PLT", stubbed ? "stub" : "invalid memory", index,
+		     ri.vaddr, value, ri.name.c_str(), magic_enum::enum_name(ri.type),
+		     magic_enum::enum_name(ri.bind), Common::PathToString(program->file_name).c_str());
 	}
 
 	if (program->dbg_print_reloc && patched && !ri.bind_self &&
@@ -1067,6 +1103,24 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	return ri.resolved;
 }
 
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestRelocationSkipsNoneEntries() {
+	constexpr uint64_t sentinel = 0x4b59545950415443;
+	uint64_t           words[2] = {sentinel, sentinel};
+
+	Program program;
+	program.base_vaddr   = reinterpret_cast<uint64_t>(words);
+	program.dynamic_info = std::make_unique<DynamicInfo>();
+	Elf64_Rela none {};
+	Elf64_Rela relative {.r_offset = 8, .r_info = R_X86_64_RELATIVE, .r_addend = 0x40};
+
+	const bool none_done     = RelocateRecord(0, &none, &program, false);
+	const bool relative_done = RelocateRecord(1, &relative, &program, false);
+	return none_done && relative_done && words[0] == sentinel &&
+	       words[1] == program.base_vaddr + 0x40;
+}
+#endif
+
 static void ForEachRelocation(Program* program, auto&& func) {
 	const auto& info = *program->dynamic_info;
 	for (uint32_t i = 0; i < info.rela_table_total_size / sizeof(Elf64_Rela); ++i) {
@@ -1077,23 +1131,121 @@ static void ForEachRelocation(Program* program, auto&& func) {
 	}
 }
 
-static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
-	EXIT_IF(g_tls_main_program == nullptr);
+// Guest code reads its TCB from fs:[0], which the host owns, so PatchGuestCode rewrites those reads
+// to gs:[TcbGsOffset()]. On Linux the gs base is the TCB, whose first qword points to itself;
+// Windows (TEB TLS slots) and macOS (TSD slots) hold the TCB in a host slot at that offset.
+// x86-64 hosts only: elsewhere guest code runs through FEX, which keeps the guest's fs:[0] reads
+// and points each guest thread's FS at its own TCB, so the host just remembers that TCB.
+struct TlsBlock {
+	uint8_t* ptr  = nullptr;
+	uint64_t size = 0;
+};
 
-	if (g_tls_cached_main_program == g_tls_main_program && g_tls_cached_main_tcb != nullptr) {
-		return g_tls_cached_main_tcb;
-	}
+struct Tcb {
+	Tcb*                   self;
+	std::vector<TlsBlock>* dtv; // indexed by ThreadLocalStorage::index
+};
 
-	g_tls_cached_main_program = g_tls_main_program;
-	g_tls_cached_main_tcb =
-	    RuntimeLinker::TlsGetAddr(g_tls_main_program) + g_tls_main_program->tls.tcb_offset;
-	return g_tls_cached_main_tcb;
+#if defined(__x86_64__) || defined(_M_X64)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Allocated before main: host libraries loaded later can use up the slots at a fixed TEB offset.
+static const DWORD g_tcb_slot = TlsAlloc();
+
+static uint32_t TcbGsOffset() {
+	return 0x1480 + 8 * g_tcb_slot;
 }
 
-static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
-	EXIT_IF(program == nullptr);
-	EXIT_IF(program->elf == nullptr);
+void RuntimeLinker::SetThreadTcb(void* tcb) {
+	EXIT_IF(g_tcb_slot >= 64); // later slots are not at a fixed TEB offset
+	EXIT_IF(TlsSetValue(g_tcb_slot, tcb) == 0);
+}
+#elif defined(__APPLE__)
+static pthread_key_t TcbKey() {
+	static const pthread_key_t key = [] {
+		pthread_key_t k {};
+		EXIT_IF(pthread_key_create(&k, nullptr) != 0);
+		return k;
+	}();
+	return key;
+}
 
+static uint32_t TcbGsOffset() {
+	return 8 * TcbKey();
+}
+
+void RuntimeLinker::SetThreadTcb(void* tcb) {
+	EXIT_IF(pthread_setspecific(TcbKey(), tcb) != 0);
+}
+#else
+static uint32_t TcbGsOffset() {
+	return 0;
+}
+
+void RuntimeLinker::SetThreadTcb(void* tcb) {
+	EXIT_IF(syscall(SYS_arch_prctl, ARCH_SET_GS, tcb) != 0);
+}
+#endif
+
+void* RuntimeLinker::GetThreadTcb() {
+	void* tcb = nullptr;
+	asm volatile("movq %%gs:(%1), %0" : "=r"(tcb) : "r"(static_cast<uint64_t>(TcbGsOffset())));
+	return tcb;
+}
+#else
+static thread_local void* g_thread_tcb = nullptr;
+
+void RuntimeLinker::SetThreadTcb(void* tcb) {
+	g_thread_tcb = tcb;
+}
+
+void* RuntimeLinker::GetThreadTcb() {
+	return g_thread_tcb;
+}
+#endif
+
+static TlsBlock AllocateTlsBlock(const ThreadLocalStorage& tls, uint64_t size) {
+	auto* ptr = reinterpret_cast<uint8_t*>(Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, size, Common::VirtualMemory::Mode::ReadWrite, "thread_local_storage"));
+	EXIT_IF(ptr == nullptr);
+	std::memcpy(ptr, reinterpret_cast<const void*>(tls.image_vaddr), tls.init_size);
+	std::memset(ptr + tls.init_size, 0, size - tls.init_size);
+	return {ptr, size};
+}
+
+void RuntimeLinker::CreateThreadTls() {
+	constexpr uint64_t TCB_SIZE = 0x40;
+
+	const auto tls =
+	    g_tls_main_program != nullptr ? g_tls_main_program->tls : ThreadLocalStorage {};
+	const auto block = AllocateTlsBlock(tls, tls.image_size + TCB_SIZE);
+	auto*      tcb   = reinterpret_cast<Tcb*>(block.ptr + tls.image_size);
+	tcb->self        = tcb;
+	tcb->dtv         = new std::vector<TlsBlock> {block};
+	SetThreadTcb(tcb);
+}
+
+void RuntimeLinker::DeleteThreadTls() {
+	auto* dtv = static_cast<Tcb*>(GetThreadTcb())->dtv;
+	for (const auto& block: *dtv) {
+		EXIT_IF(block.ptr != nullptr && !Libs::LibKernel::Memory::FreeGuestMemory(
+		                                    reinterpret_cast<uint64_t>(block.ptr), block.size));
+	}
+	delete dtv;
+}
+
+uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
+	auto&      dtv   = *static_cast<Tcb*>(GetThreadTcb())->dtv;
+	const auto index = program->tls.index;
+	if (index >= dtv.size()) {
+		dtv.resize(index + 1);
+	}
+	if (dtv[index].ptr == nullptr) {
+		dtv[index] = AllocateTlsBlock(program->tls, program->tls.image_size);
+	}
+	return dtv[index].ptr;
+}
+
+void RuntimeLinker::PatchGuestCode(uint64_t address, uint64_t size) {
 	if (size >= 12) {
 		// Replace guest stack-canary/errno stores through fs:[0x28] with nops.
 		// Windows x64 cannot host guest FS directly, and an unpatched shared-library access faults
@@ -1118,55 +1270,20 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		}
 	}
 
-	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 &&
-	    size >= Jit::Call9::GetSize()) {
-		// Replace:
-		//   66 66 66
-		//   mov <reg>, qword ptr fs:[0x00]
-		// with:
-		//   call <handler>
-		//   mov <reg>,rax
-		//   nop ...
-		const uint8_t tls_pattern[5]       = {0x64, 0x48, 0x8B, 0x00, 0x25};
-		const uint8_t zero_displacement[4] = {};
-
-		EXIT_IF(Jit::Call9::GetSize() != 9);
-
-		auto* start_ptr = reinterpret_cast<uint8_t*>(address);
-		auto* end_ptr   = start_ptr + size - Jit::Call9::GetSize();
-
-		for (auto* ptr = start_ptr; ptr <= end_ptr; ptr++) {
-			auto*  inst_ptr     = ptr;
-			size_t prefix_count = 0;
-			while (prefix_count < 3 && inst_ptr < start_ptr + size && *inst_ptr == 0x66) {
-				inst_ptr++;
-				prefix_count++;
-			}
-
-			if (inst_ptr + Jit::Call9::GetSize() > start_ptr + size) {
-				break;
-			}
-
-			const uint8_t modrm = inst_ptr[3];
-			if (memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
-			    inst_ptr[4] == tls_pattern[4] &&
-			    memcmp(inst_ptr + 5, zero_displacement, sizeof(zero_displacement)) == 0) {
-				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(inst_ptr));
-
-				const auto reg = (modrm >> 3u) & 7u;
-				EXIT_NOT_IMPLEMENTED(reg == 4u);
-
-				// A raw scan can encounter a 0x66 in the preceding instruction, so do not
-				// overwrite it. Call9 starts with REX.W to neutralize genuine 0x66
-				// prefixes on AMD processors (before it could turn E8 into callw 16bit).
-				auto* code = new (inst_ptr) Jit::Call9;
-				code->SetFunc(reg == 0
-				                  ? program->tls.handler_vaddr
-				                  : program->tls.handler_vaddr + Jit::TlsRegStub::GetOffset(reg));
-				ptr += prefix_count + Jit::Call9::GetSize() - 1;
-			}
+#if defined(__x86_64__) || defined(_M_X64)
+	// mov r64, qword ptr fs:[0] -> mov r64, qword ptr gs:[TcbGsOffset()]
+	const uint32_t offset  = TcbGsOffset();
+	auto*          end_ptr = reinterpret_cast<uint8_t*>(address + size);
+	for (auto* ptr = reinterpret_cast<uint8_t*>(address); ptr + 9 <= end_ptr; ptr++) {
+		if (ptr[0] == 0x64 && (ptr[1] & 0xfbu) == 0x48 && ptr[2] == 0x8b &&
+		    (ptr[3] & 0xc7u) == 0x04 && ptr[4] == 0x25 &&
+		    (ptr[5] | ptr[6] | ptr[7] | ptr[8]) == 0) {
+			ptr[0] = 0x65;
+			std::memcpy(ptr + 5, &offset, sizeof(offset));
+			ptr += 8;
 		}
 	}
+#endif
 }
 
 uint64_t RuntimeLinker::GetEntry() {
@@ -1275,6 +1392,8 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 	auto it = std::find(m_programs.begin(), m_programs.end(), program);
 	EXIT_IF(it == m_programs.end());
 	m_programs.erase(it);
+	// The stdio slots and fflush point into the module that is about to be unmapped.
+	Libs::LibcStdio::ResetGuestLibc(program);
 
 	for (auto* importer: m_programs) {
 		const auto& info = *importer->dynamic_info;
@@ -1400,6 +1519,18 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
+/// Points the HLE __stdinp, __stdoutp and __stderrp slots and fflush at the given libc.prx.
+/// Passing nullptr leaves them null, which is logged.
+void RuntimeLinker::BindGuestLibc(Program* libc) {
+	Libs::LibcStdio::BindGuestLibc(libc != nullptr ? libc->export_symbols.get() : nullptr, libc);
+}
+
+/// Lets a libc.prx that fills its own stdio variables in its initializer override the bind.
+void RuntimeLinker::RefreshGuestLibc(Program* libc) {
+	Libs::LibcStdio::RefreshGuestLibc(libc != nullptr ? libc->export_symbols.get() : nullptr,
+	                                  libc);
+}
+
 void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
@@ -1422,6 +1553,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
 	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
+	// Binding needs finished relocations so that variables defined by libc.prx hold real values.
+	// Nothing that could read a slot runs before this point, and the game patch and the libc
+	// initializers come after it.
+	BindGuestLibc(libc);
 
 	if (!game_patch.empty()) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
@@ -1429,9 +1564,12 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	CreateThreadTls();
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
+	// A libc that fills its own stdio variables in its initializer is only visible now.
+	RefreshGuestLibc(libc);
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -1459,6 +1597,7 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	Libs::LibcStdio::ResetGuestLibc(nullptr);
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);
@@ -1475,10 +1614,8 @@ void RuntimeLinker::Clear() {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
 		g_invalid_memory = 0;
 	}
-	g_tls_main_program        = nullptr;
-	g_tls_cached_main_program = nullptr;
-	g_tls_cached_main_tcb     = nullptr;
-	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+	g_tls_main_program  = nullptr;
+	g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
 }
 
@@ -1632,6 +1769,13 @@ Program* RuntimeLinker::FindProgramById(int32_t id) {
 	return nullptr;
 }
 
+std::vector<int32_t> RuntimeLinker::GetProgramIds() {
+	Common::LockGuard    lock(m_mutex);
+	std::vector<int32_t> ids(m_programs.size());
+	std::ranges::transform(m_programs, ids.begin(), &Program::unique_id);
+	return ids;
+}
+
 Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_name) {
 	Common::LockGuard lock(m_mutex);
 
@@ -1734,60 +1878,6 @@ int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, m
 	return result;
 }
 
-uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
-	EXIT_IF(program == nullptr);
-
-	Common::LockGuard lock(program->tls.mutex);
-
-	auto& tls = program->tls.tlss[Common::Thread::GetThreadIdUnique()];
-
-	if (tls.ptr == nullptr) {
-		constexpr uint64_t TCB_SIZE  = 0x40;
-		constexpr uint64_t TCB_ALIGN = 0x20;
-
-		const auto tcb_offset =
-		    program->tls.tcb_offset != 0 ? program->tls.tcb_offset : program->tls.image_size;
-		const auto alloc_size = AlignUp(tcb_offset, TCB_ALIGN) + TCB_SIZE;
-		tls.ptr        = reinterpret_cast<uint8_t*>(Libs::LibKernel::Memory::AllocateRuntimeMemory(
-		    0, alloc_size, Common::VirtualMemory::Mode::ReadWrite, "thread_local_storage"));
-		tls.free_func  = nullptr;
-		tls.vm_alloc   = true;
-		tls.alloc_size = alloc_size;
-
-		EXIT_IF(tls.ptr == nullptr);
-
-		std::memset(tls.ptr, 0, alloc_size);
-
-		if (!program->tls.init_image.empty()) {
-			std::memcpy(tls.ptr, program->tls.init_image.data(), program->tls.init_image.size());
-		} else {
-			std::memcpy(tls.ptr, reinterpret_cast<void*>(program->tls.image_vaddr),
-			            program->tls.init_size);
-		}
-
-		auto* tcb = reinterpret_cast<uint64_t*>(tls.ptr + tcb_offset);
-		tcb[0]    = reinterpret_cast<uint64_t>(tcb);
-	}
-
-	return tls.ptr;
-}
-
-void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
-	EXIT_IF(program == nullptr);
-
-	if (thread_id == Common::Thread::GetThreadIdUnique() && g_tls_cached_main_program == program) {
-		g_tls_cached_main_program = nullptr;
-		g_tls_cached_main_tcb     = nullptr;
-	}
-
-	Common::LockGuard lock(program->tls.mutex);
-
-	if (auto it = program->tls.tlss.find(thread_id); it != program->tls.tlss.end()) {
-		FreeTlsBlock(&it->second);
-		program->tls.tlss.erase(it);
-	}
-}
-
 constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
 
 static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
@@ -1840,9 +1930,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	EXIT_IF(program->base_size > UINT64_MAX - (GUEST_PAGE_SIZE - 1));
 	program->base_size_aligned = AlignUp(program->base_size, GUEST_PAGE_SIZE);
 
-	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
-	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
-	program->mapped_size = program->base_size_aligned + tls_handler_size;
+	program->mapped_size   = program->base_size_aligned;
 	const bool emulate_amd = Config::AmdCpuEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
@@ -1874,10 +1962,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
 		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
 	}
-	if (!is_shared) {
-		program->tls.handler_vaddr =
-		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
-	}
 
 	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
 
@@ -1887,9 +1971,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	     "base_size_aligned      = 0x%016" PRIx64 "\n"
 	     "mapped_size            = 0x%016" PRIx64 "\n",
 	     program->base_vaddr, program->base_size, program->base_size_aligned, program->mapped_size);
-	if (!is_shared) {
-		LOGF("tls_handler_size       = 0x%016" PRIx64 "\n", tls_handler_size);
-	}
 
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
@@ -1920,7 +2001,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                     mode == Common::VirtualMemory::Mode::NoAccess);
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
-				PatchProgram(program, segment_addr, segment_memory_size);
+				PatchGuestCode(segment_addr, segment_memory_size);
 				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}
 
@@ -1940,14 +2021,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			program->tls.image_vaddr = phdr[i].p_vaddr + program->base_vaddr;
 			program->tls.init_size   = std::min(phdr[i].p_filesz, GetAlignedSize(phdr + i));
 			program->tls.image_size  = GetAlignedSize(phdr + i);
-			program->tls.tcb_offset  = program->tls.image_size;
+			program->tls.index       = is_shared ? static_cast<uint32_t>(program->unique_id) : 0;
 
 			LOGF("tls addr = 0x%016" PRIx64 "\n"
 			     "tls init   = %" PRIu64 "\n"
-			     "tls size   = %" PRIu64 "\n"
-			     "tls offset = %" PRIu64 "\n",
-			     program->tls.image_vaddr, program->tls.init_size, program->tls.image_size,
-			     program->tls.tcb_offset);
+			     "tls size   = %" PRIu64 "\n",
+			     program->tls.image_vaddr, program->tls.init_size, program->tls.image_size);
 		}
 
 		if (phdr[i].p_type == PT_OS_PROCPARAM) {
@@ -2029,7 +2108,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	if (!is_shared) {
-		SetupTlsHandler(program);
+		g_tls_main_program = program;
 	}
 
 	LOGF("entry = 0x%016" PRIx64 "\n", program->elf->GetEntry() + program->base_vaddr);
@@ -2039,10 +2118,6 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	auto program = std::unique_ptr<Program>(p);
 	if (g_tls_main_program == program.get()) {
 		g_tls_main_program = nullptr;
-	}
-	if (g_tls_cached_main_program == program.get()) {
-		g_tls_cached_main_program = nullptr;
-		g_tls_cached_main_tcb     = nullptr;
 	}
 	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr >= program->base_vaddr &&
@@ -2199,12 +2274,6 @@ void RuntimeLinker::Relocate(Program* program) {
 			program->rela_bits[bit_index >> 3u] |= 1u << (bit_index & 7u);
 		}
 	});
-
-	if (program->tls.image_vaddr != 0 && program->tls.init_size != 0 &&
-	    program->tls.init_image.empty()) {
-		const auto* src = reinterpret_cast<const uint8_t*>(program->tls.image_vaddr);
-		program->tls.init_image.assign(src, src + program->tls.init_size);
-	}
 }
 
 const ModuleId* RuntimeLinker::FindModule(const Program& program, const std::string& id) {
@@ -2301,45 +2370,6 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 
 	syms(program, program->export_symbols.get(), true);
 	syms(program, program->import_symbols.get(), false);
-}
-
-void RuntimeLinker::SetupTlsHandler(Program* program) {
-	EXIT_IF(program == nullptr);
-	EXIT_IF(g_tls_main_program != nullptr);
-	EXIT_IF(program->elf == nullptr);
-	EXIT_IF(program->elf->IsShared());
-	EXIT_IF(program->tls.handler_vaddr == 0);
-
-	g_tls_main_program = program;
-
-	auto* code = new (reinterpret_cast<void*>(program->tls.handler_vaddr)) Jit::SafeCall;
-
-	code->SetFunc(TlsMainGetAddr);
-
-	for (uint8_t reg = 1; reg < 8; reg++) {
-		if (reg == 4) {
-			continue;
-		}
-
-		auto* stub = new (reinterpret_cast<void*>(program->tls.handler_vaddr +
-		                                          Jit::TlsRegStub::GetOffset(reg))) Jit::TlsRegStub;
-		stub->SetFunc(program->tls.handler_vaddr);
-		stub->SetOutputReg(reg);
-	}
-
-	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->tls.handler_vaddr,
-	                                                     Jit::SafeCall::GetSize(),
-	                                                     Common::VirtualMemory::Mode::Execute));
-	Common::VirtualMemory::FlushInstructionCache(program->tls.handler_vaddr,
-	                                             Jit::SafeCall::GetSize());
-}
-
-void RuntimeLinker::DeleteTlss(int thread_id) {
-	Common::LockGuard lock(m_mutex);
-
-	for (auto* p: m_programs) {
-		DeleteTls(p, thread_id);
-	}
 }
 
 void RuntimeLinker::SetApplicationHeapApi(void* const api[10]) {

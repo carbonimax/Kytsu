@@ -79,9 +79,9 @@ struct SystemServiceEvent {
 static std::mutex          g_event_mutex;
 static std::deque<int32_t> g_events;
 
-void NotifyEntitlementUpdate() {
+void NotifyEvent(int32_t event_type) {
 	std::scoped_lock lock(g_event_mutex);
-	g_events.push_back(0x10000003); // SCE_SYSTEM_SERVICE_EVENT_ENTITLEMENT_UPDATE
+	g_events.push_back(event_type);
 }
 
 struct SystemServiceDisplaySafeAreaInfo {
@@ -265,6 +265,18 @@ static int KYTY_SYSV_ABI SystemServiceDisableMusicPlayer() {
 // The counterpart of sceSystemServiceDisableMusicPlayer(). A title can disable the system
 // background music player, and this call re-enables it. It's implemented whit a stub and returns 0.
 static int KYTY_SYSV_ABI sceSystemServiceReenableMusicPlayer() {
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceDisableMediaPlay() {
+	PRINT_NAME();
+
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceReenableMediaPlay() {
+	PRINT_NAME();
+
 	return OK;
 }
 
@@ -599,6 +611,8 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("XbbJC3E+L5M", SystemService::SystemServicePowerTick);
 	LIB_FUNC("x1UB9bwDSOw", SystemService::SystemServiceDisableMusicPlayer);
 	LIB_FUNC("9kPCz7Or+1Y", SystemService::sceSystemServiceReenableMusicPlayer);
+	LIB_FUNC("64nkF7LGk8w", SystemService::SystemServiceDisableMediaPlay);
+	LIB_FUNC("uInYhy7xa+U", SystemService::SystemServiceReenableMediaPlay);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
 	LIB_FUNC("m5CYKX20wfg", SystemService::SystemServiceInitializePlayerDialogParam);
 	LIB_FUNC("uaieF+glFPs", SystemService::SystemServiceLaunchPlayerDialog);

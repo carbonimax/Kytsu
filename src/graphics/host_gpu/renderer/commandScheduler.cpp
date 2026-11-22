@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/onceValue.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
@@ -435,10 +436,11 @@ CommandBuffer& CommandScheduler::Current() {
 // while presented frames are at least M ms apart on average (PerfStats::RecentFrameUs). At the display
 // rate the GPU thread has time to spare and the hand-off only delays the submission.
 static uint64_t RecordMinFrameUs() {
-	static const uint64_t value = [] {
+	static std::atomic<int64_t> value_once {Common::OnceUnset};
+	const auto value = static_cast<uint64_t>(Common::Once(value_once, [] {
 		const char* env = std::getenv("KYTY_CP_RECORD_MIN_FRAME_MS");
 		return env != nullptr ? std::strtoull(env, nullptr, 10) * 1000ull : 25000ull;
-	}();
+	}));
 	return value;
 }
 
@@ -463,10 +465,11 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 // KYTY_IDLE_SUBMIT=N (default 8, 0 = off): at least N draws/dispatches recorded.
 static uint64_t IdleSubmitMinWork() {
-	static const uint64_t value = [] {
+	static std::atomic<int64_t> value_once {Common::OnceUnset};
+	const auto value = static_cast<uint64_t>(Common::Once(value_once, [] {
 		const char* env = std::getenv("KYTY_IDLE_SUBMIT");
 		return env != nullptr ? std::strtoull(env, nullptr, 10) : 8ull;
-	}();
+	}));
 	return value;
 }
 
@@ -487,10 +490,11 @@ static bool IdleSubmitSplitsPasses() {
 // on average: a slow game is usually held back by the command processor, while a game at the display
 // rate is held back by the GPU or the display, where splitting its passes only adds GPU work.
 static uint64_t IdleSubmitMinFrameUs() {
-	static const uint64_t value = [] {
+	static std::atomic<int64_t> value_once {Common::OnceUnset};
+	const auto value = static_cast<uint64_t>(Common::Once(value_once, [] {
 		const char* env = std::getenv("KYTY_IDLE_SUBMIT_MIN_FRAME_MS");
 		return env != nullptr ? std::strtoull(env, nullptr, 10) * 1000ull : 25000ull;
-	}();
+	}));
 	return value;
 }
 

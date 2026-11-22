@@ -120,6 +120,7 @@ public:
 	Id   SslInit(uint64_t pool_size);
 	bool SslTerm(Id ssl_ctx_id);
 	bool SslValid(Id ssl_ctx_id);
+	int  SslGetMemoryPoolStats(Id ssl_ctx_id, Net::NetMemoryPoolStats* stats);
 
 	Id   HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size);
 	bool HttpTerm(Id http_ctx_id);
@@ -372,6 +373,23 @@ bool Network::SslValid(Id ssl_ctx_id) {
 
 	return ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
 	       ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used;
+}
+
+int Network::SslGetMemoryPoolStats(Id ssl_ctx_id, Net::NetMemoryPoolStats* stats) {
+	if (stats == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+	*stats = {};
+
+	Common::LockGuard lock(m_mutex);
+
+	if (!SslValid(ssl_ctx_id)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	// Nothing allocates from the pool.
+	stats->pool_size = m_ssl[ssl_ctx_id.GetId()].size;
+	return OK;
 }
 
 Network::Id Network::HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size) {
@@ -1096,11 +1114,20 @@ static int ConvertSocketOptionName(int level, int option) {
 	if (level == 0xffff) {
 		switch (option) {
 			case 0x0004: return SO_REUSEADDR;
+#if !defined(_WIN32)
+			case 0x0200: return SO_REUSEPORT;
+#endif
 			case 0x0020: return SO_BROADCAST;
 			case 0x1001: return SO_SNDBUF;
 			case 0x1002: return SO_RCVBUF;
 			case 0x1007: return SO_ERROR;
 			case 0x1105: return SO_SNDTIMEO;
+			case 0x1106: return SO_RCVTIMEO;
+#if defined(_WIN32)
+			// SO_ONESBCAST (all-ones broadcast route): Winsock sends to 255.255.255.255 with
+			// broadcast permission.
+			case 0x10000: return SO_BROADCAST;
+#endif
 			default: break;
 		}
 	} else if (level == 6 && option == 1) {
@@ -2241,7 +2268,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	}
 
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
-	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	const bool socket_timeout = (level == 0xffff && (optname == 0x1105 || optname == 0x1106));
 	optname                = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
@@ -2253,7 +2280,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 #endif
 	SocketLength len = static_cast<SocketLength>(*optlen);
 	void*        value = optval;
-	if (send_timeout) {
+	if (socket_timeout) {
 		if (*optlen < sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
@@ -2264,7 +2291,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	                 &len) != 0) {
 		return SetHostSocketError();
 	}
-	if (send_timeout) {
+	if (socket_timeout) {
 #if defined(_WIN32)
 		const int64_t usec = static_cast<int64_t>(timeout) * 1000;
 #else
@@ -2353,7 +2380,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 #endif
 		return failed ? SetHostSocketError() : 0;
 	}
-	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	const bool socket_timeout = (level == 0xffff && (optname == 0x1105 || optname == 0x1106));
 	optname                = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
@@ -2363,7 +2390,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 #else
 	timeval timeout {};
 #endif
-	if (send_timeout) {
+	if (socket_timeout) {
 		if (optlen != sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
@@ -2850,6 +2877,13 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
 	certs->pool          = nullptr;
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI SslGetMemoryPoolStats(int ssl_ctx_id, Net::NetMemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+	return g_net->SslGetMemoryPoolStats(Network::Id(ssl_ctx_id), stats);
 }
 
 } // namespace Ssl
