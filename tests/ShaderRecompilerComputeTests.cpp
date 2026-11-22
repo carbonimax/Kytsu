@@ -1536,8 +1536,12 @@ void CheckDrawStateInPlaceReset() {
   const auto topology = vk::PrimitiveTopology::eTriangleList;
   static DrawRenderState used, fresh;
   std::memset(static_cast<void *>(&used), 0x5a, sizeof(used));
+  std::memset(static_cast<void *>(&fresh), 0x5a, sizeof(fresh));
   ResetDrawStateForLookup(used, topology, 1);
-  ResetDrawStateForLookup(fresh, topology, 0);
+  // Value-initialized in place, not `state = {}` (mode 0): that copies a temporary whose padding is
+  // indeterminate, and the memcmp below would compare it (seen with Apple clang 21).
+  std::construct_at(&fresh);
+  fresh.topology = topology;
   size_t offset = 0;
   Require("DrawStateInPlace", "reset fields",
           std::memcmp(&used.depth_info, &fresh.depth_info, sizeof(fresh.depth_info)) == 0 &&
