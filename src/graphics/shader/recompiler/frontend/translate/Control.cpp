@@ -425,12 +425,12 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	    inst.src0.dpp) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
+	// M0 indexes with all its bits; an M0 past the last register reads v0.
 	const auto base     = inst.src0.reg;
-	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                    IR::U32(IR::Value(0xffu)));
+	const auto m0       = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
 	if (!MovrelReadMux()) {
-		auto selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
-		for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
+		auto selected = ir.GetVectorReg(static_cast<IR::VectorReg>(0));
+		for (uint32_t index = base; index < current_vector_limit; index++) {
 			const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 			selected =
 			    ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
@@ -439,7 +439,7 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 		return;
 	}
 	// A binary multiplexer on M0's bits: one select per candidate and one test per bit, instead of
-	// a compare and a select per register. M0 past the last register still reads the base.
+	// a compare and a select per register.
 	std::vector<IR::U32> level;
 	for (uint32_t index = base; index < std::max(current_vector_limit, base + 1u); index++) {
 		level.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(index)));
@@ -455,12 +455,9 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 		}
 		level = std::move(next);
 	}
-	auto selected = level[0];
-	if (count < 256u) {
-		selected = ir.Select(ir.ULessThan(m0, IR::U32(IR::Value(count))), selected,
-		                     ir.GetVectorReg(static_cast<IR::VectorReg>(base)));
-	}
-	WriteOperand(DestinationOperand(inst), selected);
+	WriteOperand(DestinationOperand(inst),
+	             ir.Select(ir.ULessThan(m0, IR::U32(IR::Value(count))), level[0],
+	                       ir.GetVectorReg(static_cast<IR::VectorReg>(0))));
 }
 
 void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
@@ -474,8 +471,7 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	}
 	const auto base  = inst.dst.reg;
 	const auto value = ReadU32(inst.src0);
-	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                 IR::U32(IR::Value(0xffu)));
+	const auto m0    = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
 	// Between its first lane write and last lane read a VGPR holds spilled SGPRs, which no
 	// indexed register tuple overlaps, so the first such VGPR above the base ends the tuple.
 	for (uint32_t index = base; index < current_vector_limit; index++) {

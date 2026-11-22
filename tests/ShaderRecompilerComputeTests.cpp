@@ -36271,7 +36271,7 @@ TestCase Vop1MoveRelSourceIndex(const char *name, u32 m0) {
 
 // The same read with M0 known only at run time (lane 0's thread id plus an offset), so the
 // selection runs on the GPU instead of folding while translating. v53-v55 are in the window but
-// unwritten; M0 past the window reads the base, and M0 uses only its low eight bits.
+// unwritten; M0 indexes with all its bits, and an M0 past the window reads v0.
 TestCase Vop1MoveRelSourceRuntimeIndex(const char *name, u32 m0, u32 expected) {
   using O = ShaderOpcode;
 
@@ -36281,6 +36281,7 @@ TestCase Vop1MoveRelSourceRuntimeIndex(const char *name, u32 m0, u32 expected) {
   code.push_back(EncodeVop1(0x02, 124, Vgpr(0)));
   code.push_back(EncodeSop2(0x00, 124, 124, 255));
   code.push_back(m0);
+  AppendVMovLiteral(&code, 0, 0x50000000u);
   code.push_back(EncodeVop1(0x43, 55, Vgpr(12)));
   AppendStoreVgpr(&code, 55, 0);
   AppendEnd(&code);
@@ -36356,9 +36357,9 @@ constexpr MoveRelRuntimeCase MoveRelRuntimeCases[] = {
     {"Vop1MoveRelSourceRuntimeIndex31", 31, 0x5100002bu},
     {"Vop1MoveRelSourceRuntimeIndex32", 32, 0x5100002cu},
     {"Vop1MoveRelSourceRuntimeIndex40", 40, 0x51000034u},
-    {"Vop1MoveRelSourceRuntimeIndex50", 50, 0x5100000cu},
-    {"Vop1MoveRelSourceRuntimeIndex255", 255, 0x5100000cu},
-    {"Vop1MoveRelSourceRuntimeIndex261", 261, 0x51000011u},
+    {"Vop1MoveRelSourceRuntimeIndex50", 50, 0x50000000u},
+    {"Vop1MoveRelSourceRuntimeIndex255", 255, 0x50000000u},
+    {"Vop1MoveRelSourceRuntimeIndex261", 261, 0x50000000u},
 };
 
 TestCase Vop1MoveRelDestination() {
@@ -36375,6 +36376,9 @@ TestCase Vop1MoveRelDestination() {
   code.push_back(EncodeSop1(0x04, 126, 106));
   code.push_back(EncodeVop1(0x42, 5, Vgpr(1)));
   code.push_back(EncodeSop1(0x04, 126, 8));
+  // M0 indexes with all its bits, so 0x102 is past the candidates and writes nothing.
+  AppendSMovLiteral(&code, 124, 0x102u);
+  code.push_back(EncodeVop1(0x42, 5, InlineU32(0)));
   code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 7, 4);
   AppendEnd(&code);
