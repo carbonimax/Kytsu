@@ -1651,6 +1651,14 @@ static bool CollectStoredValues(Value value, std::unordered_set<const Inst*>& vi
 			if (count.IsImmediate() && bound && *bound < count.U32()) {
 				return CollectStoredValues(inst->Arg(1), visited, leaves, depth + 1);
 			}
+			// The V_MOVRELS binary search takes its upper half when first - 1 < selector: never
+			// when the selector's bound is at most first - 1.
+			const auto first_minus_one = test->Arg(0).Resolve();
+			const auto selector_bound  = SelectorUpperBound(test->Arg(1));
+			if (first_minus_one.IsImmediate() && first_minus_one.GetType() == Type::U32 &&
+			    selector_bound && *selector_bound <= first_minus_one.U32()) {
+				return CollectStoredValues(inst->Arg(2), visited, leaves, depth + 1);
+			}
 		}
 		return CollectStoredValues(inst->Arg(1), visited, leaves, depth + 1) &&
 		       CollectStoredValues(inst->Arg(2), visited, leaves, depth + 1);
