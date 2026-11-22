@@ -905,6 +905,9 @@ target_link_libraries(agc_tests kyty_test_gtest)
 add_kyty_full_emulator_test(kernel_event_flag_tests "${KYTY_TESTS_DIR}/KernelEventFlagTests.cpp")
 target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(user_service_tests "${KYTY_TESTS_DIR}/UserServiceTests.cpp")
+target_link_libraries(user_service_tests kyty_test_gtest)
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests shader_optimization_tests
@@ -1011,6 +1014,7 @@ if(BUILD_TESTING)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
 	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
+	add_test(NAME user_service COMMAND $<TARGET_FILE:user_service_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_mad_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-only)
 	add_test(NAME shader_recompiler_movrel COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --movrel-only)
@@ -1223,6 +1227,7 @@ if(BUILD_TESTING)
 		playgo_tests
 		vr_tracker2_tests
 		psml_tests
+		user_service_tests
 	)
 endif()
 
