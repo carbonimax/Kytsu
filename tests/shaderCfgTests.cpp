@@ -18175,6 +18175,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   const auto wide_result = compile("wide-buffer", wide_buffer,
                                    {.words = 807,
                                     .instructions = 211,
+                                    // GLSL.std.450 UMin in the buffer prefix guard.
+                                    .ext_inst_imports = 1,
                                     .runtime_arrays = 1,
                                     .variables = 2,
                                     .loads = 9,

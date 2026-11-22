@@ -60,6 +60,11 @@ uint32_t EmitFMinMax3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c, b
 }
 
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
+	if (state.profile.native_float_to_int) {
+		return signed_value ? Unary(state, spv::OpBitcast, TypeU32(state),
+		                            Unary(state, spv::OpConvertFToS, TypeI32(state), src))
+		                    : Unary(state, spv::OpConvertFToU, TypeU32(state), src);
+	}
 	// Clamping first keeps the truncating conversion defined; NaN and values past the largest
 	// float below the integer limit are selected afterwards.
 	const auto clamped =
