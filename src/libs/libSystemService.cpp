@@ -269,12 +269,50 @@ static int KYTY_SYSV_ABI sceSystemServiceReenableMusicPlayer() {
 }
 
 static int KYTY_SYSV_ABI SystemServiceDisableMediaPlay() {
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceReenableMediaPlay() {
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceShowDisplaySafeAreaSettings() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceReenableMediaPlay() {
+static int KYTY_SYSV_ABI SystemServiceShowControllerSettings() {
+	PRINT_NAME();
+
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceGetRemoteplayStatus(bool* active) {
+	PRINT_NAME();
+
+	if (active == nullptr) {
+		return SYSTEM_SERVICE_ERROR_REMOTEPLAY_PARAMETER;
+	}
+
+	*active = false;
+
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceOpenChallengeActivity() {
+	PRINT_NAME();
+
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceOpenTournamentOccurrence() {
+	PRINT_NAME();
+
+	return OK;
+}
+
+static int KYTY_SYSV_ABI SystemServiceDeclareReadyForSuspend() {
 	PRINT_NAME();
 
 	return OK;
@@ -613,6 +651,13 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("9kPCz7Or+1Y", SystemService::sceSystemServiceReenableMusicPlayer);
 	LIB_FUNC("64nkF7LGk8w", SystemService::SystemServiceDisableMediaPlay);
 	LIB_FUNC("uInYhy7xa+U", SystemService::SystemServiceReenableMediaPlay);
+	LIB_FUNC("tPfQU2pD4-M", SystemService::SystemServiceShowDisplaySafeAreaSettings);
+	LIB_FUNC("w9wlKcHrmm8", SystemService::SystemServiceShowControllerSettings);
+	LIB_FUNC("Getl+RqEhVQ", SystemService::SystemServiceGetRemoteplayStatus);
+	LIB_FUNC("sPuK5ic3GD4", SystemService::SystemServiceOpenChallengeActivity);
+	LIB_FUNC("gELp9ue2ccQ", SystemService::SystemServiceOpenTournamentOccurrence);
+	LIB_FUNC_IN("SystemServiceSuspend", "EqcPA3ugRP8",
+	            SystemService::SystemServiceDeclareReadyForSuspend);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
 	LIB_FUNC("m5CYKX20wfg", SystemService::SystemServiceInitializePlayerDialogParam);
 	LIB_FUNC("uaieF+glFPs", SystemService::SystemServiceLaunchPlayerDialog);
