@@ -4,11 +4,13 @@
 #include "common/emulatorConfig.h"
 #include "common/localization.h"
 #include "common/logging/log.h"
+#include "common/stringUtils.h"
 #include "common/systemFonts.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -742,7 +744,12 @@ static std::vector<std::filesystem::path> fallback_font_candidates(const char* f
 	    std::filesystem::path("3rdparty") / "tracy" / "profiler" / "src" / "font" / file_name;
 	std::vector<std::filesystem::path> paths;
 
-	auto source_root = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+	// The build copies the fonts beside the emulator; the source tree may be gone or moved.
+	if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
+		paths.push_back(Common::PathFromUtf8(base_path) / "assets" / "fonts" / file_name);
+	}
+
+	auto source_root =std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
 	paths.push_back(source_root / rel);
 
 	std::error_code ec;

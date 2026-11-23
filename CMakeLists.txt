@@ -1253,6 +1253,20 @@ add_custom_target(kyty_touch_cursors
 add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
+# libFont's fallback font, found beside the emulator so a moved build or a deleted source tree keeps it.
+set(KYTY_FALLBACK_FONTS
+	"${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tracy/profiler/src/font/Roboto-Regular.ttf"
+	"${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tracy/profiler/src/font/Roboto-Bold.ttf"
+	"${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tracy/profiler/src/font/Roboto-Italic.ttf"
+	"${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tracy/profiler/src/font/Roboto-BoldItalic.ttf")
+add_custom_target(kyty_fallback_fonts
+	COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${KYTY_FALLBACK_FONTS}
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/fonts"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_fallback_fonts)
+install(FILES ${KYTY_FALLBACK_FONTS} DESTINATION assets/fonts)
+
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
