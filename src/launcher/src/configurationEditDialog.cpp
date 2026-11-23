@@ -493,8 +493,12 @@ void ConfigurationEditDialog::GrowToFitContents() {
 	auto* tabs = m_ui->settings_tabs;
 	QSize content;
 	for (int i = 0; i < tabs->count(); i++) {
-		content = content.expandedTo(
-		    static_cast<QScrollArea*>(tabs->widget(i))->widget()->minimumSizeHint());
+		// A tab added after MakeTabsScrollable() is not a QScrollArea: fall back to the page itself.
+		auto* scroll = qobject_cast<QScrollArea*>(tabs->widget(i));
+		auto* inner  = scroll != nullptr ? scroll->widget() : tabs->widget(i);
+		if (inner != nullptr) {
+			content = content.expandedTo(inner->minimumSizeHint());
+		}
 	}
 	const QSize chrome = size() - tabs->currentWidget()->size();
 	resize(size().expandedTo(content + chrome).boundedTo(screen()->availableGeometry().size()));
@@ -809,7 +813,12 @@ void ConfigurationEditDialog::InitMacPerformance() {
 	recommended->setToolTip(tr("Reset this tab to the adopted Mac performance settings and bundled MoltenVK."));
 	layout->addWidget(recommended, 0, Qt::AlignLeft);
 	connect(recommended, &QPushButton::clicked, this, [this]() { SetMacPerformance(Configuration {}); });
-	m_ui->settings_tabs->addTab(page, tr("macOS / performance"));
+	// Same scrollable wrapping as MakeTabsScrollable(), which ran before this tab existed.
+	auto* scroll = new QScrollArea;
+	scroll->setWidgetResizable(true);
+	scroll->setFrameShape(QFrame::NoFrame);
+	scroll->setWidget(page);
+	m_ui->settings_tabs->addTab(scroll, tr("macOS / performance"));
 }
 
 void ConfigurationEditDialog::SetMacPerformance(const Configuration& info) {
