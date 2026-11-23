@@ -36164,6 +36164,119 @@ TestCase Vop1MoveRelSource() {
            O::S_ENDPGM}};
 }
 
+// V_MOVRELS reads v[12 + M0] from forty-one live candidates, so the selection
+// spans several levels of the multiplexer, including an unpaired last register.
+TestCase Vop1MoveRelSourceIndex(const char *name, u32 m0) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 reg = 12; reg <= 52; reg++)
+    AppendVMovLiteral(&code, reg, 0x51000000u + reg);
+  code.push_back(EncodeSMovB32(124, InlineU32(m0)));
+  code.push_back(EncodeVop1(0x43, 55, Vgpr(12)));
+  AppendStoreVgpr(&code, 55, 0);
+  AppendEnd(&code);
+
+  return {name,
+          code,
+          {},
+          {0x51000000u + 12u + m0},
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
+// The same read with M0 known only at run time (lane 0's thread id plus an offset), so the
+// selection runs on the GPU instead of folding while translating. v53-v55 are in the window but
+// unwritten; M0 past the window reads the base, and M0 uses only its low eight bits.
+TestCase Vop1MoveRelSourceRuntimeIndex(const char *name, u32 m0, u32 expected) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 reg = 12; reg <= 52; reg++)
+    AppendVMovLiteral(&code, reg, 0x51000000u + reg);
+  code.push_back(EncodeVop1(0x02, 124, Vgpr(0)));
+  code.push_back(EncodeSop2(0x00, 124, 124, 255));
+  code.push_back(m0);
+  code.push_back(EncodeVop1(0x43, 55, Vgpr(12)));
+  AppendStoreVgpr(&code, 55, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = code;
+  test.expected = {expected};
+  test.opcodes = {O::V_MOV_B32, O::V_READFIRSTLANE_B32, O::S_ADD_U32, O::V_MOVRELS_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A buffer fill with a four-dword pattern, as games compile it: a waterfall loop takes each
+// lane's pattern index (lane & 3) into M0 with V_READFIRSTLANE_B32, narrows EXEC to the lanes
+// with that index and reads v[0 + M0]. The window is v0-v6 (seven candidates).
+TestCase Vop1MoveRelSourceWaterfall() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 4, Vgpr(0)));                 // v4 = lane
+  code.push_back(EncodeVop2(0x1b, 5, InlineU32(3), Vgpr(4)));    // v5 = lane & 3
+  for (u32 reg = 0; reg < 4; reg++)
+    AppendVMovLiteral(&code, reg, 0x61000000u + reg);
+  code.push_back(EncodeSop1(0x04, 4, 126));                      // s[4:5] = exec
+  code.push_back(EncodeSop1(0x04, 6, 126));                      // s[6:7] = exec
+  const auto loop = code.size();
+  code.push_back(EncodeVop1(0x02, 8, Vgpr(5)));                  // s8 = readfirstlane v5
+  code.push_back(EncodeVopc(0xd2, 8, Vgpr(5)));                  // exec = s8 == v5
+  code.push_back(EncodeSMovB32(124, 8));                         // m0 = s8
+  code.push_back(EncodeVop1(0x43, 6, Vgpr(0)));                  // v6 = v[0 + m0]
+  code.push_back(EncodeSop2(0x15, 6, 6, 126));                   // s[6:7] &= ~exec, SCC
+  code.push_back(EncodeSop1(0x04, 126, 6));                      // exec = s[6:7]
+  code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+  code.push_back(EncodeSop1(0x04, 126, 4));                      // exec = s[4:5]
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), Vgpr(4)));    // v4 = lane * 4
+  AppendBufferStoreDword(&code, 6, 4);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1MoveRelSourceWaterfall";
+  test.code = code;
+  for (u32 lane = 0; lane < 16; lane++)
+    test.expected.push_back(0x61000000u + (lane & 3u));
+  test.opcodes = {O::V_MOV_B32,     O::V_AND_B32,     O::S_MOV_B64,     O::V_READFIRSTLANE_B32,
+                  O::V_CMPX_EQ_U32, O::S_MOV_B32,     O::V_MOVRELS_B32, O::S_ANDN2_B64,
+                  O::S_CBRANCH_SCC1, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 16;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+struct MoveRelRuntimeCase {
+  const char *name;
+  u32 m0;
+  u32 expected;
+};
+
+constexpr MoveRelRuntimeCase MoveRelRuntimeCases[] = {
+    {"Vop1MoveRelSourceRuntimeIndex0", 0, 0x5100000cu},
+    {"Vop1MoveRelSourceRuntimeIndex1", 1, 0x5100000du},
+    {"Vop1MoveRelSourceRuntimeIndex6", 6, 0x51000012u},
+    {"Vop1MoveRelSourceRuntimeIndex7", 7, 0x51000013u},
+    {"Vop1MoveRelSourceRuntimeIndex8", 8, 0x51000014u},
+    {"Vop1MoveRelSourceRuntimeIndex31", 31, 0x5100002bu},
+    {"Vop1MoveRelSourceRuntimeIndex32", 32, 0x5100002cu},
+    {"Vop1MoveRelSourceRuntimeIndex40", 40, 0x51000034u},
+    {"Vop1MoveRelSourceRuntimeIndex50", 50, 0x5100000cu},
+    {"Vop1MoveRelSourceRuntimeIndex255", 255, 0x5100000cu},
+    {"Vop1MoveRelSourceRuntimeIndex261", 261, 0x51000011u},
+};
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -54937,6 +55050,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMadF32FlushesDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
+  cases.push_back(Vop1MoveRelSourceIndex("Vop1MoveRelSourceIndex0", 0));
+  cases.push_back(Vop1MoveRelSourceIndex("Vop1MoveRelSourceIndex5", 5));
+  cases.push_back(Vop1MoveRelSourceIndex("Vop1MoveRelSourceIndex31", 31));
+  cases.push_back(Vop1MoveRelSourceIndex("Vop1MoveRelSourceIndex40", 40));
+  for (const auto &c : MoveRelRuntimeCases)
+    cases.push_back(Vop1MoveRelSourceRuntimeIndex(c.name, c.m0, c.expected));
+  AddCase(Vop1MoveRelSourceWaterfall);
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
@@ -55471,6 +55591,76 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
     previous_units = units;
   }
   std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A bounded zero fill as games compile it: each lane picks pattern word lane & 3 from v0-v3 in a
+// waterfall loop (V_READFIRSTLANE_B32 into M0, then V_MOVRELS_B32). The fill proof bounds M0 to
+// 3, so the window's other registers (lane-varying v4-v6) are never stored, with the compare
+// chain and with the multiplexer alike.
+void CheckMoveRelWaterfallFill() {
+  std::vector<u32> code;
+  AppendVop3(&code, 0x346u, 4, 9, InlineU32(6), Vgpr(0));        // v4 = s9 * 64 + lane
+  for (u32 i = 0; i < 4; i++)
+    code.push_back(EncodeVop1(0x01u, i, i + 4u));                // v[i] = s[4 + i]
+  code.push_back(EncodeVopc(0xd4, 8, Vgpr(4)));                  // exec = s8 > v4
+  const auto skip = code.size();
+  code.push_back(0u);
+  code.push_back(EncodeVop2(0x1b, 5, InlineU32(3), Vgpr(4)));    // v5 = v4 & 3
+  code.push_back(EncodeSop1(0x04, 4, 126));
+  code.push_back(EncodeSop1(0x04, 6, 126));
+  const auto loop = code.size();
+  code.push_back(EncodeVop1(0x02, 8, Vgpr(5)));
+  code.push_back(EncodeVopc(0xd2, 8, Vgpr(5)));
+  code.push_back(EncodeSMovB32(124, 8));
+  code.push_back(EncodeVop1(0x43, 6, Vgpr(0)));                  // v6 = v[0 + m0]
+  code.push_back(EncodeSop2(0x15, 6, 6, 126));
+  code.push_back(EncodeSop1(0x04, 126, 6));
+  code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  code.push_back(EncodeMubuf0(0x04u, 0, true, false));          // buffer_store_format_x v6, v4
+  code.push_back(EncodeMubuf1(6, 0, 4));
+  code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);       // s_cbranch_execz
+  AppendEnd(&code);
+
+  std::array<u32, 10> user_data{0x00200000u, 4u << 16u, 256u, 0x14204u, 0, 0, 0, 0, 200u, 0};
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  compute.group_id[0] = true;
+  compute.wave_size = 64;
+  compute.thread_ids_num = 1;
+  compute.workgroup_register = 9;
+  const auto Fill = [&] {
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.wave_size = 64;
+    options.user_data_base = 0;
+    options.user_data = user_data;
+    options.input_info.compute = &compute;
+    options.dump_ir = false;
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+    };
+    Require("MoveRelWaterfallFill", "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                       specialization),
+            "waterfall fill resources could not be materialized");
+    return resources.uniform_fill;
+  };
+  const auto zero = Fill();
+  Require("MoveRelWaterfallFill", "zero pattern",
+          zero.words == 1 && zero.value == 0u && zero.bounded_elements == 200u,
+          "the V_MOVRELS selector bound no longer proves a zero fill");
+  user_data[6] = 1;
+  Require("MoveRelWaterfallFill", "mixed pattern", Fill().words == 0,
+          "a pattern with different words was proven uniform");
+  std::printf("[host]    %-32s ok\n", "MoveRelWaterfallFill");
 }
 
 void CheckPs5GameExampleImageClearRuntimeShape() {
@@ -62772,6 +62962,21 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--movrel-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1MoveRelSource());
+    for (const auto &[name, m0] :
+         {std::pair{"Vop1MoveRelSourceIndex0", 0u}, std::pair{"Vop1MoveRelSourceIndex5", 5u},
+          std::pair{"Vop1MoveRelSourceIndex31", 31u}, std::pair{"Vop1MoveRelSourceIndex40", 40u}})
+      RunCase(&vulkan, Vop1MoveRelSourceIndex(name, m0));
+    for (const auto &c : MoveRelRuntimeCases)
+      RunCase(&vulkan, Vop1MoveRelSourceRuntimeIndex(c.name, c.m0, c.expected));
+    RunCase(&vulkan, Vop1MoveRelSourceWaterfall());
+    CheckMoveRelWaterfallFill();
+    RunCase(&vulkan, Vop1MoveRelDestination());
+    RunCase(&vulkan, Vop1MoveRelDestinationSkipsLaneSpill());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--relaxed-float-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, RelaxedFloatNativeOps());
@@ -64348,6 +64553,7 @@ int main(int argc, char **argv) {
   CheckFiniteInlineSamplerPhi(vulkan);
   CheckSamplerCandidateTables(vulkan);
   CheckWave64WholeWaveResults();
+  CheckMoveRelWaterfallFill();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();

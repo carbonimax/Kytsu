@@ -1615,6 +1615,27 @@ static bool CollectStoredValues(Value value, std::unordered_set<const Inst*>& vi
 				}
 			}
 		}
+		// The V_MOVRELS multiplexer tests selector bits and guards the range with selector < count:
+		// a bit above the selector's bound is never set, and a count above it always passes.
+		if (test != nullptr && test->GetOpcode() == ValueOpcode::INotEqual32 &&
+		    test->Arg(1).Resolve() == Value(0u)) {
+			const auto* bits = test->Arg(0).Resolve().TryInstruction();
+			const auto  mask = bits != nullptr && bits->GetOpcode() == ValueOpcode::BitwiseAnd32
+			                       ? bits->Arg(1).Resolve() : Value {};
+			const auto  bound = bits != nullptr && !mask.IsEmpty() && mask.IsImmediate()
+			                        ? SelectorUpperBound(bits->Arg(0)) : std::nullopt;
+			if (bound && *bound < 0x80000000u &&
+			    (mask.U32() & (std::bit_ceil(*bound + 1u) - 1u)) == 0u) {
+				return CollectStoredValues(inst->Arg(2), visited, leaves, depth + 1);
+			}
+		}
+		if (test != nullptr && test->GetOpcode() == ValueOpcode::ULessThan32) {
+			const auto count = test->Arg(1).Resolve();
+			const auto bound = SelectorUpperBound(test->Arg(0));
+			if (count.IsImmediate() && bound && *bound < count.U32()) {
+				return CollectStoredValues(inst->Arg(1), visited, leaves, depth + 1);
+			}
+		}
 		return CollectStoredValues(inst->Arg(1), visited, leaves, depth + 1) &&
 		       CollectStoredValues(inst->Arg(2), visited, leaves, depth + 1);
 	}
