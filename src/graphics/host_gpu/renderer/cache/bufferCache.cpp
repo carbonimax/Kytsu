@@ -43,7 +43,7 @@ namespace Libs::Graphics {
 
 static std::atomic<BufferCache*> g_import_cache {nullptr};
 
-// KYTY_EAGER_READBACK=0|1|2 (default 0: nothing changes). 1: a page the CPU read back while it was
+// KYTY_EAGER_READBACK=0|1|2 (default 1; 0 turns it off). 1: a page the CPU read back while it was
 // GPU-written (requests of at most 16 tracker pages, never forgotten) is downloaded again at the end
 // of each command buffer that writes it, in that command buffer, and published once it completed. A
 // later read finds the page clean, or waits for that download only. 2: verify: the same downloads and
@@ -54,7 +54,7 @@ namespace EagerReadback {
 int Mode() {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_EAGER_READBACK");
-		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
 		return v == 1 || v == 2 ? static_cast<int>(v) : 0;
 	}();
 	return mode;
