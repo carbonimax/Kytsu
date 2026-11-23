@@ -155,6 +155,7 @@ enum class Counter : uint32_t {
 	AsyncBlockQuery,     // an occlusion query counts its samples
 	AsyncBlockPasses,    // aliased-target passes
 	AsyncBlockCap,       // skipped for ASYNC_PIPELINE_SKIP_FRAMES guest frames, still queued
+	AsyncBlockNotRedrawn, // a target with no real draw in an earlier, recent guest frame (new, or drawn once then sampled)
 	StagingWriteNs,      // guest bytes written into the upload staging ring (any thread)
 	StagingWriteBytes,
 	StagingWriteCount,

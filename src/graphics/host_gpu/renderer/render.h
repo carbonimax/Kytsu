@@ -15,6 +15,7 @@
 #include <atomic>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -339,6 +340,11 @@ private:
 	void ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, const DrawEmitInfo& emit,
 	                         const DrawIndexBufferSource& index_source);
+	// KYTY_ASYNC_PIPELINE: true when each target of the draw was drawn in an earlier guest frame;
+	// notes the targets of a draw that is drawn (not skipped).
+	[[nodiscard]] bool AsyncTargetsDrawnBefore(const DrawRenderState& state, uint64_t frame);
+	void               NoteAsyncTargetsDrawn(const DrawRenderState& state, uint64_t frame);
+	void               LogAsyncTargets(char kind, const DrawRenderState& state, uint64_t frame);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -377,6 +383,10 @@ private:
 	};
 
 	RenderContext&                        m_context;
+	// KYTY_ASYNC_PIPELINE: per guest target subresource (address, level, layer, format), its real draws;
+	// with KYTY_COMPILE_LOG, the guest frame of its last skipped draw not yet followed by a drawn one.
+	std::unordered_map<uint64_t, AsyncTargetHistory> m_async_targets;
+	std::unordered_map<uint64_t, uint64_t>           m_async_skipped_targets;
 	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;

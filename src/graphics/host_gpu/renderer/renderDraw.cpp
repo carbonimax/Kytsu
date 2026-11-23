@@ -1822,6 +1822,82 @@ static bool DrawWritesAnything(const DrawRenderState& state) {
 	       (state.ps_active && StageWritesAnything(state.ps_input_info.stage));
 }
 
+// KYTY_ASYNC_PIPELINE: calls `visit(key, desc, level, layer)` for each color target and the depth
+// target when the draw writes it; `key` packs the guest address (40 bits), level, layer and guest
+// format: targets of different formats aliasing one address (transient pools) are apart.
+template <class Visit>
+static void ForEachAsyncTarget(const DrawRenderState& state, Visit visit) {
+	auto key = [](const TextureCache::ImageDesc& desc, uint32_t level, uint32_t layer) {
+		return (desc.info.data.address & ((uint64_t {1} << 40) - 1)) | (uint64_t {level & 0xfu} << 40) |
+		       (uint64_t {layer & 0xfffu} << 44) |
+		       (uint64_t {static_cast<uint32_t>(desc.info.guest_format) & 0xffu} << 56);
+	};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto& color = state.color_info[i];
+		visit(key(color.desc, color.guest_mip_level, color.guest_array_layer), color.desc, color.guest_mip_level,
+		      color.guest_array_layer);
+	}
+	const auto& depth = state.depth_info;
+	if (depth.image_id && depth.AttachmentWriteAspects()) {
+		const auto& view = depth.desc.view_info;
+		visit(key(depth.desc, view.base_level, view.base_layer), depth.desc, view.base_level, view.base_layer);
+	}
+}
+
+// KYTY_ASYNC_REDRAWN_ONLY=0: a draw into any target may be skipped (the rule before it), untracked.
+static bool AsyncAnyTarget() {
+	static const bool any_target = [] {
+		const char* value = std::getenv("KYTY_ASYNC_REDRAWN_ONLY");
+		return value != nullptr && std::strcmp(value, "0") == 0;
+	}();
+	return any_target;
+}
+
+bool RenderExecutor::AsyncTargetsDrawnBefore(const DrawRenderState& state, uint64_t frame) {
+	if (AsyncAnyTarget()) return true;
+	bool drawn = true;
+	ForEachAsyncTarget(state, [&](uint64_t key, const auto&, uint32_t, uint32_t) {
+		const auto found = m_async_targets.find(key);
+		drawn = drawn && found != m_async_targets.end() && AsyncTargetDrawnBefore(found->second, frame);
+	});
+	return drawn;
+}
+
+void RenderExecutor::NoteAsyncTargetsDrawn(const DrawRenderState& state, uint64_t frame) {
+	if (AsyncAnyTarget()) return;
+	// shortcut: one entry per target subresource the session ever drew, never pruned (a few thousand).
+	ForEachAsyncTarget(state, [&](uint64_t key, const auto&, uint32_t, uint32_t) {
+		AsyncTargetNoteDrawn(m_async_targets[key], frame);
+	});
+}
+
+void RenderExecutor::LogAsyncTargets(char kind, const DrawRenderState& state, uint64_t frame) {
+	ForEachAsyncTarget(state, [&](uint64_t key, const TextureCache::ImageDesc& desc, uint32_t level, uint32_t layer) {
+		int64_t age = -1;
+		if (kind == 'S') {
+			m_async_skipped_targets.try_emplace(key, frame);
+		} else if (kind == 'R') {
+			const auto skipped = m_async_skipped_targets.find(key);
+			if (skipped == m_async_skipped_targets.end() || skipped->second == frame) return;
+			age = static_cast<int64_t>(frame - skipped->second);
+			m_async_skipped_targets.erase(skipped);
+		}
+		const auto found = m_async_targets.find(key);
+		// T kind(S skipped, N waits: not drawn before, R first drawn after a skip) time frame address
+		//   level layer guest_format width height last_drawn_frame(-1: never) frames_since_skip(R)
+		//   color_count depth_written
+		PerfStats::CompileLogLine("T %c %" PRIu64 " %" PRIu64 " %010" PRIx64 " %u %u %u %ux%u %" PRId64 " %" PRId64 " %u %d",
+		                          kind, PerfStats::SteadyUs(), frame, desc.info.data.address, level, layer,
+		                          static_cast<uint32_t>(desc.info.guest_format),
+		                          std::max(desc.info.extent.width >> level, 1u),
+		                          std::max(desc.info.extent.height >> level, 1u),
+		                          found == m_async_targets.end() ? int64_t {-1}
+		                                                         : static_cast<int64_t>(found->second.last_drawn),
+		                          age, state.color_count,
+		                          state.depth_info.image_id && state.depth_info.AttachmentWriteAspects() ? 1 : 0);
+	});
+}
+
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          const DrawEmitInfo&          emit,
@@ -1981,10 +2057,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 			                   : DrawWritesAnything(state)                  ? Counter::AsyncBlockWrites
 			                   : state.color_count == 0 && !tess_skip       ? Counter::AsyncBlockDepthOnly
 			                   : m_context.GetOcclusionQueries().Counting() ? Counter::AsyncBlockQuery
+			                   : !AsyncTargetsDrawnBefore(state, pipeline_cache.Frame()) ? Counter::AsyncBlockNotRedrawn
 			                                                                : Counter::Count;
 			if (block != Counter::Count) {
 				PerfStats::Add(block, 1);
+				if (block == Counter::AsyncBlockNotRedrawn && PerfStats::CompileLogEnabled()) [[unlikely]] {
+					LogAsyncTargets('N', state, pipeline_cache.Frame());
+				}
 			} else if (pipeline_cache.SkipMissing(buffer, state, colors, depth_feedback)) {
+				if (PerfStats::CompileLogEnabled()) [[unlikely]] {
+					LogAsyncTargets('S', state, pipeline_cache.Frame());
+				}
 				PerfStats::Add(Counter::AsyncSkipped, 1);
 				static uint64_t last_frame = UINT64_MAX;
 				if (const auto frame = pipeline_cache.Frame(); frame != last_frame) {
@@ -1994,6 +2077,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 				return;
 			}
 		}
+		if (PerfStats::CompileLogEnabled() && !m_async_skipped_targets.empty()) [[unlikely]] {
+			LogAsyncTargets('R', state, pipeline_cache.Frame());
+		}
+		NoteAsyncTargetsDrawn(state, pipeline_cache.Frame());
 	}
 	for (uint32_t pass = 0; pass < pass_count; pass++) {
 		auto* colors = passes ? state.color_info + pass : state.color_info;

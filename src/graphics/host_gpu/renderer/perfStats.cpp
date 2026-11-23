@@ -447,13 +447,15 @@ void MaybeReport() noexcept {
 		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs);
 	}
 	if (n(Counter::AsyncSkipped) + n(Counter::AsyncBlockWrites) + n(Counter::AsyncBlockDepthOnly) +
-	        n(Counter::AsyncBlockQuery) + n(Counter::AsyncBlockPasses) + n(Counter::AsyncBlockCap) != 0) {
+	        n(Counter::AsyncBlockQuery) + n(Counter::AsyncBlockPasses) + n(Counter::AsyncBlockCap) +
+	            n(Counter::AsyncBlockNotRedrawn) !=
+	        0) {
 		std::printf("PERF async %.1fs: skipped=%" PRIu64 " skip_frames=%" PRIu64 "/%" PRIu64
 		            " blocked_writes=%" PRIu64 " blocked_depth_only=%" PRIu64 " blocked_query=%" PRIu64
-		            " blocked_passes=%" PRIu64 " blocked_cap=%" PRIu64 "\n",
+		            " blocked_passes=%" PRIu64 " blocked_cap=%" PRIu64 " blocked_not_redrawn=%" PRIu64 "\n",
 		            seconds, n(Counter::AsyncSkipped), n(Counter::AsyncSkipFrames), n(Counter::Frames),
 		            n(Counter::AsyncBlockWrites), n(Counter::AsyncBlockDepthOnly), n(Counter::AsyncBlockQuery),
-		            n(Counter::AsyncBlockPasses), n(Counter::AsyncBlockCap));
+		            n(Counter::AsyncBlockPasses), n(Counter::AsyncBlockCap), n(Counter::AsyncBlockNotRedrawn));
 	}
 	if (n(Counter::DescSetAllocs) + n(Counter::DescPoolCreates) != 0) {
 		static uint64_t pools = 0; // pools are only destroyed with their heap: created = alive
