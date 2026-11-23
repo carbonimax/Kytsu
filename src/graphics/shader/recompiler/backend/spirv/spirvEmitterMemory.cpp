@@ -270,9 +270,16 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
 		if (prefix == 0u) prefix = ctx.state.memory_byte_offsets[resource];
-		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
-		                            BufferByteAddress(ctx, inst, mem), prefix);
-		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
+		const auto guest = BufferByteAddress(ctx, inst, mem);
+		// The host binding prefix must not wrap an out-of-range guest address into the buffer:
+		// umin(a, ~p) + p is a + p, or UINT32_MAX when that wraps, without a compare and select.
+		if (!ctx.state.profile.select_prefix_guard) {
+			return Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
+			              EmitUMin32(ctx.state, guest,
+			                         Unary(ctx.state, spv::OpNot, TypeU32(ctx.state), prefix)),
+			              prefix);
+		}
+		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state), guest, prefix);
 		return Select(ctx.state, TypeU32(ctx.state),
 		              Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), address, prefix),
 		              address, ConstantU32(ctx.state, UINT32_MAX));

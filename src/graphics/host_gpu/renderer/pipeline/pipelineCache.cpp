@@ -177,6 +177,16 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 }
 
 // KYTY_SHADER_DUMP_HASH=<hex> (diagnosis, default off): dump the code and the IR of that one shader.
+// KYTY_COMPARE_SELECT_FOLD=0 keeps the compare-and-select forms of float-to-int conversions and of
+// the buffer prefix guard. Read once.
+bool CompareSelectFold() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COMPARE_SELECT_FOLD");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 bool IsDumpedShader(uint64_t shader_hash) {
 	static const uint64_t hash = [] {
 		const char* value = std::getenv("KYTY_SHADER_DUMP_HASH");
@@ -1000,6 +1010,10 @@ struct PipelineCache::ProgramCache {
 	      profile {.maintenance8 = graphics.maintenance8_enabled,
 		           .native_float_min_max =
 		               graphics.physical_device_properties.vendorID == 0x1002u,
+		           // v_cvt_u32/i32_f32 saturate and turn NaN into 0, as the guest's do.
+		           .native_float_to_int =
+		               graphics.physical_device_properties.vendorID == 0x1002u && CompareSelectFold(),
+		           .select_prefix_guard = !CompareSelectFold(),
 		           .device_clock_period_ps = graphics.device_clock_period_ps,
 		           .storage_bounds = static_cast<ShaderRecompiler::Spirv::StorageBounds>(graphics.storage_bounds),
 		           .storage_bounds_alignment = graphics.storage_bounds_alignment,

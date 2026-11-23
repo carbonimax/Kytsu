@@ -36791,6 +36791,52 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave, bool signaling_nan = true) {
   return test;
 }
 
+// V_CVT_U32_F32 and V_CVT_I32_F32 on runtime inputs, so no compiler can fold them: NaN gives 0,
+// out-of-range values saturate and the rest truncate toward zero.
+TestCase VectorCvtF32ToIntRuntimeEdges(u32 wave) {
+  using O = ShaderOpcode;
+  constexpr u32 inputs[] = {
+      0x7fc00000u, 0xffc00000u, 0x7fa00001u, 0x7f800000u, 0xff800000u, 0x4f800000u,
+      0x4f7fffffu, 0x4f000000u, 0x4effffffu, 0xcf000000u, 0xcf000001u, 0xbf800000u,
+      0xbf000000u, 0x80000000u, 0x00000001u, 0x3fc00000u, 0x47f12000u, 0xc7f12000u};
+  const auto to_u32 = [](u32 bits) -> u32 {
+    const float v = std::bit_cast<float>(bits);
+    if (v != v || v <= 0.0f) return 0u;
+    if (v >= 4294967296.0f) return 0xffffffffu;
+    return static_cast<u32>(v);
+  };
+  const auto to_i32 = [](u32 bits) -> u32 {
+    const float v = std::bit_cast<float>(bits);
+    if (v != v) return 0u;
+    if (v >= 2147483648.0f) return 0x7fffffffu;
+    if (v <= -2147483648.0f) return 0x80000000u;
+    return static_cast<u32>(static_cast<int32_t>(v));
+  };
+  TestCase test;
+  test.name = "VectorCvtF32ToIntRuntimeEdges";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1u;
+  test.initial.assign(std::begin(inputs), std::end(inputs));
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < static_cast<u32>(std::size(inputs)); ++index) {
+    AppendVMovU32(&code, 30, index * 4u);
+    AppendBufferLoadDword(&code, 0, 30);
+    code.push_back(EncodeVop1(0x07, 10, Vgpr(0)));
+    code.push_back(EncodeVop1(0x08, 11, Vgpr(0)));
+    AppendStoreVgpr(&code, 10, static_cast<u32>(test.expected.size()));
+    AppendStoreVgpr(&code, 11, static_cast<u32>(test.expected.size() + 1u));
+    test.expected.insert(test.expected.end(), {to_u32(inputs[index]), to_i32(inputs[index])});
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_U32_F32, O::V_CVT_I32_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   using O = ShaderOpcode;
   // Runtime inputs keep every MED3 in the emitted module; compare raw result bits.
@@ -63030,6 +63076,41 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--exec-select-forward-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorExecRegionForwardsSelects());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compare-select-fold-only") == 0) {
+    // The buffer prefix guard umin(a, ~p) + p must equal select(a + p >= p, a + p, ~0).
+    for (u32 prefix = 0; prefix < 256u; ++prefix) {
+      for (u32 address : {0u, 1u, 0x1000u, 0x7fffffffu, 0xfffffe00u, ~prefix - 1u, ~prefix,
+                          ~prefix + 1u, 0xfffffffcu, 0xffffffffu}) {
+        const u32 sum = address + prefix;
+        const u32 guarded = sum >= prefix ? sum : 0xffffffffu;
+        if (std::min(address, ~prefix) + prefix != guarded) {
+          std::printf("[compute] prefix guard mismatch: address 0x%08x prefix %u\n", address, prefix);
+          return 1;
+        }
+      }
+    }
+    // Native conversions must keep the emulated results on AMD GPUs; other GPUs only compile them.
+    static constexpr ShaderProfile native_profile{.maintenance8 = true,
+                                                  .native_float_to_int = true};
+    VulkanHarness vulkan;
+    const bool supported = vulkan.SupportsNativeFloatMinMax();
+    for (bool native : {false, true}) {
+      for (u32 wave : {32u, 64u}) {
+        auto test = VectorCvtF32ToIntRuntimeEdges(wave);
+        // The emulation clamps first and selects NaN and the upper limit afterwards.
+        (native ? test.forbidden_spirv : test.required_spirv) = {" NClamp ", " OpIsNan "};
+        test.profile = native ? &native_profile : &Maintenance8Profile;
+        test.compile_only = native && !supported;
+        RunCase(&vulkan, test);
+      }
+      // Literal sources reach the driver as constant conversions, which it may fold itself.
+      auto literal = CvtF32ToIntSaturatesNaNAndOutOfRange();
+      literal.profile = native ? &native_profile : &Maintenance8Profile;
+      literal.compile_only = native && !supported;
+      RunCase(&vulkan, literal);
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--relaxed-float-only") == 0) {

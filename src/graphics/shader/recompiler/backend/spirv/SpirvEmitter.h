@@ -33,6 +33,11 @@ enum class StorageBoundsCounter : uint32_t {
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
+	// OpConvertFToU/FToS saturate and give 0 for NaN, as V_CVT_U32/I32_F32 do. SPIR-V leaves
+	// out-of-range conversions undefined, so only a device known to convert this way sets it.
+	bool native_float_to_int = false;
+	// Guard buffer prefix additions with a compare and select instead of the equivalent umin.
+	bool select_prefix_guard = false;
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
 	StorageBounds storage_bounds = StorageBounds::Shader;
