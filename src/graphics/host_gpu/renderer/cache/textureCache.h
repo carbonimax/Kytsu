@@ -301,6 +301,21 @@ private:
 	// FindImagesInRegion(address, size) through a small cache of recent results, valid
 	// while no image is (un)registered (m_image_index_epoch). Caller holds m_lock.
 	[[nodiscard]] const std::vector<ImageId>& FindImageCandidates(uint64_t address, uint64_t size);
+	// KYTY_TEXTURE_ADDR_INDEX: 1 (default) answer a search from the images registered at its address
+	// when the full candidate scan could not do anything else, 0 off, 2 compare with the full search.
+	[[nodiscard]] static uint32_t TextureAddrIndexMode() noexcept;
+	// The image the full search of FindImageLocked would give, from the images registered at the
+	// description's address, or an empty id when that search could alias, insert or free (it must run).
+	// Read-only. Caller holds m_lock.
+	[[nodiscard]] ImageId FindImageByAddress(const ImageDesc& desc, bool exact_format) const;
+	// A stencil descriptor naming the plane associated with image (its depth owner supplies the image).
+	[[nodiscard]] bool IsStencilPlaneOf(const Image& image, const ImageDesc& desc) const;
+	// Registered single-sample images per BcAlias class (block or not, tile mode, bytes per block):
+	// no cached image can BcAlias::Matches a description whose opposite class is empty.
+	static constexpr uint32_t kAliasTiles = 32, kAliasBytes = 17;
+	[[nodiscard]] static int32_t AliasClassSlot(const ImageInfo& info, bool block) noexcept;
+	void                         CountAliasClass(const ImageInfo& info, int32_t delta) noexcept;
+	[[nodiscard]] bool           NoAliasPossible(const ImageInfo& requested) const noexcept;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	// Sets keep_both instead of recreating when the new description may sit beside the cached one.
@@ -391,6 +406,7 @@ private:
 		std::vector<ImageId> ids;
 	};
 	std::array<CandidateCacheEntry, 64> m_candidate_cache;
+	std::array<uint32_t, 2 * kAliasTiles * kAliasBytes> m_alias_class_count {};
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 	bool             m_readback_storage_images = false;

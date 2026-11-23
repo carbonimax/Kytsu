@@ -233,6 +233,30 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	return true;
 }
 
+int32_t TextureCache::AliasClassSlot(const ImageInfo& info, bool block) noexcept {
+	const auto tile = static_cast<uint32_t>(info.tile_mode);
+	if (info.samples != 1 || tile >= kAliasTiles || info.bytes_per_block >= kAliasBytes) {
+		return -1;
+	}
+	return static_cast<int32_t>(((block ? kAliasTiles : 0u) + tile) * kAliasBytes + info.bytes_per_block);
+}
+
+void TextureCache::CountAliasClass(const ImageInfo& info, int32_t delta) noexcept {
+	if (const auto slot = AliasClassSlot(info, info.IsBlock()); slot >= 0) {
+		m_alias_class_count[slot] += static_cast<uint32_t>(delta);
+	}
+}
+
+// BcAlias::Matches needs both images single-sample, of opposite block class, with the same tile
+// mode and bytes per block. A description outside the counted classes is not proven.
+bool TextureCache::NoAliasPossible(const ImageInfo& requested) const noexcept {
+	if (requested.samples != 1) {
+		return true;
+	}
+	const auto slot = AliasClassSlot(requested, !requested.IsBlock());
+	return slot >= 0 && m_alias_class_count[slot] == 0;
+}
+
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	if (image.info.IsDepth()) {
 		if (image.info.tile_mode == Prospero::TileMode::kDepth ||
@@ -272,6 +296,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].entries.push_back(entry);
 	});
 	image.registered = true;
+	CountAliasClass(image.info, 1);
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
 }
@@ -295,6 +320,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	});
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
+	CountAliasClass(image.info, -1);
 	image.registered = false;
 }
 
@@ -528,6 +554,9 @@ const std::vector<ImageId>& TextureCache::FindImageCandidates(uint64_t address, 
 	const auto hash  = (address >> 8u) * 0x9E3779B97F4A7C15ull ^ size * 0xC2B2AE3D27D4EB4Full;
 	auto&      entry = m_candidate_cache[(hash >> 58u) & (m_candidate_cache.size() - 1)];
 	if (entry.epoch != m_image_index_epoch || entry.address != address || entry.size != size) {
+		if (PerfStats::TexIndexStatsEnabled()) [[unlikely]] {
+			PerfStats::Add(PerfStats::Counter::TiCandRebuilt, 1);
+		}
 		entry.ids.clear();
 		for (const auto id: FindImagesInRegion(address, size)) {
 			entry.ids.push_back(id);
@@ -1567,7 +1596,13 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		// The record may be an ordinary image a heap pins: as an association it stops being current.
 		record.HeapChanged();
 		m_image_index_epoch++;
+		if (record.registered) {
+			CountAliasClass(record.info, -1);
+		}
 		record.info                 = plane;
+		if (record.registered) {
+			CountAliasClass(record.info, 1);
+		}
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
 	}
@@ -1593,6 +1628,20 @@ uint32_t TextureCache::FindImageMemoMode() noexcept {
 // search gives the same image, so a hit skips the description checks and the scan. The per-bind
 // rest (view offset, access tick, LRU touch, metadata clears, video-out check) still runs.
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMemo* memo) {
+	// KYTY_TEX_INDEX_STATS: the whole call, and one clock read to subtract.
+	struct Timer {
+		std::chrono::steady_clock::time_point start;
+		~Timer() {
+			if (start != std::chrono::steady_clock::time_point {}) {
+				const auto t1 = std::chrono::steady_clock::now();
+				const auto t2 = std::chrono::steady_clock::now();
+				PerfStats::Add(PerfStats::Counter::TiFind, 1);
+				PerfStats::Add(PerfStats::Counter::TiFindNs, std::chrono::nanoseconds(t1 - start).count());
+				PerfStats::Add(PerfStats::Counter::TiClockNs, std::chrono::nanoseconds(t2 - t1).count());
+			}
+		}
+	} timer {PerfStats::TexIndexStatsEnabled() ? std::chrono::steady_clock::now()
+	                                           : std::chrono::steady_clock::time_point {}};
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1814,6 +1863,59 @@ void TextureCache::WaitAliasPublishes(GuestRange range) {
 	}
 }
 
+uint32_t TextureCache::TextureAddrIndexMode() noexcept {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	return static_cast<uint32_t>(Common::Once(mode_once, [] {
+		const char* value = std::getenv("KYTY_TEXTURE_ADDR_INDEX");
+		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}));
+}
+
+bool TextureCache::IsStencilPlaneOf(const Image& image, const ImageDesc& desc) const {
+	return (desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+	       image.depth_id && image.info.data == desc.info.data &&
+	       m_slot_images[image.depth_id].info.samples == desc.info.samples &&
+	       image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
+	       image.info.resources.levels >= desc.info.resources.levels &&
+	       image.info.resources.layers >= desc.info.resources.layers &&
+	       desc.info.bytes_per_block == 1 &&
+	       desc.info.guest_format == Prospero::BufferFormat::k8UInt;
+}
+
+// Both tests of the candidate scan need the description's address. Images registered there are
+// listed from its first page, in registration order, as in the candidate list, so the same walk
+// over them gives the scan's result. Only valid when no candidate can BcAlias the description.
+ImageId TextureCache::FindImageByAddress(const ImageDesc& desc, bool exact_format) const {
+	const auto* bucket = m_image_page_table.Find(desc.info.data.address >> ImagePageTable::kPageBits);
+	if (bucket == nullptr || !NoAliasPossible(desc.info)) {
+		return {};
+	}
+	ImageId result {};
+	for (const auto& entry: bucket->entries) {
+		if (entry.address != desc.info.data.address) {
+			continue;
+		}
+		const auto& image = m_slot_images[entry.id];
+		if (IsStencilPlaneOf(image, desc)) {
+			result = entry.id;
+			break;
+		}
+		if (SameBacking(image.info, desc.info, exact_format)) {
+			result = entry.id;
+		}
+	}
+	// The scan's later steps (overlap merge, free, insert) need the candidates.
+	if (!result) {
+		return {};
+	}
+	const auto& resolved = m_slot_images[result];
+	if (!resolved.depth_id && ((exact_format && resolved.info.pixel_format != desc.info.pixel_format) ||
+	                           resolved.info.resources < desc.info.resources)) {
+		return {};
+	}
+	return result;
+}
+
 // The search of FindImage, under m_lock. Returns an empty id when an image heap must wait for
 // another extent. memo (if any) is filled when the result may be kept, cleared otherwise.
 ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,
@@ -1821,26 +1923,45 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 
+	const bool stats      = PerfStats::TexIndexStatsEnabled();
+	const auto start      = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const auto index_mode = TextureAddrIndexMode();
+	const auto indexed    = index_mode != 0 ? FindImageByAddress(desc, exact_format) : ImageId {};
+	// KYTY_TEXTURE_ADDR_INDEX=2: the full search below decides; the address lookup must give its
+	// image, and only for a search it may keep (else it skipped an alias, merge, free or insert).
+	const auto verify = [&](ImageId found, bool kept) {
+		if (index_mode != 2 || !indexed) {
+			return;
+		}
+		PerfStats::Add(PerfStats::Counter::TiChecked, 1);
+		if (found != indexed || !kept) {
+			PerfStats::Add(PerfStats::Counter::TiDiffs, 1);
+			static std::atomic<uint32_t> printed {0};
+			if (printed.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("KYTY_TEXTURE_ADDR_INDEX=2: diff addr=0x%010" PRIx64 " size=0x%" PRIx64
+				            " indexed=%u search=%u kept=%d\n",
+				            desc.info.data.address, desc.info.data.size, static_cast<uint32_t>(indexed.index),
+				            static_cast<uint32_t>(found.index), kept ? 1 : 0);
+			}
+		}
+	};
+
 	ImageId result {};
 	bool    keepable = true;
-	{
+	if (indexed && index_mode == 1) {
+		result = indexed;
+	} else {
 		// Stays valid below: only FindImage (not reentrant, m_lock) rewrites cached lists.
 		const auto& candidates =
 		    FindImageCandidates(desc.info.data.address, desc.info.data.size);
 		bool block_alias = false;
+		bool any_alias   = false;
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			// Stencil descriptors name the associated plane; its depth owner supplies
 			// the native image and the canonical guest tiling.
-			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
-			    image.depth_id && image.info.data == desc.info.data &&
-			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
-			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
-			    image.info.resources.levels >= desc.info.resources.levels &&
-			    image.info.resources.layers >= desc.info.resources.layers &&
-			    desc.info.bytes_per_block == 1 &&
-			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+			if (IsStencilPlaneOf(image, desc)) {
 				result = id;
 				break;
 			}
@@ -1848,11 +1969,20 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 				result = id;
 			} else if (BcAlias::Matches(desc.info, image.info)) {
 				// SafeToDownload changes without an epoch bump: a possible alias is not kept.
-				keepable = false;
+				keepable  = false;
+				any_alias = true;
 				if (image.SafeToDownload()) {
 					block_alias = true;
 				}
 			}
+		}
+		if (stats) [[unlikely]] {
+			PerfStats::Add(PerfStats::Counter::TiCand, candidates.size());
+			PerfStats::Add(PerfStats::Counter::TiCandSame,
+			               static_cast<uint64_t>(std::ranges::count_if(candidates, [&](ImageId id) {
+				               return m_slot_images[id].info.data.address == desc.info.data.address;
+			               })));
+			PerfStats::Add(PerfStats::Counter::TiAlias, any_alias ? 1 : 0);
 		}
 
 		if (!result) {
@@ -1878,6 +2008,7 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 				if (memo != nullptr) {
 					*memo = {};
 				}
+				verify({}, false);
 				return {};
 			}
 		} else if (block_alias) {
@@ -1937,6 +2068,23 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 	}
 	if (memo != nullptr) {
 		*memo = keepable ? FindImageMemo {result, m_image_index_epoch} : FindImageMemo {};
+	}
+	verify(result, keepable);
+	if (stats) [[unlikely]] {
+		using C              = PerfStats::Counter;
+		const auto ns        = std::chrono::nanoseconds(std::chrono::steady_clock::now() - start).count();
+		const bool answered  = indexed && index_mode == 1;
+		const bool no_alias  = NoAliasPossible(desc.info);
+		const auto* bucket   = m_image_page_table.Find(desc.info.data.address >> ImagePageTable::kPageBits);
+		PerfStats::Add(C::TiFull, 1);
+		PerfStats::Add(C::TiFullNs, ns);
+		PerfStats::Add(C::TiAnswered, answered ? 1 : 0);
+		PerfStats::Add(C::TiNoMemo, memo == nullptr ? 1 : 0);
+		PerfStats::Add(C::TiKeepable, keepable && !answered ? 1 : 0);
+		PerfStats::Add(C::TiProof, no_alias ? 1 : 0);
+		PerfStats::Add(C::TiRemovable, keepable && no_alias ? 1 : 0);
+		PerfStats::Add(C::TiRemovableNs, keepable && no_alias ? ns : 0);
+		PerfStats::Add(C::TiBucket, bucket != nullptr ? bucket->entries.size() : 0);
 	}
 	return result;
 }

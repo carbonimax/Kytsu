@@ -471,6 +471,13 @@ struct TextureCacheTestAccess {
     return cache.InsertImage(info);
   }
 
+  // KYTY_TEXTURE_ADDR_INDEX: the address lookup of FindImageLocked (read-only).
+  static ImageId FindByAddress(TextureCache &cache,
+                               const TextureCache::ImageDesc &desc) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.FindImageByAddress(desc, false);
+  }
+
   static void DeleteImage(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.DeleteImage(id);
@@ -7884,6 +7891,57 @@ public:
                   texture_cache, large_info.data.address, large_info.data.size,
                   large_owner) == 0,
               "large image unregister left coarse memberships behind");
+
+      {
+        // KYTY_TEXTURE_ADDR_INDEX: the address lookup gives the candidate scan's image (the
+        // last same backing at the address) and declines while a BcAlias is possible.
+        const auto MakeClassInfo = [&](uint64_t address,
+                                       Prospero::BufferFormat format) {
+          auto info = MakeOwnershipInfo(address, 0x100);
+          // Formatless records (ImageOps::Validate) keep 0 bytes per block: one alias class.
+          info.guest_format = format;
+          return info;
+        };
+        const uint64_t at = base + 0x900100;
+        ImageDesc query{};
+        query.type = BindingType::Texture;
+        query.info =
+            MakeClassInfo(at, Prospero::BufferFormat::k16_16_16_16UInt);
+        const auto Lookup = [&] {
+          return TextureCacheTestAccess::FindByAddress(texture_cache, query);
+        };
+        const auto older =
+            TextureCacheTestAccess::InsertImage(texture_cache, query.info);
+        const auto newer =
+            TextureCacheTestAccess::InsertImage(texture_cache, query.info);
+        const auto overlapping = TextureCacheTestAccess::InsertImage(
+            texture_cache,
+            MakeClassInfo(at + 0x80, Prospero::BufferFormat::k16_16_16_16UInt));
+        Require(name, "address lookup: last same backing",
+                Lookup() == newer,
+                "the address lookup did not give the newest same-backing "
+                "image");
+        const auto block = TextureCacheTestAccess::InsertImage(
+            texture_cache,
+            MakeClassInfo(at + 0x200000, Prospero::BufferFormat::kBc1UNorm));
+        Require(name, "address lookup: possible block alias",
+                !Lookup(),
+                "the address lookup answered while a block image of the same "
+                "tile mode and block size was registered");
+        TextureCacheTestAccess::DeleteImage(texture_cache, block);
+        Require(name, "address lookup: alias class removed",
+                Lookup() == newer,
+                "unregistering the block image left its alias class counted");
+        TextureCacheTestAccess::DeleteImage(texture_cache, newer);
+        Require(name, "address lookup: removal", Lookup() == older,
+                "the address lookup did not fall back to the older image");
+        TextureCacheTestAccess::DeleteImage(texture_cache, older);
+        Require(name, "address lookup: overlap at another address",
+                !Lookup(),
+                "the address lookup took an overlapping image at another "
+                "address");
+        TextureCacheTestAccess::DeleteImage(texture_cache, overlapping);
+      }
 
       auto &image = texture_cache.GetImage(first);
       constexpr uint32_t final_sampled_value = 0x88776655u;
