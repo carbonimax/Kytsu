@@ -2960,6 +2960,85 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return source.first->Handle();
 }
 
+// KYTY_STREAM_REUSE: 1 (default, also when unset) = stream copies reused (streamReusePolicy.h),
+// 0 = a copy for every use, 2 = reuse with checks: every reuse is compared with a new copy, and a
+// difference takes the new copy. Off while the late-read detector runs (it checks each copy).
+static int StreamReuseMode() {
+	static std::atomic<int64_t> mode_once {Common::OnceUnset};
+	return static_cast<int>(Common::Once(mode_once, [] {
+		const char* value = std::getenv("KYTY_STREAM_REUSE");
+		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
+		const int   mode  = LateRead::Enabled() ? 0 : v == 0 || v == 2 ? static_cast<int>(v) : 1;
+		std::printf("BufferCache: KYTY_STREAM_REUSE=%d (stream copy reuse)\n", mode);
+		return mode;
+	}));
+}
+
+namespace {
+struct StreamReuseStats {
+	std::atomic<uint64_t> fresh {0};
+	std::atomic<uint64_t> fresh_bytes {0};
+	std::atomic<uint64_t> hit_bytes {0};
+	std::atomic<uint64_t> overlaid {0};
+	std::atomic<uint64_t> verified {0};
+	std::atomic<uint64_t> diffs {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(StreamReuse::Result::Count)> results {};
+};
+StreamReuseStats g_stream_reuse_stats;
+// One writer at a time (the thread that holds the stream path): no locked add needed.
+void Bump(std::atomic<uint64_t>& counter, uint64_t n = 1) {
+	counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+}
+} // namespace
+
+void BufferCache::ReportStreamReuse(double seconds, uint64_t frames) {
+	auto&      st   = g_stream_reuse_stats;
+	const auto take = [](std::atomic<uint64_t>& a) { return a.exchange(0, std::memory_order_relaxed); };
+	std::array<uint64_t, static_cast<size_t>(StreamReuse::Result::Count)> r {};
+	for (size_t i = 0; i < r.size(); i++) {
+		r[i] = take(st.results[i]);
+	}
+	const auto fresh = take(st.fresh);
+	const auto hits  = r[static_cast<size_t>(StreamReuse::Result::Hit)];
+	if (fresh + hits == 0 || seconds <= 0.0) {
+		return;
+	}
+	using R = StreamReuse::Result;
+	std::printf("PERF streamreuse %.1fs: mode=%d frames=%" PRIu64 " fresh=%" PRIu64 "(%" PRIu64 "B) hits=%" PRIu64
+	            "(%" PRIu64 "B) share=%.1f%% miss empty=%" PRIu64 " packet=%" PRIu64 " store=%" PRIu64
+	            " tick=%" PRIu64 " lap=%" PRIu64 " overlaid=%" PRIu64 " verify checked=%" PRIu64 " diffs=%" PRIu64 "\n",
+	            seconds, StreamReuseMode(), frames, fresh, take(st.fresh_bytes), hits, take(st.hit_bytes),
+	            100.0 * static_cast<double>(hits) / static_cast<double>(fresh + hits),
+	            r[static_cast<size_t>(R::Empty)], r[static_cast<size_t>(R::PacketEpoch)],
+	            r[static_cast<size_t>(R::StoreEpoch)], r[static_cast<size_t>(R::Tick)], r[static_cast<size_t>(R::Lap)],
+	            take(st.overlaid), take(st.verified), take(st.diffs));
+}
+
+// KYTY_STREAM_REUSE=2: the earlier copy against a new one (with the pending labels).
+static bool StreamReuseMatches(const StreamBuffer& stream, uint64_t vaddr, uint64_t size, uint64_t offset) {
+	static thread_local std::array<uint8_t, BufferCache::CACHING_PAGESIZE> fresh;
+	if (!LibKernel::Memory::CopySparseMemory(vaddr, fresh.data(), size)) {
+		EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+	}
+	(void)EopAtGpu::OverlayPending(vaddr, fresh.data(), size);
+	Bump(g_stream_reuse_stats.verified);
+	if (std::memcmp(fresh.data(), stream.Mapped().data() + offset, size) == 0) {
+		return true;
+	}
+	static std::atomic<uint32_t> logged {0};
+	Bump(g_stream_reuse_stats.diffs);
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		uint64_t first = 0;
+		while (first < size && fresh[first] == stream.Mapped()[offset + first]) {
+			first++;
+		}
+		std::printf("BufferCache: KYTY_STREAM_REUSE=2 diff at 0x%016" PRIx64 "+0x%" PRIx64 " first byte +0x%" PRIx64
+		            " ring offset 0x%" PRIx64 "\n",
+		            vaddr, size, first, offset);
+	}
+	return false;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -2979,14 +3058,44 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto& stream          = StreamRing();
+		auto&                  stream = StreamRing();
+		const int              reuse  = StreamReuseMode();
+		const StreamReuse::Key key {vaddr, size, &stream};
+		StreamReuse::Stamp     stamp {};
+		if (reuse != 0) {
+			// Read before the copy: a store or packet after this point changes them.
+			stamp = {StreamPacketEpoch(), StreamStoreEpoch(), m_scheduler.CurrentTick(), stream.Laps()};
+			uint64_t   reused = 0;
+			const auto result = m_stream_reuse->Find(key, stamp, reused);
+			Bump(g_stream_reuse_stats.results[static_cast<size_t>(result)]);
+			if (result == StreamReuse::Result::Hit) {
+				if (reuse != 2 || StreamReuseMatches(stream, vaddr, size, reused)) {
+					Bump(g_stream_reuse_stats.hit_bytes, size);
+					return {&stream, reused};
+				}
+				m_stream_reuse->Forget(key);
+			}
+		}
 		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
-			(void)EopAtGpu::OverlayPending(vaddr, mapped, size);
+			const bool overlaid = EopAtGpu::OverlayPending(vaddr, mapped, size);
 			stream.Commit();
+			Bump(g_stream_reuse_stats.fresh);
+			Bump(g_stream_reuse_stats.fresh_bytes, size);
+			if (reuse != 0) {
+				// A copy holding pending labels is not kept: their delivery would not reach it.
+				if (overlaid) {
+					Bump(g_stream_reuse_stats.overlaid);
+					m_stream_reuse->Forget(key);
+				} else {
+					stamp.tick = m_scheduler.CurrentTick();
+					stamp.lap  = stream.Laps(); // Map may have wrapped
+					m_stream_reuse->Store(key, stamp, offset);
+				}
+			}
 			if (LateRead::Enabled() && !m_import && !LateRead::NetOnly()) [[unlikely]] {
 				LateRead::Bind(vaddr, size, LateRead::PathStream);
 			}

@@ -143,6 +143,8 @@ public:
 	// waited for; the range goes to a buffer of its own instead.
 	[[nodiscard]] Download MapDownload(uint64_t size, uint64_t alignment, bool wait_priority = true);
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// Times Map went back to the start: an earlier range may be rewritten after one.
+	[[nodiscard]] uint64_t Laps() const noexcept { return m_laps; }
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -161,6 +163,7 @@ private:
 	                                                uint64_t& wait_bound);
 
 	uint64_t              m_offset      = 0;
+	uint64_t              m_laps        = 0;
 	uint64_t              m_mapped_size = 0;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;

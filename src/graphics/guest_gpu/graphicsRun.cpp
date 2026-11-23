@@ -131,6 +131,7 @@ class PendingLabels {
 public:
 	uint64_t Add(uint64_t address, uint32_t size, uint64_t value, bool pending) {
 		std::lock_guard lock(m_mutex);
+		NoteGuestStore(); // KYTY_STREAM_REUSE: copies overlay pending labels
 		if (m_entries.size() > 4096) {
 			uint64_t oldest_pending = m_seq + 1;
 			for (const auto& [base, entry] : m_entries) {
@@ -152,6 +153,7 @@ public:
 
 	void Delivered(uint64_t address, uint64_t seq) {
 		std::lock_guard lock(m_mutex);
+		NoteGuestStore(); // after the label store (backing or plain)
 		const auto [begin, end] = m_entries.equal_range(address);
 		for (auto it = begin; it != end; ++it) {
 			if (it->second.latest == seq && it->second.pending != 0) {
@@ -1079,6 +1081,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
 	CpPipeline::Drain();
+	NoteStreamPacket(); // the guest wrote what this submission reads before submitting it
 	// After the drain: the previous slice's guest reads are attributed to its own submission.
 	if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
 		const uint32_t queue = submission.queue_id == 0 ? 0 : ComputeQueueBase + submission.queue_id - 1;
@@ -1362,6 +1365,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		if (flip_block || !IsPipelinedPacket(opcode, KYTY_PM4_R(packet_header))) {
 			CpPipeline::Drain();
+			NoteStreamPacket(); // labels, waits, DMA, dispatches, events: the guest may rewrite memory
 			if (reprotect_batch && (flip_block || IsSyncPointPacket(opcode)) &&
 			    g_gpu_state != nullptr) {
 				g_gpu_state->FlushBatchedUploads();

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/host_gpu/memTrackProf.h"
@@ -1041,11 +1042,14 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 
 static bool TryWriteBackingTracked(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!Graphics::GpuCapture::Recording()) [[likely]] {
-		return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+		const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
+		Graphics::NoteGuestStore(); // KYTY_STREAM_REUSE: after the bytes, so no copy keeps the old ones
+		return written;
 	}
 	// Only the GPU side writes the backing directly: a GPU capture does not replay it as an Update.
 	Graphics::GpuCapture::GpuWriteSlow(vaddr, size, false);
 	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	Graphics::NoteGuestStore();
 	Graphics::GpuCapture::GpuWriteSlow(vaddr, size, true);
 	return written;
 }

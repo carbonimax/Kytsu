@@ -473,6 +473,7 @@ void MaybeReport() noexcept {
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);
 	BufferCache::ReportImport(seconds);
+	BufferCache::ReportStreamReuse(seconds, n(Counter::Frames));
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));
