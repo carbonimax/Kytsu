@@ -971,7 +971,7 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
-                                                         ImageId merged_id) {
+                                                         ImageId merged_id, bool exact_format) {
 	auto& cached = m_slot_images[cached_id];
 	if (!cached.registered) {
 		return {merged_id};
@@ -1038,9 +1038,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		// PPSA08394
 		// A view cannot change the native image type or grow its extent.
+		const bool compatible_format =
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format);
 		if (requested.data.size == cached.info.data.size &&
-		    requested.resources == cached.info.resources &&
-		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    requested.resources == cached.info.resources && compatible_format &&
 		    (requested.type != cached.info.type
 		         ? requested.extent == cached.info.extent
 		         : requested.extent.width > cached.info.extent.width &&
@@ -1048,8 +1049,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		               requested.extent.depth >= cached.info.extent.depth)) {
 			return {ExpandImage(requested, cached_id)};
 		}
+		// Raw face writes can precede the first view of the full floating-point cube.
+		const bool compatible_array = !exact_format && compatible_format && !cached.info.IsBlock() &&
+		                              requested.extent == cached.info.extent &&
+		                              requested.resources.levels == cached.info.resources.levels;
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
-		if (requested.pixel_format == cached.info.pixel_format &&
+		if ((requested.pixel_format == cached.info.pixel_format || compatible_array) &&
 		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
 		    (requested.data.size > cached.info.data.size ||
 		     (requested.data.size == cached.info.data.size &&
@@ -1953,7 +1958,10 @@ ImageId TextureCache::FindImageByAddress(const ImageDesc& desc, bool exact_forma
 		return {};
 	}
 	const auto& resolved = m_slot_images[result];
-	if (!resolved.depth_id && ((exact_format && resolved.info.pixel_format != desc.info.pixel_format) ||
+	// Same refusal as FindImageLocked: a shader-converted color view never takes a depth image.
+	const bool needs_color = resolved.info.IsDepth() &&
+	                         Prospero::RemapTextureFormat(desc.info.guest_format) != desc.info.guest_format;
+	if (!resolved.depth_id && (needs_color || (exact_format && resolved.info.pixel_format != desc.info.pixel_format) ||
 	                           resolved.info.resources < desc.info.resources)) {
 		return {};
 	}
@@ -2033,7 +2041,7 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 			keepable = false;
 			for (const auto candidate: candidates) {
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+				const auto overlap = ResolveOverlap(merged_info, desc.type, candidate, result, exact_format);
 				if (overlap.image) {
 					result = overlap.image;
 				}
@@ -2067,7 +2075,12 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 
 		if (result && !m_slot_images[result].depth_id) {
 			auto& resolved = m_slot_images[result];
-			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+			// Shader-converted color views need their raw texels even when the guest
+			// address also has a depth image whose sampling view would return depth.
+			const bool needs_color = resolved.info.IsDepth() &&
+			                         Prospero::RemapTextureFormat(desc.info.guest_format) !=
+			                             desc.info.guest_format;
+			if (needs_color || (exact_format && resolved.info.pixel_format != desc.info.pixel_format)) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
 				FreeImage(result);
