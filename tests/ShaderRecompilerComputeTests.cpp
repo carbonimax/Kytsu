@@ -3355,6 +3355,33 @@ public:
     Require("SchedulerTimeline", "implicit boundary", completed == 3,
             "operation boundary did not release the implicit tick callback");
 
+    // An empty queue queries no timeline; a tick finished unobserved still releases its operation.
+    {
+      static uint32_t counter_queries = 0;
+      static PFN_vkGetSemaphoreCounterValue get_counter = nullptr;
+      auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+      get_counter = std::exchange(dispatcher.vkGetSemaphoreCounterValue, [](auto... args) {
+        ++counter_queries;
+        return get_counter(args...);
+      });
+      scheduler.PopPendingOperations();
+      const auto empty_queries = counter_queries;
+      const auto unobserved_tick = scheduler.CurrentTick();
+      scheduler.DeferOperation([&completed] { completed = 4; });
+      scheduler.Flush();
+      const auto timeline = scheduler.GetMasterSemaphore().Handle();
+      const vk::SemaphoreWaitInfo unobserved_wait{
+          .semaphoreCount = 1, .pSemaphores = &timeline, .pValues = &unobserved_tick};
+      const bool signaled =
+          m_runtime_context.device.waitSemaphores(&unobserved_wait, UINT64_MAX) ==
+          vk::Result::eSuccess;
+      scheduler.PopPendingOperations();
+      dispatcher.vkGetSemaphoreCounterValue = get_counter;
+      Require("SchedulerTimeline", "pending operation refresh",
+              empty_queries == 0 && signaled && completed == 4,
+              "an empty queue queried the timeline, or a finished tick stayed pending");
+    }
+
     vk::SemaphoreTypeCreateInfo timeline_type{};
     timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
     timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
@@ -17497,7 +17524,9 @@ public:
                 &mapped, allocation_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
             "captured scene mapping failed");
-    for (const auto initial_size : {metadata_size - 0x1000, metadata_size}) {
+    // Partial fills end at a 4 KiB block boundary or inside a block.
+    for (const auto initial_size :
+         {metadata_size - 0x1000, metadata_size - 0x800, metadata_size}) {
       std::memset(mapped, 0x5a, color_size);
       std::memset(reinterpret_cast<void *>(dcc_address), 0xff, metadata_size);
       RenderContext context(m_runtime_context);
@@ -56095,7 +56124,7 @@ TessellationStage CompileTessellationStage(const char *name, const std::vector<u
                                            ShaderType stage,
                                            const ShaderTessellationInputInfo &tess) {
   using namespace ShaderRecompiler;
-  ShaderVertexInputInfo vertex;
+  ShaderVertexInputInfo vertex{};
   vertex.logical_stage = stage;
   vertex.tess = tess;
   CompileOptions options;
@@ -56119,6 +56148,15 @@ TessellationStage CompileTessellationStage(const char *name, const std::vector<u
   Require(name, "disassembly", tools.Disassemble(compiled.spirv, &result.assembly),
           "failed to disassemble tessellation shader");
   return result;
+}
+
+std::vector<u32> TessellationStageKey(ShaderType stage, const ShaderTessellationInputInfo &tess) {
+  ShaderVertexInputInfo vertex{};
+  vertex.logical_stage = stage;
+  vertex.tess = tess;
+  std::vector<u32> key;
+  BuildStageStaticKey(vertex, key);
+  return key;
 }
 
 // Whether a Patch uvec4[vectors] variable of a storage class sits at a Location.
@@ -56379,6 +56417,43 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
               ds.assembly.find(output_topology == 2 ? "VertexOrderCcw" : "VertexOrderCw") ==
                   std::string::npos,
           "TES must preserve guest domain, partitioning, and winding");
+
+  // Each stage keys exactly the layout fields its module depends on; the rest leave it unchanged.
+  using Layout = ShaderTessellationInputInfo;
+  struct Field {
+    u32 Layout::*member;
+    u32 value;
+    const char *stages; // The stages depending on the field: L(S), H(S), T(ES).
+  };
+  const Field fields[] = {
+      {&Layout::input_control_points, tess.input_control_points + 1, "H"},
+      {&Layout::output_control_points, tess.output_control_points + 1, "HT"},
+      {&Layout::ls_stride, tess.ls_stride + 16, "LH"},
+      {&Layout::hs_stride, tess.hs_stride + 16, "HT"},
+      {&Layout::patch_base, tess.patch_base + 16, "HT"},
+      {&Layout::patch_size, tess.patch_size + 16, "HT"},
+      {&Layout::domain, 3 - domain, "HT"},
+      {&Layout::partitioning, 5 - partitioning, "T"},
+      {&Layout::output_topology, 5 - output_topology, "T"},
+  };
+  const auto check_layout = [&](const char *what, char stage_letter, ShaderType stage,
+                                const std::vector<u32> &code, const std::string &assembly) {
+    const auto key = TessellationStageKey(stage, tess);
+    for (const auto &field : fields) {
+      auto layout = tess;
+      layout.*field.member = field.value;
+      const bool depends = std::strchr(field.stages, stage_letter) != nullptr;
+      Require(name, what,
+              (TessellationStageKey(stage, layout) != key) == depends &&
+                  (depends ||
+                   CompileTessellationStage(name, code, stage, layout).assembly == assembly),
+              "a tessellation stage key must hold exactly the layout fields its module depends on");
+    }
+  };
+  check_layout("LS layout key", 'L', ShaderType::Local, local, ls.assembly);
+  check_layout("HS layout key", 'H', ShaderType::TessellationControl, control, hs.assembly);
+  check_layout("TES layout key", 'T', ShaderType::TessellationEvaluation, evaluation,
+               ds.assembly);
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -56667,7 +56742,7 @@ void CheckEmbeddedFetchVertexOffset() {
                            Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float) {
     std::array<u32, 11> user_data{};
     user_data[10] = slot10;
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.logical_stage = stage;
     vertex.tess = {.input_control_points = 3, .output_control_points = 3,
                    .ls_stride = 124, .hs_stride = 128, .domain = 1,
@@ -56711,7 +56786,7 @@ void CheckEmbeddedFetchVertexOffset() {
 
   const auto Resolve = [](const CompiledShader &result,
                           u32 index_offset) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.fetch_embedded = true;
     ShaderRecompiler::IR::CompiledShaderInfo program{};
     program.user_data_base = result.program.user_data_base;
@@ -56722,7 +56797,7 @@ void CheckEmbeddedFetchVertexOffset() {
   };
 
   const auto ResolveInstance = [](const CompiledShader &result) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.fetch_embedded = true;
     ShaderRecompiler::IR::CompiledShaderInfo program{};
     program.user_data_base = result.program.user_data_base;
@@ -59763,7 +59838,7 @@ void CheckEmbeddedFetchLaneSpill() {
   AppendEnd(&code);
 
   std::array<u32, 11> user_data{};
-  ShaderVertexInputInfo vertex;
+  ShaderVertexInputInfo vertex{};
   vertex.fetch_embedded = true;
   vertex.fetch_buffer_reg = 0;
   vertex.resources_num = 1;
@@ -63074,7 +63149,7 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
   for (const auto [stages, hs_wave, gs_wave] :
        {std::tuple{0x0260210du, 32u, 32u}, {0x0020210du, 32u, 64u}, {0x0040210du, 64u, 32u}}) {
     context.SetShaderStages(stages);
-    std::array<ShaderVertexInputInfo, 3> info;
+    std::array<ShaderVertexInputInfo, 3> info{};
     const auto params = PrepareTessellationPrograms(regs, context, info);
     (void)params;
     // The fork's program cache compiles each non-mesh stage with its input info's wave size.

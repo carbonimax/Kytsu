@@ -257,7 +257,6 @@ void CommandScheduler::WaitRetired(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
 	PopReady(m_pending_operations, UINT64_MAX);
 	if (m_release_waits_for_fence) {
 		PopReady(m_pending_releases, RetireFences(0));
@@ -269,7 +268,7 @@ void CommandScheduler::PopReady(std::queue<PendingOperation>& queue, uint64_t re
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (queue.empty() || !m_master.IsFree(queue.front().tick) ||
+			if (queue.empty() || !IsFree(queue.front().tick) ||
 			    queue.front().tick > retired_tick) {
 				return;
 			}

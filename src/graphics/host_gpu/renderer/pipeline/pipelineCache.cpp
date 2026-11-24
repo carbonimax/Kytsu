@@ -2045,7 +2045,11 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	const auto        program          = m_program_cache->Get(params, input_info, push_data_cursor);
+	// HW_ID2 reads are translated with the graphics compute queue's values.
+	EXIT_NOT_IMPLEMENTED(program && input_info.async_compute && input_info.stage.program != nullptr &&
+	                     input_info.stage.program->info.reads_queue_id);
+	return program;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
