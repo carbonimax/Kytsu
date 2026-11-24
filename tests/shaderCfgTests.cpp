@@ -15718,6 +15718,7 @@ void TestAliasedColorPassChecks() {
 
   depth.image_id = ImageId{4};
   depth.desc.view_info.format = vk::Format::eD32Sfloat;
+  depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
   depth.depth_write_enable = true;
   Check(rejects("V2"), "repeated depth writes were accepted");
   depth = {};

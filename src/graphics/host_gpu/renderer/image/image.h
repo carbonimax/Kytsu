@@ -242,7 +242,6 @@ public:
 private:
 	friend struct ImageTestAccess;
 
-	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	void CopyStencilWithBuffer(Image& source, const vk::ImageCopy& region, Buffer& scratch,
 	                           vk::CommandBuffer command);
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
