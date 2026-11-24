@@ -154,7 +154,12 @@ void Translator::V_FRACT(const Decoder::Instruction& inst, IR::Type type) {
 		const auto below_one = ir.Emit(IR::ValueOpcode::BitCastF64U64,
 		                               {IR::Value(uint64_t {0x3fefffffffffffff})});
 		const auto above     = ir.Emit(IR::ValueOpcode::FPOrdGreaterThan64, {result, below_one});
-		WriteOperand(destination, ir.Emit(IR::ValueOpcode::SelectF64, {above, below_one, result}));
+		const auto clamped   = ir.Emit(IR::ValueOpcode::SelectF64, {above, below_one, result});
+		// Host Fract passes a signaling NaN through unchanged; v_fract returns a quiet NaN.
+		const auto quiet_nan = ir.Emit(IR::ValueOpcode::BitCastF64U64,
+		                               {IR::Value(uint64_t {0x7ff8000000000000})});
+		const auto is_nan    = ir.Emit(IR::ValueOpcode::FPIsNan64, {result});
+		WriteOperand(destination, ir.Emit(IR::ValueOpcode::SelectF64, {is_nan, quiet_nan, clamped}));
 		return;
 	}
 	const bool half   = type == IR::Type::F16;
