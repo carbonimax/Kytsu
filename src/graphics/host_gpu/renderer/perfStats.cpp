@@ -117,6 +117,14 @@ bool BindMemoStatsEnabled() noexcept {
 	return enabled && CpPipeline::IsBackThread();
 }
 
+bool TexIndexStatsEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEX_INDEX_STATS");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
 void Add(Counter counter, uint64_t value) noexcept {
 	if (Enabled()) {
 		g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
@@ -349,6 +357,17 @@ void MaybeReport() noexcept {
 		            " resource_diffs=%" PRIu64 " raced=%" PRIu64 "\n",
 		            seconds, n(Counter::Frames), n(Counter::RiKept), n(Counter::RiChecked), n(Counter::RiDiffs),
 		            n(Counter::RiResourceDiffs), n(Counter::RiRaced));
+	}
+	if (n(Counter::TiFind) + n(Counter::TiChecked) != 0) {
+		std::printf("PERF texindex %.1fs: frames=%" PRIu64 " checked=%" PRIu64 " diffs=%" PRIu64 " find=%" PRIu64
+		            "(%.2fms,clock=%.2fms) full=%" PRIu64 "(%.2fms) answered=%" PRIu64 " no_memo=%" PRIu64
+		            " keepable=%" PRIu64 " proof=%" PRIu64 " removable=%" PRIu64 "(%.2fms) alias=%" PRIu64
+		            " cand=%" PRIu64 " cand_same=%" PRIu64 " bucket=%" PRIu64 " rebuilt=%" PRIu64 "\n",
+		            seconds, n(Counter::Frames), n(Counter::TiChecked), n(Counter::TiDiffs), n(Counter::TiFind),
+		            ms(Counter::TiFindNs), ms(Counter::TiClockNs), n(Counter::TiFull), ms(Counter::TiFullNs),
+		            n(Counter::TiAnswered), n(Counter::TiNoMemo), n(Counter::TiKeepable), n(Counter::TiProof),
+		            n(Counter::TiRemovable), ms(Counter::TiRemovableNs), n(Counter::TiAlias), n(Counter::TiCand),
+		            n(Counter::TiCandSame), n(Counter::TiBucket), n(Counter::TiCandRebuilt));
 	}
 	if (n(Counter::TessMissLs) + n(Counter::TessMissHs) + n(Counter::TessMissDs) +
 	        n(Counter::TessDeferredDraws) !=

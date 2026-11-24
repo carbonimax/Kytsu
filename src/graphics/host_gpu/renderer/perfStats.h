@@ -193,6 +193,26 @@ enum class Counter : uint32_t {
 	RiDiffs,
 	RiResourceDiffs, // the address said same resource, the full comparison did not
 	RiRaced,         // only the image differed, and the texture cache epoch moved between the lookups
+	// KYTY_TEXTURE_ADDR_INDEX (textureCache.cpp, "PERF texindex"), all threads. =2: searches the address
+	// lookup answered, compared with the full search. KYTY_TEX_INDEX_STATS=1 (measurement): the rest.
+	TiChecked,
+	TiDiffs,
+	TiFind,          // FindImage calls, of which
+	TiFindNs,        //   their whole time (one clock pair each, see TiClockNs)
+	TiClockNs,       //   one empty clock pair per timed call (to subtract)
+	TiFull,          //   full searches (FindImageLocked), of which
+	TiFullNs,
+	TiAnswered,      //     answered by the address lookup (=1)
+	TiNoMemo,        //     the caller passed no FindImageMemo
+	TiKeepable,      //     main path ran and its result may be kept (no alias, insert, free or merge)
+	TiProof,         //     no BcAlias possible (class counts)
+	TiRemovable,     //     keepable and no BcAlias possible: what the address lookup can answer
+	TiRemovableNs,
+	TiAlias,         //     main path: a candidate BcAlias::Matches the description
+	TiCand,          //     main path: candidates examined
+	TiCandSame,      //     main path: of which at the description's address
+	TiBucket,        //     entries of the description's first page
+	TiCandRebuilt,   // FindImageCandidates lists rebuilt (FindImagesInRegion walks)
 	// KYTY_BIND_MEMO_STATS=1 (measurement; needs KYTY_PERF_STATS=1), CP back thread only: buffer slot
 	// lookups a memo could keep ("PERF bindmemo"). Each *Ns includes one clock read (BmClockNs per call).
 	BmCalls,       // RebindBuffers: NativeStorageBuffer calls
@@ -245,6 +265,8 @@ enum class Counter : uint32_t {
 [[nodiscard]] bool SrtProfEnabled() noexcept;
 // KYTY_BIND_MEMO_STATS=1 (measurement, default off; needs KYTY_PERF_STATS=1), on the CP back thread.
 [[nodiscard]] bool BindMemoStatsEnabled() noexcept;
+// KYTY_TEX_INDEX_STATS=1 (measurement, default off; needs KYTY_PERF_STATS=1): texture search counters.
+[[nodiscard]] bool TexIndexStatsEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;
