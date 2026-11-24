@@ -1098,7 +1098,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
-		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+		if (buffers.HasGpuDirtyBytes(vaddr, size, true)) {
 			Graphics::CpSplitProf::Drain(Graphics::CpSplitProf::Cause::SyncRead);
 			Graphics::CpPipeline::Drain();
 			buffers.ReadMemoryWindow(vaddr, size);

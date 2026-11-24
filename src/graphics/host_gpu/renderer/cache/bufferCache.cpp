@@ -43,6 +43,83 @@ namespace Libs::Graphics {
 
 static std::atomic<BufferCache*> g_import_cache {nullptr};
 
+// KYTY_EAGER_READBACK=0|1|2 (default 0: nothing changes). 1: a page the CPU read back while it was
+// GPU-written (requests of at most 16 tracker pages, never forgotten) is downloaded again at the end
+// of each command buffer that writes it, in that command buffer, and published once it completed. A
+// later read finds the page clean, or waits for that download only. 2: verify: the same downloads and
+// publications, but the pages stay GPU-written, so the usual readback downloads them again and
+// compares its bytes with the published ones ("PERF eager" diffs, first addresses logged).
+// Needs asynchronous fault readbacks and no KYTY_MEM_IMPORT.
+namespace EagerReadback {
+int Mode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_EAGER_READBACK");
+		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+		return v == 1 || v == 2 ? static_cast<int>(v) : 0;
+	}();
+	return mode;
+}
+struct Stats {
+	std::atomic<uint64_t> bytes {0}, kept {0}, copies {0}, temporaries {0}, waits {0}, verified {0}, diffs {0},
+	    lost {0};
+};
+Stats& S() {
+	static Stats stats;
+	return stats;
+}
+// =2: bytes published early whose next download compares with them (any thread).
+std::mutex g_verify_mutex;
+RangeSet   g_verify;
+void Forget(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(g_verify_mutex);
+	g_verify.Subtract(vaddr, size);
+}
+// =2: called with the bytes a readback is about to write to guest memory.
+void Verify(uint64_t guest, const uint8_t* host, uint64_t size) {
+	std::lock_guard lock(g_verify_mutex);
+	if (!g_verify.Intersects(guest, size)) {
+		return;
+	}
+	std::vector<uint8_t> published;
+	g_verify.ForEachInRange(guest, size, [&](uint64_t begin, uint64_t end) {
+		published.resize(end - begin);
+		if (!Libs::LibKernel::Memory::TryReadBacking(begin, published.data(), end - begin)) {
+			return;
+		}
+		S().verified.fetch_add(end - begin, std::memory_order_relaxed);
+		if (std::memcmp(published.data(), host + (begin - guest), end - begin) != 0) {
+			uint64_t at = 0;
+			while (published[at] == host[begin - guest + at]) {
+				at++;
+			}
+			if (S().diffs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("BufferCache: KYTY_EAGER_READBACK=2 diff at 0x%016" PRIx64 " (range 0x%016" PRIx64
+				            "+0x%" PRIx64 ")\n",
+				            begin + at, begin, end - begin);
+				std::fflush(stdout);
+			}
+		}
+	});
+	g_verify.Subtract(guest, size);
+}
+void Report(double seconds, uint64_t frames) {
+	if (Mode() == 0 || seconds <= 0.0) {
+		return;
+	}
+	const double fr  = frames != 0 ? static_cast<double>(frames) : 1.0;
+	auto&        st  = S();
+	const auto   kib = [&](std::atomic<uint64_t>& v) { return static_cast<double>(v.exchange(0)) / 1024.0 / fr; };
+	const auto   per = [&](std::atomic<uint64_t>& v) { return static_cast<double>(v.exchange(0)) / fr; };
+	// Per frame, except the totals diffs and lost.
+	const auto dl = kib(st.bytes), kept = kib(st.kept), copies = per(st.copies), temps = per(st.temporaries),
+	           waits = per(st.waits), verified = kib(st.verified);
+	std::printf("PERF eager mode=%d %.1fs dl_kib=%.1f kept_kib=%.1f copies=%.2f temporaries=%.2f writer_waits=%.2f "
+	            "verified_kib=%.1f diffs=%" PRIu64 " lost=%" PRIu64 "\n",
+	            Mode(), seconds, dl, kept, copies, temps, waits, verified, st.diffs.load(), st.lost.load());
+	std::fflush(stdout);
+}
+} // namespace EagerReadback
+
 
 // Second queue (KYTY_READBACK_QUEUE) for guest-fault readbacks of GPU writes that already
 // completed: the copy does not wait behind the work queued on the main queue. GPU thread:
@@ -699,16 +776,205 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::FindPendingPublish(uint64_t vaddr,
                                                                                 uint64_t size) {
-	std::lock_guard lock(m_pending_mutex);
-	for (const auto& pending: m_pending_publishes) {
-		if (pending.begin < vaddr + size && vaddr < pending.end) {
-			return pending.done;
+	{
+		std::lock_guard lock(m_pending_mutex);
+		for (const auto& pending: m_pending_publishes) {
+			if (pending.begin < vaddr + size && vaddr < pending.end) {
+				return pending.done;
+			}
+		}
+	}
+	return m_eager ? FindEagerPublish(vaddr, size) : nullptr;
+}
+
+std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::FindEagerPublish(uint64_t vaddr, uint64_t size,
+                                                                              bool bytes) {
+	std::lock_guard lock(m_eager_mutex);
+	for (const auto& entry: m_eager_publishes) {
+		if ((bytes ? entry->bytes : entry->ranges).Intersects(vaddr, size)) {
+			return entry->done;
 		}
 	}
 	return nullptr;
 }
 
-void BufferCache::WaitPendingPublishes(uint64_t vaddr, uint64_t size) {
+// GPU thread (or the CP pipeline's back thread): a readback of GPU-written pages.
+void BufferCache::EagerNoteRead(uint64_t vaddr, uint64_t size) {
+	if (!m_eager || size == 0 || !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return;
+	}
+	const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto bytes = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - first;
+	if (bytes <= 16 * TRACKER_PAGE_SIZE) {
+		std::lock_guard lock(m_eager_mutex);
+		m_eager_pages.Add(first, bytes);
+	}
+}
+
+// A write binding, before it marks its pages GPU-modified. An eager download in flight over them
+// keeps them GPU-modified (its bytes are older); one being published is waited for, as it may be
+// clearing that mark. The read-back pages it writes are downloaded at the end of the command buffer.
+void BufferCache::EagerNoteWrite(uint64_t vaddr, uint64_t size) {
+	if (!m_eager || size == 0) {
+		return;
+	}
+	const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto bytes = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - first;
+	const auto work  = PerfStats::t_work_recorded.load(std::memory_order_relaxed);
+	std::vector<std::shared_ptr<ReadbackCompletion>> wait;
+	{
+		std::lock_guard lock(m_eager_mutex);
+		for (const auto& entry: m_eager_publishes) {
+			if (entry->ranges.Intersects(first, bytes)) {
+				if (entry->publishing) {
+					wait.push_back(entry->done);
+				} else {
+					entry->keep.Add(first, bytes);
+				}
+			}
+		}
+		m_eager_pages.ForEachInRange(first, bytes, [&](uint64_t begin, uint64_t end) {
+			m_eager_writes.push_back({begin, end, work});
+		});
+	}
+	for (const auto& done: wait) {
+		EagerReadback::S().waits.fetch_add(1, std::memory_order_relaxed);
+		done->Wait();
+	}
+	if (EagerReadback::Mode() == 2) {
+		EagerReadback::Forget(first, bytes);
+	}
+}
+
+// Pre-submit (GPU thread, the CP pipeline drained): downloads the read-back pages written by this
+// command buffer, one copy per buffer. A write binding counts only once a draw or dispatch started
+// after it (PerfStats::NoteWork): a submission while a draw is prepared (a stream-buffer wrap, a
+// synchronous readback) comes before that draw's writes are recorded.
+void BufferCache::EagerRecord() {
+	if (m_sync_download != 0) {
+		// A synchronous download is submitting: its bytes left the dirty set, unpublished. Next submission.
+		return;
+	}
+	const auto work = PerfStats::t_work_recorded.load(std::memory_order_relaxed);
+	RangeSet   in_flight;
+	{
+		std::lock_guard lock(m_pending_mutex);
+		for (const auto& pending: m_pending_publishes) {
+			const auto first = Common::AlignDown(pending.begin, TRACKER_PAGE_SIZE);
+			in_flight.Add(first, Common::AlignUp(pending.end, TRACKER_PAGE_SIZE) - first);
+		}
+	}
+	RangeSet ready;
+	{
+		std::lock_guard lock(m_eager_mutex);
+		ready = EagerReadyPages(m_eager_writes, work, in_flight);
+	}
+	if (ready.Empty()) {
+		return;
+	}
+	std::vector<BufferId> ids;
+	ready.ForEach([&](uint64_t begin, uint64_t end) {
+		auto it = m_buffers.upper_bound(begin);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			const auto& buffer = m_slot_buffers[it->second];
+			if (!buffer.IsImported() && buffer.CpuAddress() + buffer.Size() > begin &&
+			    std::find(ids.begin(), ids.end(), it->second) == ids.end()) {
+				ids.push_back(it->second);
+			}
+		}
+	});
+	for (const auto id: ids) {
+		auto&                       buffer = m_slot_buffers[id];
+		auto                        entry  = std::make_shared<EagerPublish>();
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total_size = 0;
+		ready.ForEachInRange(buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
+			const auto before = copies.size();
+			CollectDownload(buffer, begin, end - begin, copies, total_size);
+			// Only the pages these copies cover get published (and their mark cleared).
+			for (auto i = before; i < copies.size(); i++) {
+				const auto first = Common::AlignDown(buffer.CpuAddress() + copies[i].srcOffset, TRACKER_PAGE_SIZE);
+				entry->ranges.Add(first, Common::AlignUp(buffer.CpuAddress() + copies[i].srcOffset + copies[i].size,
+				                                         TRACKER_PAGE_SIZE) - first);
+			}
+		});
+		if (copies.empty()) {
+			continue;
+		}
+		for (const auto& copy: copies) {
+			entry->bytes.Add(buffer.CpuAddress() + copy.srcOffset, copy.size);
+			if (EagerReadback::Mode() == 2) {
+				entry->spans.emplace_back(buffer.CpuAddress() + copy.srcOffset, copy.size);
+			}
+		}
+		EagerReadback::S().bytes.fetch_add(total_size, std::memory_order_relaxed);
+		EagerReadback::S().copies.fetch_add(1, std::memory_order_relaxed);
+		Common::UniqueFunction<void> publish;
+		// No wait: a stream-buffer wait for this command buffer would submit it again.
+		RecordCollected(buffer, std::move(copies), total_size, publish, false);
+		entry->done = std::make_shared<ReadbackCompletion>();
+		{
+			std::lock_guard lock(m_eager_mutex);
+			m_eager_publishes.push_back(entry);
+		}
+		m_scheduler.DeferPriorityOperation([this, entry, publish = std::move(publish)]() mutable {
+			EagerPublishRun(*entry, publish);
+		});
+	}
+}
+
+// Priority-operation thread, once the command buffer completed.
+void BufferCache::EagerPublishRun(EagerPublish& entry, Common::UniqueFunction<void>& publish) {
+	RangeSet keep;
+	{
+		std::lock_guard lock(m_eager_mutex);
+		entry.publishing = true;
+		keep             = entry.keep;
+	}
+	publish();
+	RangeSet clean = entry.ranges;
+	keep.ForEach([&](uint64_t begin, uint64_t end) {
+		clean.Subtract(begin, end - begin);
+		entry.ranges.ForEachInRange(begin, end - begin, [](uint64_t b, uint64_t e) {
+			EagerReadback::S().kept.fetch_add(e - b, std::memory_order_relaxed);
+		});
+	});
+	if (EagerReadback::Mode() == 1) {
+		clean.ForEach(
+		    [&](uint64_t begin, uint64_t end) { m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin); });
+	} else {
+		// Verify: the pages stay GPU-written and the bytes dirty, so the next readback downloads them again.
+		{
+			std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+			for (const auto& [begin, bytes]: entry.spans) {
+				clean.ForEachInRange(begin, bytes,
+				                     [&](uint64_t b, uint64_t e) { m_gpu_modified_ranges.Add(b, e - b); });
+			}
+		}
+		std::lock_guard lock(EagerReadback::g_verify_mutex);
+		for (const auto& [begin, bytes]: entry.spans) {
+			clean.ForEachInRange(begin, bytes, [&](uint64_t b, uint64_t e) { EagerReadback::g_verify.Add(b, e - b); });
+		}
+	}
+	// Pages bound for writing since the copy keep their mark.
+	keep.ForEach([&](uint64_t begin, uint64_t end) {
+		if (entry.ranges.Intersects(begin, end - begin) &&
+		    !m_memory_tracker.IsRegionGpuModified(begin, end - begin)) {
+			EagerReadback::S().lost.fetch_add(1, std::memory_order_relaxed);
+		}
+	});
+	{
+		std::lock_guard lock(m_eager_mutex);
+		std::erase_if(m_eager_publishes,
+		              [&](const std::shared_ptr<EagerPublish>& e) { return e.get() == &entry; });
+	}
+	entry.done->Signal();
+}
+
+void BufferCache::WaitPendingPublishes(uint64_t vaddr, uint64_t size, bool eager) {
 	// Readbacks are only left pending in asynchronous mode.
 	if (!AsyncFaultReadbacks()) {
 		return;
@@ -724,6 +990,14 @@ void BufferCache::WaitPendingPublishes(uint64_t vaddr, uint64_t size) {
 				} else {
 					tick = std::max(tick, pending.tick);
 				}
+			}
+		}
+	}
+	if (m_eager && eager) [[unlikely]] {
+		std::lock_guard lock(m_eager_mutex);
+		for (const auto& entry: m_eager_publishes) {
+			if (entry->ranges.Intersects(vaddr, size)) {
+				side.push_back(entry->done); // published by the priority-operation thread
 			}
 		}
 	}
@@ -827,7 +1101,8 @@ static uint32_t SyncSideReads() {
 	return mode;
 }
 
-bool BufferCache::ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t size) {
+bool BufferCache::ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t size, uint64_t need,
+                                        uint64_t need_size) {
 	if (buffer.IsImported()) {
 		WaitPendingPublishes(begin, size);
 		(void)PublishImported(begin, size, true, nullptr);
@@ -847,25 +1122,64 @@ bool BufferCache::ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t
 		}
 		m_scheduler.Wait(latest);
 	}
-	WaitPendingPublishes(begin, size);
+	// The publication below leaves the pages of eager downloads in flight marked: only the bytes read wait for them.
+	const bool narrow = need_size != 0 && EagerReadback::Mode() == 1;
+	WaitPendingPublishes(begin, size, !narrow);
+	if (narrow) {
+		// Pages bound for writing since an eager download: its publication would write its older bytes over this copy.
+		WaitEager(begin, size, &EagerPublish::keep);
+	}
 	auto done = DownloadForFault(buffer, begin, size, true);
 	if (done == nullptr) {
 		// No GPU-written byte left in the window: nothing to publish.
-		m_memory_tracker.UnmarkRegionAsGpuModified(begin, size);
+		UnmarkExceptEager(begin, size);
+		if (narrow) {
+			WaitEager(need, need_size, &EagerPublish::bytes);
+		}
 		return true;
 	}
 	if (done->side_tick != 0) {
 		PerfStats::ScopedTimer timer(PerfStats::Counter::SideReadNs, PerfStats::Counter::SideReadCount);
 		m_readback_queue->Wait(done->side_tick);
 		done->side_publish();
+		if (narrow) {
+			WaitEager(need, need_size, &EagerPublish::bytes);
+		}
 		return true;
 	}
 	// No ring space: the main queue copies the window, published by a priority operation.
 	const auto tick = m_scheduler.CurrentTick();
 	m_scheduler.Wait(tick);
-	m_scheduler.WaitPriorityOperations(tick);
+	m_scheduler.WaitPriorityOperations(tick); // the eager publications queued before it ran too
 	done->Wait();
 	return true;
+}
+
+void BufferCache::UnmarkExceptEager(uint64_t vaddr, uint64_t size) {
+	RangeSet clear;
+	clear.Add(vaddr, size);
+	if (m_eager) {
+		std::lock_guard lock(m_eager_mutex);
+		for (const auto& entry: m_eager_publishes) {
+			entry->ranges.ForEachInRange(vaddr, size, [&](uint64_t b, uint64_t e) { clear.Subtract(b, e - b); });
+		}
+	}
+	clear.ForEach([&](uint64_t b, uint64_t e) { m_memory_tracker.UnmarkRegionAsGpuModified(b, e - b); });
+}
+
+void BufferCache::WaitEager(uint64_t vaddr, uint64_t size, RangeSet EagerPublish::* set) {
+	std::vector<std::shared_ptr<ReadbackCompletion>> held;
+	{
+		std::lock_guard lock(m_eager_mutex);
+		for (const auto& entry: m_eager_publishes) {
+			if (((*entry).*set).Intersects(vaddr, size)) {
+				held.push_back(entry->done);
+			}
+		}
+	}
+	for (const auto& done: held) {
+		done->Wait();
+	}
 }
 
 bool BufferCache::WritesComplete(uint64_t vaddr, uint64_t size) {
@@ -886,12 +1200,17 @@ bool BufferCache::WritesComplete(uint64_t vaddr, uint64_t size) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	WaitPendingPublishes(vaddr, size);
+	// Synchronous: the priority operations of this submission, waited for below, run after the eager
+	// publications queued before it (=2 dirties their bytes again: those are waited for first).
+	WaitPendingPublishes(vaddr, size, async || EagerReadback::Mode() == 2);
 	if (buffer.IsImported()) {
 		return PublishImported(vaddr, size, true, nullptr);
 	}
 	Common::UniqueFunction<void> publish;
 	if (!RecordDownload(buffer, vaddr, size, publish)) {
+		if constexpr (!async) {
+			WaitPendingPublishes(vaddr, size); // nothing submitted to wait behind: eager bytes must land first
+		}
 		return false;
 	}
 	if constexpr (async) {
@@ -900,7 +1219,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		const auto tick = m_scheduler.CurrentTick();
 		{
 			MemTrackProf::Timer timer(MemTrackProf::Counter::DownloadSyncNs, MemTrackProf::Counter::DownloadSyncCount);
+			m_sync_download++; // KYTY_EAGER_READBACK leaves this submission alone (EagerRecord)
 			m_scheduler.Wait(tick);
+			m_sync_download--;
 			m_scheduler.WaitPriorityOperations(tick);
 		}
 		publish();
@@ -911,6 +1232,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 // A download can reach past the guest mapping (unmapped holes after a VMA): only the mapped
 // prefix is written back, and a prefix without host backing is skipped.
 static void WriteDownloadBacking(uint64_t guest, const uint8_t* host, uint64_t size) {
+	if (EagerReadback::Mode() == 2) [[unlikely]] {
+		EagerReadback::Verify(guest, host, size);
+	}
 	const auto writable = Libs::LibKernel::Memory::TryClampRangeSize(guest, size);
 	if (writable == 0) {
 		LOGF("BufferCache: skipped GPU download into unmapped guest addr=0x%016" PRIx64
@@ -978,7 +1302,7 @@ std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(B
 					                     mapped + (copy.dstOffset - offset), copy.size);
 				}
 				m_readback_queue->Release(seq);
-				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+				UnmarkExceptEager(vaddr, size);
 				{
 					std::lock_guard lock(m_pending_mutex);
 					std::erase_if(m_pending_publishes, [&](const PendingPublish& pending) {
@@ -1065,11 +1389,15 @@ void BufferCache::CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 }
 
 void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> copies,
-                                  uint64_t total_size, Common::UniqueFunction<void>& publish_out) {
+                                  uint64_t total_size, Common::UniqueFunction<void>& publish_out,
+                                  bool may_wait) {
 	const auto buffer_address = buffer.CpuAddress();
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	auto [mapped, offset] = m_download_buffer.Map(total_size, 64, may_wait);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
+		if (!may_wait) {
+			EagerReadback::S().temporaries.fetch_add(1, std::memory_order_relaxed);
+		}
 		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
 		mapped = temporary->Mapped().data();
@@ -1233,6 +1561,16 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (m_import) {
 		g_import_cache.store(this, std::memory_order_release);
 	}
+	if (EagerReadback::Mode() != 0) {
+		m_eager = AsyncFaultReadbacks() && !m_import;
+		if (m_eager) {
+			m_scheduler.SetLatePreSubmit([](void* context) { static_cast<BufferCache*>(context)->EagerRecord(); },
+			                             this);
+		}
+		std::printf("BufferCache: KYTY_EAGER_READBACK=%d %s\n", EagerReadback::Mode(),
+		            m_eager ? "on" : "off (needs asynchronous fault readbacks, no KYTY_MEM_IMPORT)");
+		std::fflush(stdout);
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -1279,6 +1617,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
+		EagerNoteRead(vaddr, size);
 		// A write releases the GPU's pages and claims them for the CPU in one critical section.
 		// As two calls, a buffer synchronization on another thread could mark a page GPU-dirty in
 		// between, and the CPU claim exits on "CPU dirty state conflicts with GPU dirty state".
@@ -2153,6 +2492,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write, &wait_for,
 		                                                &own_side, &import_wait] {
 			MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
+			EagerNoteRead(vaddr, 1);
 			if (is_write && !IsRegionRegistered(vaddr, 1)) {
 				// Cache buffers cover whole tracker pages, so this page has nothing to download.
 				m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
@@ -2223,6 +2563,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 	const auto send_start = MemTrackProf::Enabled() ? MemTrackProf::NowNs() : 0;
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write] {
 		MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
+		EagerNoteRead(vaddr, 1);
 		if (is_write && !IsRegionRegistered(vaddr, 1)) {
 			// Cache buffers cover whole tracker pages, so this page has nothing to download.
 			{
@@ -2343,6 +2684,9 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 	// these bytes in command-stream order with the GPU writes around them.
 	WriteDataBuffer(buffer, vaddr, data, size);
 	NoteBufferWrite(vaddr, size);
+	if (EagerReadback::Mode() == 2) [[unlikely]] {
+		EagerReadback::Forget(vaddr, size);
+	}
 	return true;
 }
 
@@ -2368,12 +2712,13 @@ void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 		ReadMemory(vaddr, size);
 		return;
 	}
+	EagerNoteRead(vaddr, size);
 	auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 	const auto base   = buffer.CpuAddress();
 	const auto window = ReadbackWindowBytes();
 	const auto begin  = std::max(base, Common::AlignDown(vaddr, window));
 	const auto last   = std::min(base + buffer.Size(), Common::AlignUp(vaddr + size, window));
-	if (begin < last && ReadWindowOnSideQueue(buffer, begin, last - begin)) {
+	if (begin < last && ReadWindowOnSideQueue(buffer, begin, last - begin, vaddr, size)) {
 		return;
 	}
 	if (begin < last && DownloadBufferMemory<false>(buffer, begin, last - begin)) {
@@ -3035,7 +3380,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	if (is_written) {
-		WaitPendingPublishes(vaddr, size);
+		WaitPendingPublishes(vaddr, size, false);
+		EagerNoteWrite(vaddr, size);
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
@@ -3208,7 +3554,7 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
-bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size, bool wait_eager) {
 	// Dirty bytes only exist on GPU-dirty tracker pages; the page bits are cheaper to test.
 	if (GuestGpu::IsGpuThread() && !m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, size)) {
 		return false;
@@ -3219,8 +3565,23 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 		std::lock_guard ranges_lock(m_gpu_ranges_mutex);
 		intersects = m_gpu_modified_ranges.Intersects(vaddr, size);
 	}
-	return intersects ||
-	       (AsyncFaultReadbacks() && FindPendingPublish(vaddr, size) != nullptr);
+	if (intersects || !AsyncFaultReadbacks()) {
+		return intersects;
+	}
+	const auto pending = FindPendingPublish(vaddr, size); // queued readbacks first, then eager downloads
+	if (pending == nullptr || !m_eager || pending != FindEagerPublish(vaddr, size)) {
+		return pending != nullptr;
+	}
+	// Only eager downloads hold these pages: bytes they do not download are clean.
+	if (FindEagerPublish(vaddr, size, true) == nullptr) {
+		return false;
+	}
+	if (!wait_eager || !GuestGpu::IsGpuThread()) {
+		return true;
+	}
+	// Their batch only has to complete; reading the window back would also wait for its latest writer.
+	WaitEager(vaddr, size, &EagerPublish::bytes);
+	return HasGpuDirtyBytes(vaddr, size); // a write bound since keeps its bytes dirty
 }
 
 bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

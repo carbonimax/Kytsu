@@ -41,6 +41,10 @@ namespace Libs::Graphics::LateRead {
 void Report(double seconds, uint64_t frames); // bufferCache.h (KYTY_LATE_READ_PROF, KYTY_WFAULT_DELAY_US)
 } // namespace Libs::Graphics::LateRead
 
+namespace Libs::Graphics::EagerReadback {
+void Report(double seconds, uint64_t frames); // bufferCache.cpp (KYTY_EAGER_READBACK)
+} // namespace Libs::Graphics::EagerReadback
+
 namespace Libs::Graphics::PerfStats {
 
 namespace {
@@ -497,6 +501,7 @@ void MaybeReport() noexcept {
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	MemTrackProf::Report(seconds, n(Counter::Frames));
 	LateRead::Report(seconds, n(Counter::Frames));
+	EagerReadback::Report(seconds, n(Counter::Frames));
 	LibKernel::Memory::ReportSparseCopyCache();
 	GuestStacks::Report();
 	ShaderPretranslate::Report();

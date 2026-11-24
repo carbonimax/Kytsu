@@ -532,6 +532,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (m_pre_submit != nullptr) [[unlikely]] {
 		m_pre_submit(m_pre_submit_context);
 	}
+	if (m_late_pre_submit != nullptr) [[unlikely]] {
+		m_late_pre_submit(m_late_pre_submit_context);
+	}
 
 	if (m_external_wait_value > m_external_waited) {
 		if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {

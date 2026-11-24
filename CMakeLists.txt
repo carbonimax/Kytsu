@@ -597,6 +597,10 @@ add_executable(staging_memory_policy_tests EXCLUDE_FROM_ALL
 target_link_libraries(staging_memory_policy_tests Vulkan::Headers)
 target_include_directories(staging_memory_policy_tests PRIVATE ${inc_headers})
 
+add_executable(eager_pages_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EagerPagesTests.cpp")
+target_link_libraries(eager_pages_tests fmt::fmt common)
+target_include_directories(eager_pages_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -939,6 +943,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME refresh_prof COMMAND $<TARGET_FILE:refresh_prof_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
+	add_test(NAME eager_pages COMMAND $<TARGET_FILE:eager_pages_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME texture_track_range COMMAND $<TARGET_FILE:texture_track_range_tests>)
 	add_test(NAME texture_track_range_mutant_no_clamp
@@ -1162,6 +1167,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		refresh_prof_tests
 		memory_tracker_tests
+		eager_pages_tests
 		page_manager_tests
 		build_flags_tests
 		driver_cache_policy_tests

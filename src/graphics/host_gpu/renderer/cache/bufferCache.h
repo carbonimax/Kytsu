@@ -8,6 +8,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/eagerPages.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -142,7 +143,9 @@ public:
 	[[nodiscard]] static int UploadBatchMode();
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// `wait_eager` (GPU thread): bytes held only by a KYTY_EAGER_READBACK download in flight are waited for
+	// (its command buffer was submitted), then count as clean, instead of being read back with their window.
+	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size, bool wait_eager = false);
 	// KYTY_MEM_IMPORT: copies over a CPU read of the backing the WRITE_DATA bytes that WriteGpuOwned put
 	// in the command stream of imported memory and whose command buffer has not completed (GPU thread).
 	void OverlayOwnedWrites(uint64_t vaddr, void* data, uint64_t size);
@@ -253,7 +256,24 @@ private:
 	                                                                     uint64_t size);
 	// GPU thread: waits until no queued fault readback covers the range (its publication
 	// releases the page protection, which must not race new GPU ownership of the pages).
-	void WaitPendingPublishes(uint64_t vaddr, uint64_t size);
+	// `eager`: also KYTY_EAGER_READBACK downloads (a write binding notes itself instead, EagerNoteWrite).
+	void WaitPendingPublishes(uint64_t vaddr, uint64_t size, bool eager = true);
+	// KYTY_EAGER_READBACK (see bufferCache.cpp).
+	struct EagerPublish {
+		RangeSet                            ranges; // page-aligned guest ranges the copy downloads
+		RangeSet                            keep;   // pages bound for writing since: they stay GPU-modified
+		RangeSet                            bytes;  // the downloaded bytes (other bytes of the pages are clean)
+		std::vector<std::pair<uint64_t, uint64_t>> spans; // =2: the downloaded bytes (begin, size)
+		std::shared_ptr<ReadbackCompletion> done;
+		bool                                publishing = false;
+	};
+	void EagerNoteRead(uint64_t vaddr, uint64_t size);
+	void EagerNoteWrite(uint64_t vaddr, uint64_t size);
+	void EagerRecord();
+	void EagerPublishRun(EagerPublish& entry, Common::UniqueFunction<void>& publish);
+	// Readers: an eager download in flight over the range (nullptr: none).
+	[[nodiscard]] std::shared_ptr<ReadbackCompletion> FindEagerPublish(uint64_t vaddr, uint64_t size,
+	                                                                   bool bytes = false);
 	[[nodiscard]] bool RecordDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                  Common::UniqueFunction<void>& publish);
 	[[nodiscard]] std::shared_ptr<ReadbackCompletion> DownloadForFault(Buffer& buffer, uint64_t vaddr,
@@ -271,11 +291,16 @@ private:
 	// range is not tracked or was written by the command buffer being recorded.
 	[[nodiscard]] uint64_t LatestWriteTick(uint64_t vaddr, uint64_t size);
 	// KYTY_SYNC_SIDE_READS: ReadMemoryWindow through the readback queue; false when not taken.
-	bool ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t size);
+	// `need`, `need_size`: the bytes the caller reads (0: the window). Only eager downloads of those are waited for.
+	bool ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t size, uint64_t need = 0, uint64_t need_size = 0);
+	// Clears the GPU-written mark of the range except on pages of eager downloads in flight (their publication does).
+	void UnmarkExceptEager(uint64_t vaddr, uint64_t size);
+	// Waits for the eager downloads in flight whose `set` (bytes, keep) intersects the range.
+	void WaitEager(uint64_t vaddr, uint64_t size, RangeSet EagerPublish::* set);
 	void CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
 	void RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> copies, uint64_t total_size,
-	                     Common::UniqueFunction<void>& publish);
+	                     Common::UniqueFunction<void>& publish, bool may_wait = true);
 	[[nodiscard]] std::shared_ptr<ReadbackCompletion>
 	DownloadCollected(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                  std::vector<vk::BufferCopy> copies, uint64_t total_size,
@@ -377,6 +402,13 @@ private:
 		uint64_t begin = 0, end = 0, tick = 0;
 	};
 	std::vector<SideCopy> m_side_copies; // readback-queue copies that may still run (GPU thread)
+	// KYTY_EAGER_READBACK. Leaf lock, like m_pending_mutex.
+	bool                                        m_eager = false;
+	uint32_t                                    m_sync_download = 0; // GPU thread: DownloadBufferMemory<false> waiting
+	std::mutex                                  m_eager_mutex;
+	RangeSet                                    m_eager_pages; // read back while GPU-written, never forgotten
+	std::vector<EagerWrite>                     m_eager_writes;
+	std::vector<std::shared_ptr<EagerPublish>> m_eager_publishes;
 	uint64_t              m_side_completed = 0;
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
