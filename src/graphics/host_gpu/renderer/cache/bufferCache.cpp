@@ -3608,13 +3608,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			bool overlaid    = false;
 			const bool timed = PerfStats::Enabled() && H::g_sample_counter++ % H::Sample == 0;
 			const auto arm   = timed ? H::Arm() : 0;
+			// Producer time either way: the copy, or queuing it for the recorder.
+			const auto t0 = timed ? H::NowNs() : 0;
 			if (H::Defer(stream, mapped, vaddr, size, timed)) {
 				if (PerfStats::Enabled()) {
 					H::g_deferred[H::Arm()]++;
 					H::g_deferred_bytes[H::Arm()] += size;
+					if (timed) {
+						auto& ns = CpPipeline::IsBackThread() ? H::g_direct_back_ns : H::g_direct_front_ns;
+						ns[arm] += (H::NowNs() - t0) * H::Sample;
+					}
 				}
 			} else {
-				const auto t0 = timed ? H::NowNs() : 0;
 				if (!CopyStreamBytes(vaddr, mapped, size, &overlaid)) {
 					EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 				}
