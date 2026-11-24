@@ -295,8 +295,8 @@ private:
 	bool ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t size, uint64_t need = 0, uint64_t need_size = 0);
 	// Clears the GPU-written mark of the range except on pages of eager downloads in flight (their publication does).
 	void UnmarkExceptEager(uint64_t vaddr, uint64_t size);
-	// Waits for the eager downloads in flight whose `set` (bytes, keep) intersects the range.
-	void WaitEager(uint64_t vaddr, uint64_t size, RangeSet EagerPublish::* set);
+	// Waits for the eager downloads in flight that EagerMustWait selects for the range.
+	void WaitEager(uint64_t vaddr, uint64_t size, EagerWait kind);
 	void CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
 	void RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> copies, uint64_t total_size,

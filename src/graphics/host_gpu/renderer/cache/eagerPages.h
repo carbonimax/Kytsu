@@ -33,6 +33,16 @@ inline RangeSet EagerReadyPages(std::vector<EagerWrite>& writes, uint64_t work, 
 	return ready;
 }
 
+// Who waits for an eager download in flight (BufferCache::WaitEager). `bytes`: what it downloaded; `keep`: its
+// pages bound for writing since. A reader of [vaddr, vaddr + size) waits when the download carries those bytes
+// (Read). A window copied now waits first when the download's pages were bound for writing since (BeforeCopy):
+// the copy takes the newer bytes, and the download, published after it, would put its older ones back.
+enum class EagerWait { Read, BeforeCopy };
+inline bool EagerMustWait(EagerWait kind, const RangeSet& bytes, const RangeSet& keep, uint64_t vaddr,
+                          uint64_t size) {
+	return (kind == EagerWait::Read ? bytes : keep).Intersects(vaddr, size);
+}
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_EAGERPAGES_H_ */
