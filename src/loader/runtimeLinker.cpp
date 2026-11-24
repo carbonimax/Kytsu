@@ -1661,6 +1661,32 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 	if (find(sr) || (l->name == "libSceLibcInternal" && find({sr.name, "libc", "libc", type}))) {
 		return;
 	}
+
+	// Last resort before a stub: some titles import a function under a library that does not export it
+	// (an IL2CPP title imports libc's setenv under its own assembly library). A NID is the hash of the
+	// symbol name: bind the first export of that name, HLE libraries first, then the loaded modules,
+	// the same precedence as the strict lookup above.
+	const auto find_nid = [&]() {
+		if (const auto* rec = m_symbols->FindByNid(sr.name, type); rec != nullptr) {
+			*out_info = *rec;
+			return true;
+		}
+		for (auto* p: m_programs) {
+			if (const auto* rec = p->export_symbols->FindByNid(sr.name, type); rec != nullptr) {
+				*out_info = *rec;
+				if (bind_self != nullptr) {
+					*bind_self = (p == program);
+				}
+				return true;
+			}
+		}
+		return false;
+	};
+	if (find_nid()) {
+		LOGF("PS5 NID fallback: %s [%s][%s] -> %s %s\n", sr.name.c_str(), l->name.c_str(), m->name.c_str(),
+		     out_info->name.c_str(), out_info->dbg_name.c_str());
+		return;
+	}
 	out_info->name = SymbolDatabase::GenerateName(sr);
 }
 
