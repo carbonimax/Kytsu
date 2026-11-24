@@ -10,7 +10,6 @@
 
 namespace Common {
 
-// Call on the main thread before starting other threads.
 void InitializeThreads();
 
 using wait_poll_func_t = void (*)();
@@ -22,13 +21,6 @@ void SleepNano(uint64_t nanos);
 bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
-// Gives the calling thread the host's top-ranked physical core, which other emulator threads
-// leave. Returns the lowest logical processor it reserves, or -1 when no core is reserved.
-int ReserveCoreForCurrentThread();
-#ifdef __linux__
-// Gives the calling thread the affinity the process started with, which exec keeps.
-void RestoreProcessAffinity();
-#endif
 
 } // namespace Thread
 
