@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssrProf.h"
+#include "graphics/host_gpu/renderer/cache/recorderHostCopy.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -741,6 +742,9 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
 	GpuCapture::Touch(reinterpret_cast<uint64_t>(counter), sizeof(uint64_t));
+	if (signal || *counter != 0) {
+		RecorderHostCopy::NoteCpWrite(reinterpret_cast<uint64_t>(counter), sizeof(uint64_t));
+	}
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
@@ -823,6 +827,7 @@ void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool r
 	// and the finest mip sampled (bits 24-27, 15 for none). A non-zero header dword 0 then marks
 	// the report complete.
 	if (dst != nullptr && size >= 64) {
+		RecorderHostCopy::NoteCpWrite(reinterpret_cast<uint64_t>(dst), size);
 		const auto slots = std::min((size - 64) / 8, 256u);
 		for (uint32_t slot = 0; slot < slots; slot++) {
 			const auto& counter = counters[slot];
@@ -1034,6 +1039,7 @@ void GuestGpu::ThreadRun(void* data) {
 				    Common::DebugCounters::Counter::GpuThreadBusyNs);
 				CpSplitProf::BusyBegin();
 				CpPipeline::Drain();
+				RecorderHostCopy::DrainPending();
 				command();
 				CpSplitProf::BusyEnd();
 			}
@@ -1755,6 +1761,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	if (data_sel == 0 && !interrupt) {
 		return;
 	}
+	// KYTY_RECORDER_HOST_COPY: the guest may reuse what earlier draws read once it sees this signal.
+	RecorderHostCopy::DrainPending();
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
@@ -2051,6 +2059,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
+			RecorderHostCopy::NoteCpWrite(event_address, 16u * 2u * sizeof(uint64_t));
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/recorderHostCopy.h"
 #include "common/emulatorConfig.h"
 #include "common/onceValue.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
@@ -497,6 +498,7 @@ void MaybeReport() noexcept {
 	EopAtGpu::Report(seconds);
 	BufferCache::ReportImport(seconds);
 	BufferCache::ReportStreamReuse(seconds, n(Counter::Frames));
+	RecorderHostCopy::Report(seconds, n(Counter::Frames));
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));
