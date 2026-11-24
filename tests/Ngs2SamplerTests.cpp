@@ -780,6 +780,12 @@ void TestAtrac9Discrete() {
 	}
 }
 
+void TestRunCommandsRefusesNullVoice() {
+	const uint32_t command[4] {2, 4, 0, 0}; // a set-event command
+	Check(Ngs2VoiceRunCommands(0, command, 1) == NGS2_ERROR_INVALID_VOICE_HANDLE,
+	      "commands to a null voice were not refused");
+}
+
 void TestWaveformBlockGeometry() {
 	// 24 kHz ATRAC9: frames of 128 samples, superframes of 4 frames in 192 bytes.
 	const Ngs2WaveformFormat format {NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0};
@@ -4363,6 +4369,7 @@ void TestFiniteFilterTail() {
 } // namespace
 
 int main() {
+	TestRunCommandsRefusesNullVoice();
 	TestProgressDrivenWaveformRing();
 	TestStereoPan();
 	TestWaveformQueueCapacity();

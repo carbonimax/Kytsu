@@ -37,6 +37,8 @@ constexpr int32_t NGS2_ERROR_INVALID_SYSTEM_HANDLE =
     static_cast<int32_t>(0x804a8201u);
 constexpr int32_t NGS2_ERROR_INVALID_RACK_HANDLE =
     static_cast<int32_t>(0x804a8202u);
+constexpr int32_t NGS2_ERROR_INVALID_VOICE_HANDLE =
+    static_cast<int32_t>(0x804a8203u);
 constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
     static_cast<int32_t>(0x804a8010u);
 constexpr int32_t NGS2_ERROR_INVALID_OUT_SIZE =
@@ -4335,6 +4337,9 @@ int KYTY_SYSV_ABI Ngs2VoiceRunCommands(uintptr_t voice_handle, const void* comma
 			const float* levels;
 		} value;
 	};
+	if (voice_handle == 0) {
+		return NGS2_ERROR_INVALID_VOICE_HANDLE;
+	}
 	auto*             voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
 	Common::LockGuard lock(voice->rack->ngs->mutex);
 	const auto*       params = static_cast<const Command*>(commands);
