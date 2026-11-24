@@ -55,13 +55,10 @@ void TestLinkerBindStep() {
 	Loader::Program       libc;
 	libc.export_symbols = std::make_unique<SymbolDatabase>();
 	SymbolResolve sr {};
-	sr.name                 = "2sWzhYqFH4E";
-	sr.library              = "libc";
-	sr.library_version      = 1;
-	sr.module               = "libc";
-	sr.module_version_major = 1;
-	sr.module_version_minor = 1;
-	sr.type                 = SymbolType::Object;
+	sr.name    = "2sWzhYqFH4E";
+	sr.library = "libc";
+	sr.module  = "libc";
+	sr.type    = SymbolType::Object;
 	libc.export_symbols->Add(sr, FAKE_STDOUT_FILE);
 
 	linker.BindGuestLibc(&libc);

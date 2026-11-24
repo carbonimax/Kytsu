@@ -988,8 +988,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	const uint32_t control = buffer[2];
 	const bool     chain   = (control & (1u << 20u)) != 0;
 
-	auto* indirect_buffer =
-	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
+	// The two low bits of the target DWORD are not address bits.
+	auto* indirect_buffer = reinterpret_cast<const uint32_t*>(
+	    (buffer[0] & ~0x3u) | (static_cast<uint64_t>(buffer[1]) << 32u));
 	const uint32_t indirect_num_dw = control & 0xfffffu;
 
 	if (indirect_num_dw == 0) {
@@ -1377,7 +1378,7 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
 	// Fork: ProcessPm4 drains the CP pipeline before every block Pm4::IsFlipBlock names.
-	// Driver user data has R = 1; a compute queue's flip has R = 0.
+	// Driver user data has R = 1 in a DCB and R = 0 on a compute queue.
 	if (Pm4::IsFlipBlock(cmd_id, buffer, cp.IsAsyncComputeQueue())) {
 		return (buffer[1] & 0xff000000u) == Pm4::USERDATA_TAG_FLIP
 		           ? CpFlip(cp, KYTY_PM4_R(cmd_id), buffer, dw)
@@ -1389,7 +1390,7 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 			cp.ResetQueue(buffer[1]);
 			return KYTY_PM4_LEN(cmd_id) - 1u;
 		}
-		if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+		if (Agc::AgcIsInternalDataPacket(cmd_id, buffer)) {
 			return KYTY_PM4_LEN(cmd_id) - 1u;
 		}
 	}
@@ -1476,10 +1477,8 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
-	auto  write_control = buffer[0];
-	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-
-	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
+	cp.WriteData(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u), buffer + 3, dw_num - 2,
+	             buffer[0]);
 
 	return 1 + dw_num;
 }

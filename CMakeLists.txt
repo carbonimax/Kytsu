@@ -411,7 +411,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
+set(kyty_emulator_link_libraries common Vulkan::Headers SPIRV-Tools-static SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
 
 # Linux system libraries.
 if(LINUX)
@@ -422,7 +422,6 @@ endif()
 set(inc_headers
 	${KYTY_SOURCE_DIR}
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
-	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/xxHash
@@ -784,8 +783,13 @@ if(KYTY_NOTO_SANS_DIR)
 	target_compile_definitions(font_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
 endif()
 
+add_executable(splash_animation_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SplashAnimationTests.cpp")
+target_link_libraries(splash_animation_tests kyty_test_gtest)
+target_include_directories(splash_animation_tests PRIVATE ${inc_headers})
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/descriptors.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncTrace.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
@@ -904,6 +908,15 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
 target_link_libraries(net_resolver_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(agc_tests "${KYTY_TESTS_DIR}/AgcTests.cpp")
+target_link_libraries(agc_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(kernel_event_flag_tests "${KYTY_TESTS_DIR}/KernelEventFlagTests.cpp")
+target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(user_service_tests "${KYTY_TESTS_DIR}/UserServiceTests.cpp")
+target_link_libraries(user_service_tests kyty_test_gtest)
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests shader_optimization_tests
@@ -1012,6 +1025,7 @@ if(BUILD_TESTING)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
 	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
+	add_test(NAME user_service COMMAND $<TARGET_FILE:user_service_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_mad_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-only)
 	add_test(NAME shader_recompiler_movrel COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --movrel-only)
@@ -1226,6 +1240,7 @@ if(BUILD_TESTING)
 		playgo_tests
 		vr_tracker2_tests
 		psml_tests
+		user_service_tests
 	)
 endif()
 

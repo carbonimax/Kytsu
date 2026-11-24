@@ -96,6 +96,10 @@ namespace Libs::LibAmpr {
 void InitAmpr_1(Loader::SymbolDatabase* symbols);
 }
 
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase* symbols);
+}
+
 namespace {
 
 using Libs::LibKernel::Memory::VirtualQueryInfo;
@@ -851,7 +855,7 @@ void TestDriverMemoryStartup() {
 		return size;
 	};
 	const auto before = available();
-	CheckOk(test, Libs::Graphics::Gen5Driver::Initialize(), "Gen5Driver::Initialize");
+	CheckOk(test, Libs::Graphics::AgcDriver::Initialize(), "AgcDriver::Initialize");
 	Libs::LibKernel::Memory::VirtualQueryInfo info {};
 	const bool mapped = Libs::LibKernel::Memory::KernelVirtualQuery(
 	                        reinterpret_cast<void*>(driver_base), 0, &info, sizeof(info)) == OK;
@@ -873,7 +877,7 @@ void TestDriverMemoryStartup() {
 	(void)before;
 #endif
 	const auto after_first = available();
-	CheckOk(test, Libs::Graphics::Gen5Driver::Initialize(), "Gen5Driver::Initialize(repeat)");
+	CheckOk(test, Libs::Graphics::AgcDriver::Initialize(), "AgcDriver::Initialize(repeat)");
 	Check(test, available() == after_first, "repeated startup allocated direct memory again");
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -1894,6 +1898,36 @@ void TestFlexibleMapQueryAndWholeMunmap() {
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "whole munmap should return flexible memory to Prospero-reported budget");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAnonymousMmapUsesFlexibleMemory() {
+	using Mmap = void*(KYTY_SYSV_ABI*)(void*, size_t, int, int, int, int64_t);
+	const char*            test             = "AnonymousMmapUsesFlexibleMemory";
+	constexpr int          prot_read_write  = 0x3;
+	constexpr int          map_private_anon = 0x1002;
+	Loader::SymbolDatabase symbols;
+	Libs::InitLibKernel_1(&symbols);
+	const auto* symbol = symbols.FindByNid("BPE9s9vQQXo", Loader::SymbolType::Func);
+	Check(test, symbol != nullptr, "mmap does not resolve");
+	const auto mmap     = reinterpret_cast<Mmap>(symbol->vaddr);
+	const auto baseline = AvailableFlexibleMemory(test);
+
+	const auto base = reinterpret_cast<uint64_t>(
+	    mmap(nullptr, SceKernelPageSize + 1, prot_read_write, map_private_anon, -1, 0));
+	Check(test, base != UINT64_MAX, "anonymous mmap failed");
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize * 2, prot_read_write, 1, 0,
+	            0, 1, "");
+	Check(test, AvailableFlexibleMemory(test) + SceKernelPageSize * 2 == baseline,
+	      "anonymous mmap should consume whole flexible pages");
+	*Libs::Posix::GetErrorAddr() = 0;
+	Check(test,
+	      mmap(nullptr, 0, prot_read_write, map_private_anon, -1, 0) == reinterpret_cast<void*>(-1) &&
+	          *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+	      "zero-length mmap should fail with EINVAL");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
+	        "KernelMunmap");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4246,6 +4280,40 @@ void TestAmmRemapIntoPrt() {
 	      MapAutomaticMemory(old, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
 	      "remapIntoPrt released the moved pages to the automatic allocator");
+
+	std::array<uint32_t, 3> unmap_record {};
+	CheckOk(test, KernelWriteUnmapToPrtCommand(unmap_record.data(), target, block, &record_size),
+	        "encode unmapToPrt");
+	Check(test,
+	      record_size == 12 &&
+	          unmap_record == std::array<uint32_t, 3> {0x228u, static_cast<uint32_t>(target >> 14),
+	                                                   static_cast<uint32_t>(block >> 14 << 5)},
+	      "unexpected unmapToPrt record");
+	AmmCommandBuffer unmap(test);
+	const auto       unmap_to_prt =
+	    unmap.Find<int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t)>("3A2X6OCHtnA");
+	Check(test,
+	      unmap_to_prt(unmap.header.data(), target + page / 2, block) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          unmap_to_prt(unmap.header.data(), target, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          unmap_to_prt(unmap.header.data(), kExtendedMemoryBase - block, block) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "unmapToPrt accepted invalid arguments");
+	CheckOk(test, unmap_to_prt(unmap.header.data(), target, block), "append unmapToPrt");
+	Check(test,
+	      unmap.Offset() == 12 &&
+	          std::equal(unmap_record.begin(), unmap_record.end(), unmap.data.begin()),
+	      "unmapToPrt did not append its three dword record");
+	CheckOk(test, unmap.Submit().result, "submit unmapToPrt");
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, target, block}},
+	      "unmapToPrt did not unmap the range on the GPU");
+	ExpectRange(test, Query(test, prt), prt, prt + block * 4, 0, 0, 0, 0, 0, "anon");
+	CheckOk(test, MapAutomaticMemory(old, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "unmapToPrt kept the pages it unmapped");
+	AmmCommandBuffer again(test);
+	CheckOk(test, remap(again.header.data(), target, old, block, SceKernelProtCpuRead, all),
+	        "append remapIntoPrt after unmapToPrt");
+	CheckOk(test, again.Submit().result, "remapIntoPrt into a range unmapped to PRT");
 	CheckOk(test, UnmapAmmMemory(prt, block * 4), "AMM unmap PRT range");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
 	        "KernelCheckedReleaseDirectMemory(donation)");
@@ -7031,6 +7099,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
+	RunTest(TestAnonymousMmapUsesFlexibleMemory);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestUnalignedFlexibleMunmapLengthRoundsToGuestPage);
 	RunTest(TestFlexibleRangeEditsCoalesce);
