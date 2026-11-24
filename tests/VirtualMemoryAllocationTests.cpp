@@ -2,6 +2,7 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -21,6 +22,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cinttypes>
 #include <cstdint>
@@ -29,6 +31,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -87,6 +90,10 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject*, uint64_t, uint64_t*);
 int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 } // namespace Libs::Fiber
+
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase* symbols);
+} // namespace Libs
 
 namespace Libs::DbgAddressSanitizer {
 void TestRegisterMemoryCallbacks();
@@ -6941,6 +6948,144 @@ void TestGuestTlsGetAddrUsesPerThreadBlocks() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct WaitingSignalTarget {
+	std::vector<uint8_t>         stack = std::vector<uint8_t>(1024 * 1024);
+	std::atomic<std::thread::id> id {};
+	std::atomic<uint64_t>        progress {0};
+	std::atomic<bool>            stop {false};
+	std::atomic<bool>            done {false};
+	std::mutex                   mutex;
+	std::condition_variable      wake;
+	uint64_t                     ping = 0;
+};
+
+WaitingSignalTarget*         g_waiting_signal_target = nullptr;
+std::atomic<int>             g_waiting_signal_handled {0};
+std::atomic<int>             g_waiting_signal_off_target {0};
+std::atomic<int>             g_waiting_signal_in_handler {0};
+
+// Waits in a Windows condition variable that another thread keeps waking, so signals land in a
+// Windows wait or lock.
+void* KYTY_SYSV_ABI RunWaitingSignalTarget(void* arg) {
+	auto& target = *static_cast<WaitingSignalTarget*>(arg);
+	target.id    = std::this_thread::get_id();
+	uint64_t seen = 0;
+	while (!target.stop) {
+		std::unique_lock lock(target.mutex);
+		target.wake.wait_for(lock, std::chrono::milliseconds(1),
+		                     [&] { return target.ping != seen || target.stop; });
+		seen = target.ping;
+		target.progress++;
+	}
+	target.done = true;
+	return nullptr;
+}
+
+void KYTY_SYSV_ABI CountWaitingSignal(int /*signum*/, void* /*context*/) {
+	g_waiting_signal_in_handler++;
+	if (std::this_thread::get_id() != g_waiting_signal_target->id.load()) {
+		g_waiting_signal_off_target++;
+	}
+	g_waiting_signal_handled++;
+	g_waiting_signal_in_handler--;
+}
+
+template <typename Predicate>
+bool WaitWithDeadline(Predicate ready) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!ready()) {
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+// A signal to a thread in host code runs on a helper thread. The helper used to be created inside
+// the APC that interrupted the thread, which could leave the thread asleep for good.
+void TestRaisedSignalsReachWaitingThread() {
+	using namespace Libs::LibKernel;
+	const char*   test    = "RaisedSignalsReachWaitingThread";
+	constexpr int SIGNALS = 1000;
+
+	Common::Singleton<Loader::RuntimeLinker>::Instance();
+	Initialize();
+	PthreadInitSelfForMainThread();
+	static Loader::SymbolDatabase symbols;
+	Libs::InitLibKernel_1(&symbols);
+	const auto* install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
+	const auto* remove_symbol  = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
+	const auto* raise_symbol   = symbols.FindByNid("il03nluKfMk", Loader::SymbolType::Func);
+	Check(test, install_symbol != nullptr && remove_symbol != nullptr && raise_symbol != nullptr,
+	      "the exception exports do not resolve");
+	const auto install_handler = reinterpret_cast<int(KYTY_SYSV_ABI*)(int, void*)>(install_symbol->vaddr);
+	const auto remove_handler  = reinterpret_cast<int(KYTY_SYSV_ABI*)(int)>(remove_symbol->vaddr);
+	const auto raise_exception = reinterpret_cast<int(KYTY_SYSV_ABI*)(Pthread, int)>(raise_symbol->vaddr);
+
+	static WaitingSignalTarget target;
+	g_waiting_signal_target = &target;
+	CheckOk(test, install_handler(30, reinterpret_cast<void*>(CountWaitingSignal)), "install handler");
+
+	Pthread     thread = nullptr;
+	PthreadAttr attr   = nullptr;
+	CheckOk(test, PthreadAttrInit(&attr), "PthreadAttrInit");
+	CheckOk(test, PthreadAttrSetstack(&attr, target.stack.data(), target.stack.size()),
+	        "PthreadAttrSetstack");
+	CheckOk(test, PthreadCreate(&thread, &attr, RunWaitingSignalTarget, &target, "SignalTarget"),
+	        "PthreadCreate");
+	CheckOk(test, PthreadAttrDestroy(&attr), "PthreadAttrDestroy");
+
+	std::atomic<bool> stop_pinger {false};
+	std::thread       pinger([&] {
+		while (!stop_pinger) {
+			{
+				std::scoped_lock lock(target.mutex);
+				target.ping++;
+			}
+			target.wake.notify_one();
+			std::this_thread::yield();
+		}
+	});
+
+	int hung_at = -1;
+	if (WaitWithDeadline([&] { return target.progress > 0; })) {
+		for (int i = 0; i < SIGNALS && hung_at < 0; i++) {
+			const uint64_t progress = target.progress;
+			CheckOk(test, raise_exception(thread, 30), "sceKernelRaiseException");
+			// Raise the next one only once this one ran: pending signals merge.
+			if (!WaitWithDeadline([&] { return g_waiting_signal_handled > i; }) ||
+			    !WaitWithDeadline([&] { return target.progress > progress; })) {
+				hung_at = i;
+			}
+		}
+	} else {
+		hung_at = 0;
+	}
+	const bool handlers_left = WaitWithDeadline([] { return g_waiting_signal_in_handler == 0; });
+	target.stop              = true;
+	target.wake.notify_one();
+	const bool target_ended = WaitWithDeadline([&] { return target.done.load(); });
+	stop_pinger             = true;
+	pinger.join();
+	if (target_ended) {
+		CheckOk(test, PthreadJoin(thread, nullptr), "PthreadJoin");
+	}
+	CheckOk(test, remove_handler(30), "remove handler");
+
+	char buffer[160] = {};
+	std::snprintf(buffer, sizeof(buffer),
+	              "signal %d of %d: the handler did not run or the waiting thread stopped", hung_at,
+	              SIGNALS);
+	Check(test, hung_at < 0 && handlers_left && target_ended, buffer);
+	std::snprintf(buffer, sizeof(buffer), "%d of %d signals ran on the target instead of a helper",
+	              SIGNALS - g_waiting_signal_off_target.load(), SIGNALS);
+	Check(test, g_waiting_signal_off_target == SIGNALS, buffer);
+	std::printf("[host]    %-48s ok (%d signals)\n", test, SIGNALS);
+}
+#endif
+
 int RunTrinityTests();
 
 int main(int argc, char** argv) {
@@ -7168,6 +7313,9 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestTlsReadsUseThreadTcb);
 #endif
 	RunTest(TestGuestTlsGetAddrUsesPerThreadBlocks);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestRaisedSignalsReachWaitingThread);
+#endif
 	// Memory callbacks remain registered for the rest of the process.
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
 	RunTest(TestAsanAliasedPhysicalRelease);

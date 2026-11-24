@@ -1,11 +1,22 @@
 #include "libs/ajm.cpp"
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <new>
 #include <opus.h>
 #include <opus_multistream.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 using namespace Libs::Audio::Ajm;
 
@@ -16,6 +27,93 @@ void Check(bool condition, const char* message) {
 		std::fprintf(stderr, "AjmResampleTests: %s\n", message);
 		std::abort();
 	}
+}
+
+// Allocations made while this is set end right before a page that cannot be read, so a read past
+// their end faults.
+std::atomic<bool> g_guard_allocations {false};
+
+struct GuardBlock {
+	void*  user = nullptr;
+	void*  base = nullptr;
+	size_t size = 0;
+};
+std::array<GuardBlock, 16> g_guard_blocks {};
+std::atomic<size_t>        g_guard_count {0};
+
+void* GuardedAllocate(size_t size) {
+	constexpr size_t GUARD = 0x10000; // a multiple of 4 KiB and 16 KiB pages
+	const size_t     used  = (size + 15) & ~size_t {15};
+	const size_t     span  = (used + GUARD - 1) / GUARD * GUARD;
+#ifdef _WIN32
+	auto* base = static_cast<uint8_t*>(
+	    VirtualAlloc(nullptr, span + GUARD, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	DWORD old = 0;
+	Check(base != nullptr && VirtualProtect(base + span, GUARD, PAGE_NOACCESS, &old) != 0,
+	      "guard page");
+#else
+	void* map  = mmap(nullptr, span + GUARD, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	auto* base = static_cast<uint8_t*>(map);
+	Check(map != MAP_FAILED && mprotect(base + span, GUARD, PROT_NONE) == 0, "guard page");
+#endif
+	const size_t index = g_guard_count.fetch_add(1);
+	Check(index < g_guard_blocks.size(), "too many guarded allocations");
+	g_guard_blocks[index] = {base + span - used, base, span + GUARD};
+	return base + span - used;
+}
+
+bool GuardedFree(void* user) {
+	for (size_t i = 0; i < g_guard_count; i++) {
+		auto& block = g_guard_blocks[i];
+		if (block.user == user) {
+#ifdef _WIN32
+			VirtualFree(block.base, 0, MEM_RELEASE);
+#else
+			munmap(block.base, block.size);
+#endif
+			block.user = nullptr;
+			return true;
+		}
+	}
+	return false;
+}
+
+// Peeks 3 bytes past its input, as LibAtrac9's bit reader can at the end of a frame.
+class PeekPastInputDecoder final: public AjmDecoder {
+public:
+	PeekPastInputDecoder(): AjmDecoder(1, 48000, AjmSampleEncoding::S16) {}
+	AjmDecodeResult Decode(const void* input, size_t input_size, void* /*output*/,
+	                       size_t /*output_size*/, bool /*multiple_frames*/,
+	                       AjmGaplessState* /*gapless*/) override {
+		const auto* bytes = static_cast<const volatile uint8_t*>(input);
+		peeked            = bytes[input_size] | bytes[input_size + 1] | bytes[input_size + 2];
+		auto result       = MakeResult();
+		result.input_consumed = input_size;
+		return result;
+	}
+	uint8_t peeked = 0xff;
+};
+
+void SplitInputHasRoomAfterIt() {
+	uint32_t instance = 0;
+	Check(AjmInstanceCreate(1, static_cast<uint32_t>(AjmCodec::DecAt9), 0, &instance) == OK,
+	      "create ATRAC9 instance");
+	auto* decoder = new PeekPastInputDecoder;
+	{
+		std::scoped_lock lock(g_ajm_instances_mutex);
+		g_ajm_instances[instance].decoder.reset(decoder);
+	}
+	std::array<uint8_t, 384> superframe {};
+	superframe.fill(0x5a);
+	AjmBuffer                input[] {{superframe.data(), 100}, {superframe.data() + 100, 284}};
+	std::array<uint8_t, 64>  pcm {};
+	AjmBuffer                output[] {{pcm.data(), pcm.size()}};
+	g_guard_allocations = true;
+	const auto result   = AjmDecodeSplitInstance(instance, input, 2, output, 1, false);
+	g_guard_allocations = false;
+	Check(result.input_consumed == superframe.size() && decoder->peeked == 0,
+	      "split decode: the decoder did not get the input size with zeroed room after it");
+	AjmInstanceDestroy(1, instance);
 }
 
 struct DecodeResult {
@@ -453,7 +551,28 @@ void Mp3ParseFrame() {
 
 } // namespace
 
+void* operator new(std::size_t size) {
+	if (g_guard_allocations) {
+		return GuardedAllocate(size);
+	}
+	if (void* p = std::malloc(size == 0 ? 1 : size)) {
+		return p;
+	}
+	throw std::bad_alloc();
+}
+
+void operator delete(void* p) noexcept {
+	if (p != nullptr && !GuardedFree(p)) {
+		std::free(p);
+	}
+}
+
+void operator delete(void* p, std::size_t /*size*/) noexcept {
+	operator delete(p);
+}
+
 int main(int argc, char** argv) {
+	SplitInputHasRoomAfterIt();
 	Mp3ParseFrame();
 	const auto packet = Encode(1, 1);
 	SmallOutputs(packet);
