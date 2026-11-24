@@ -1002,13 +1002,20 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (keep_both) {
 			return {merged_id};
 		}
-		// Equal pitch does not imply equal mip placement: a changed extent can move
-		// a level into or out of the mip tail. These are separate guest layouts.
+		// Compare the levels both layouts store. A new texture at a recycled address can
+		// have the same extent and pitch but place mip zero after a different mip tail.
+		const auto shared_levels =
+		    std::min(requested.resources.levels, cached.info.resources.levels);
+		const bool guest_texture = binding == BindingType::Texture &&
+		                           (!cached.IsGpuModified() || cached.IsDefinitelyCpuDirty() ||
+		                            cached.IsBufferModified());
+		const bool compare_mips =
+		    requested.resources == cached.info.resources ||
+		    (guest_texture && requested.resources.levels != cached.info.resources.levels);
 		if (requested.tile_mode != cached.info.tile_mode ||
-		    (requested.resources == cached.info.resources &&
-		     !std::equal(requested.mip_layout.begin(),
-		                 requested.mip_layout.begin() + requested.resources.levels,
-		                 cached.info.mip_layout.begin()))) {
+		    (compare_mips && !std::equal(requested.mip_layout.begin(),
+		                                 requested.mip_layout.begin() + shared_levels,
+		                                 cached.info.mip_layout.begin()))) {
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
@@ -1949,7 +1956,9 @@ ImageId TextureCache::FindImageByAddress(const ImageDesc& desc, bool exact_forma
 			result = entry.id;
 			break;
 		}
-		if (SameBacking(image.info, desc.info, exact_format)) {
+		// Same test as FindImageLocked's candidate scan: equal mip counts only.
+		if (image.info.resources.levels == desc.info.resources.levels &&
+		    SameBacking(image.info, desc.info, exact_format)) {
 			result = entry.id;
 		}
 	}
@@ -2017,7 +2026,9 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 				result = id;
 				break;
 			}
-			if (SameBacking(image.info, desc.info, exact_format)) {
+			// Even equal-sized allocations can place different mip chains within one tail tile.
+			if (image.info.resources.levels == desc.info.resources.levels &&
+			    SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			} else if (BcAlias::Matches(desc.info, image.info)) {
 				// SafeToDownload changes without an epoch bump: a possible alias is not kept.
