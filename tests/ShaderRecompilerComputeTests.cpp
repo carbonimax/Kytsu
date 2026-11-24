@@ -2466,7 +2466,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(
-        result.program, options.input_info, 0u, *options.profile, true);
+        result.program, options.input_info, {}, *options.profile, true);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -2626,7 +2626,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization,
-      static_cast<u32>(pixel_info.object_primitive_id));
+      {.begin = static_cast<u32>(pixel_info.object_primitive_id)});
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -49974,9 +49974,10 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     }
     program.shader_info_complete = false;
     CollectShaderInfo(program, {.compute = &compute});
-    const auto push_start = layout == Layout::ShiftedPushData ? 3u :
-                            layout == Layout::StorageData ? PushData::NoStart : 0u;
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_start);
+    PushData::Window push_data;
+    if (layout == Layout::ShiftedPushData) push_data.begin = 3u;
+    if (layout == Layout::StorageData) push_data.begin = PushData::DwordCount;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_data);
     Require(test.name, "candidate bindings",
             program.bindings.descriptor_counts[0] == (single ? 1u : 2u) &&
                 program.info.buffers[0].descriptor_index == 0u &&
