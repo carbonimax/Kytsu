@@ -55,6 +55,8 @@ enum class Counter : uint32_t {
 	ReadAheadPages,   // KYTY_WRITE_FAULT_READAHEAD pages opened ahead of sequential writers
 	TrackingLocks,    // TrackingSpinLock acquisitions (memory tracker, texture cache)
 	TrackingLockContended, // of which found the lock taken
+	TrackingSpinNs,   // time contended acquisitions waited for the lock
+	TrackingSpinMaxNs, // longest such wait (a maximum, not a sum)
 	Count
 };
 
@@ -98,7 +100,8 @@ void NoteFaultWait(uint64_t ns) noexcept;
 // A host protection change of `bytes` to `mode` that took `ns`.
 void NoteProtect(Prot mode, uint64_t bytes, uint64_t ns) noexcept;
 // One TrackingSpinLock acquisition (counted per thread, added to the totals every 1024).
-void NoteTrackingLock(bool contended) noexcept;
+// A contended acquisition also adds its wait `spin_ns` to the totals at once.
+void NoteTrackingLock(bool contended, uint64_t spin_ns) noexcept;
 
 // Called from the PerfStats report: prints the lines for the last `seconds`.
 void Report(double seconds, uint64_t frames) noexcept;

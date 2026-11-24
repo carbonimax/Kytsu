@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #if defined(_MSC_VER)
@@ -34,7 +35,10 @@ namespace Libs::Graphics {
 //   0: OS thread id at every lock and unlock (the former path, also used before static init);
 //   1: thread id cached per thread, same check;
 //   2: no owner (a recursive lock spins forever, a non-owner unlock goes unnoticed).
-// Bit 4 (set from KYTY_MEMTRACK_PROF=1): acquisitions counted for the "PERF memtrack" line.
+// Bit 4 (set from KYTY_MEMTRACK_PROF=1): acquisitions and contended wait time counted for the
+// "PERF memtrack" line.
+// Bits 8+ (KYTY_SPIN_YIELD=N, unset or 0: off): a waiter that spun N rounds gives its core back to the
+// OS at each further round, since the holder may be blocked on another thread.
 // One value, so either path costs a single load and branch. Defined in memTrackProf.cpp.
 extern const uint32_t g_tracking_lock_flags;
 
@@ -86,18 +90,30 @@ private:
 		const auto mode      = flags & 15u;
 		const auto thread    = mode == 1 ? CachedThread() : mode == 2 ? 0u : CurrentThread();
 		bool       contended = false;
+		uint64_t   spin_ns   = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(mode != 2 && m_owner.load(std::memory_order_relaxed) == thread);
-			contended = true;
+			contended              = true;
+			const auto start       = (flags & 16u) != 0 ? MemTrackProf::NowNs() : 0;
+			const auto yield_after = flags >> 8u;
+			uint32_t   spins       = 0;
 			while (m_lock.test(std::memory_order_relaxed)) {
+				if (yield_after != 0 && spins >= yield_after) [[unlikely]] {
+					std::this_thread::yield();
+					continue;
+				}
+				spins++;
 				Pause();
+			}
+			if (start != 0) {
+				spin_ns += MemTrackProf::NowNs() - start;
 			}
 		}
 		if (mode != 2) {
 			m_owner.store(thread, std::memory_order_relaxed);
 		}
 		if ((flags & 16u) != 0) {
-			MemTrackProf::NoteTrackingLock(contended);
+			MemTrackProf::NoteTrackingLock(contended, spin_ns);
 		}
 	}
 
