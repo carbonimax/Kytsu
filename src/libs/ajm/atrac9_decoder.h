@@ -113,6 +113,10 @@ static uint32_t AjmReadLe32(const uint8_t* data) {
 // KYTY_ATRAC9_PARTIAL_INPUT=1: keep a partial superframe across jobs and report the job's input as
 // consumed, instead of PARTIAL_INPUT with nothing consumed. Off by default: hardware's consumed count
 // for a partial job is not confirmed. Read at decoder creation.
+// LibAtrac9's bit reader peeks up to 3 bytes past the frame it decodes, so copies made for it keep
+// this much room after the input.
+constexpr size_t ATRAC9_INPUT_SLACK = 16;
+
 static bool AjmAt9CarryPartialInput() {
 	const char* value = std::getenv("KYTY_ATRAC9_PARTIAL_INPUT");
 	return value != nullptr && value[0] == '1';
@@ -178,6 +182,7 @@ public:
 		if (pending_size != 0) {
 			m_pending.insert(m_pending.end(), static_cast<const uint8_t*>(input),
 			                 static_cast<const uint8_t*>(input) + input_size);
+			m_pending.reserve(m_pending.size() + ATRAC9_INPUT_SLACK);
 			input      = m_pending.data();
 			input_size = m_pending.size();
 		}
