@@ -43,6 +43,20 @@ bool VideoOutSourceFlagsAndRouting() {
 	return ok;
 }
 
+// A game sets its R8G8B8A8 register clear color on a DCC 256/64/64 display buffer: a compressed
+// buffer accepts any register clear color, an uncompressed one stays unsupported.
+bool VideoOutDccClearColorNeedsCompressedBuffers() {
+	const bool dcc =
+	    Libs::Graphics::ClassifyVideoOutCompression(true, 0x215468000ull, 0x208, 0x311308) ==
+	    Libs::Graphics::VideoOutCompression::Dcc256_64_64;
+	const bool plain = Libs::Graphics::ClassifyVideoOutCompression(false, 0, 0, 0x311308) ==
+	                   Libs::Graphics::VideoOutCompression::Unsupported;
+	if (!dcc || !plain) {
+		std::printf("video out dcc clear color: dcc=%d plain=%d\n", dcc, plain);
+	}
+	return dcc && plain;
+}
+
 // At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs
 // maintenance4: the build targets SPIR-V 1.5, which keeps LocalSize.
 bool MeshIndirectTaskDeclaresLocalSize() {
@@ -78,6 +92,11 @@ int main() {
 		return 1;
 	}
 	std::printf("PASS VideoOutFormat.SourceFlagsAndRouting\n");
+	if (!VideoOutDccClearColorNeedsCompressedBuffers()) {
+		std::printf("FAIL VideoOutFormat.DccClearColorNeedsCompressedBuffers\n");
+		return 1;
+	}
+	std::printf("PASS VideoOutFormat.DccClearColorNeedsCompressedBuffers\n");
 	if (!MeshIndirectTaskDeclaresLocalSize()) {
 		std::printf("FAIL GpuBlitShaders.MeshIndirectTaskDeclaresLocalSize\n");
 		return 1;

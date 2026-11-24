@@ -43,6 +43,7 @@ constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
+constexpr size_t   VIDEODEC2_COMPUTE_MEMORY_SIZE   = 0x495300;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
 using Videodec2Decoder      = void*;
@@ -253,7 +254,7 @@ QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* compute_memory_info) {
 		return VIDEODEC2_ERROR_STRUCT_SIZE;
 	}
 
-	compute_memory_info->cpu_gpu_memory_size = VIDEODEC2_MIN_MEMORY_SIZE;
+	compute_memory_info->cpu_gpu_memory_size = VIDEODEC2_COMPUTE_MEMORY_SIZE;
 	compute_memory_info->cpu_gpu_memory      = nullptr;
 
 	return OK;
@@ -286,7 +287,7 @@ static int32_t KYTY_SYSV_ABI AllocateComputeQueue(
 		return VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 	}
 
-	if (compute_memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	if (compute_memory_info->cpu_gpu_memory_size < VIDEODEC2_COMPUTE_MEMORY_SIZE) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
