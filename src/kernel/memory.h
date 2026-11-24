@@ -158,6 +158,10 @@ bool                   MaybeGpuModifiedPage(uint64_t vaddr);
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread: true when a byte of the range holds GPU-written data not yet in the backing.
 bool                   IsGpuDirtyBufferRange(uint64_t vaddr, uint64_t size);
+// The GPU thread reads through the buffer backing when no image write-back is pending; otherwise,
+// and off the GPU thread, a direct read (it faults and waits for the write-back). A buffer
+// readback is needed only for GPU-written bytes in the requested range.
+void                   ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 // Stops at the first hole, or with span_holes at the end of the last committed range.

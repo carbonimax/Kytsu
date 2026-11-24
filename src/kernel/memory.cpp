@@ -1120,6 +1120,17 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+void ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size) {
+	// Unlike upstream, a page that is not GPU-modified still goes through the backing: that read
+	// also overlays this fork's GPU-owned writes (OverlayOwnedWrites).
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread() ||
+	    GetGpuResources().GetTextureCache().WriteBackTick(vaddr, size) != 0 ||
+	    !TryReadBufferBacking(vaddr, data, size)) {
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+	}
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes) {
 	const auto clamped_size = TryClampRangeSize(vaddr, size, span_holes);
 	if (clamped_size == 0) {
