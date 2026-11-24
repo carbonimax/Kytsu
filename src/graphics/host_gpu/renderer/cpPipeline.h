@@ -43,6 +43,8 @@ struct DrawRecord {
 	HW::Shader       shaders;
 	DrawRenderState  state;
 	bool             guessed_single_sample = true;
+	// KYTY_STREAM_REUSE: the stream packet epoch when the front queued the draw (StreamPacketEpoch).
+	uint64_t packet_epoch = 0;
 	// Vertex stages 0-2, then the pixel stage.
 	std::array<ShaderRecompiler::IR::ResourceSnapshot, 4> snapshots;
 	// Back -> front: the single-sample result of the draw's targets (guess feedback).

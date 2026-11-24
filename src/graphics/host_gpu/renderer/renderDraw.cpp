@@ -2795,6 +2795,7 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	record.user_config           = buffer.GetUserConfig();
 	record.shaders               = buffer.GetShaders();
 	record.guessed_single_sample = guessed;
+	record.packet_epoch          = StreamPacketEpoch();
 	CopySnapshots(record);
 	CpPipeline::Note(CpPipeline::Stat::Queued);
 	CpPipeline::Publish();
@@ -2805,6 +2806,7 @@ void RenderExecutor::PipelineExecute(void* context, CpPipeline::DrawRecord& reco
 	auto*                  self      = static_cast<RenderExecutor*>(context);
 	auto&                  scheduler = self->m_context.GetCommandScheduler();
 	ScopedRegisterOverride registers(record.registers, record.user_config, record.shaders);
+	ScopedPacketEpoch      packet_epoch(record.packet_epoch);
 	auto&                  buffer = scheduler.Current();
 	if (record.indexed) {
 		self->DrawIndexBody(buffer, record.index_args, &record.state, &record,

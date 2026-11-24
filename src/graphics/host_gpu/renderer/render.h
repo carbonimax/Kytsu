@@ -129,12 +129,53 @@ private:
 // releases, acquires, waits, semaphores, flips and CP memory reads or writes. Draws between two of
 // them are unordered on the guest GPU, so their buffer writes need no barrier between each other.
 inline std::atomic<uint64_t> g_guest_sync_epoch {0};
+// KYTY_STREAM_REUSE (streamReusePolicy.h): the packet epoch also advances at every packet that
+// drains the CP pipeline and at submission starts (front thread, back idle); kept apart so the
+// barrier chaining above keeps its own points. The store epoch advances after emulator stores
+// into guest memory (any thread).
+inline std::atomic<uint64_t> g_stream_packet_epoch {0};
+inline std::atomic<uint64_t> g_stream_store_epoch {0};
 inline void                  NoteGuestSync() noexcept {
     g_guest_sync_epoch.fetch_add(1, std::memory_order_relaxed);
+    g_stream_packet_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 [[nodiscard]] inline uint64_t GuestSyncEpoch() noexcept {
 	return g_guest_sync_epoch.load(std::memory_order_relaxed);
 }
+inline void NoteStreamPacket() noexcept {
+	g_stream_packet_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+inline void NoteGuestStore() noexcept {
+	g_stream_store_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+[[nodiscard]] inline uint64_t StreamStoreEpoch() noexcept {
+	return g_stream_store_epoch.load(std::memory_order_acquire);
+}
+// A queued draw runs with the packet epoch its record carries (ScopedPacketEpoch in the back
+// thread's execute); elsewhere the live value is the current packet's.
+inline thread_local bool     t_record_epoch_set = false;
+inline thread_local uint64_t t_record_epoch     = 0;
+[[nodiscard]] inline uint64_t StreamPacketEpoch() noexcept {
+	return t_record_epoch_set ? t_record_epoch : g_stream_packet_epoch.load(std::memory_order_relaxed);
+}
+class ScopedPacketEpoch {
+public:
+	explicit ScopedPacketEpoch(uint64_t epoch) noexcept
+	    : m_set(t_record_epoch_set), m_epoch(t_record_epoch) {
+		t_record_epoch_set = true;
+		t_record_epoch     = epoch;
+	}
+	~ScopedPacketEpoch() {
+		t_record_epoch_set = m_set;
+		t_record_epoch     = m_epoch;
+	}
+	ScopedPacketEpoch(const ScopedPacketEpoch&)            = delete;
+	ScopedPacketEpoch& operator=(const ScopedPacketEpoch&) = delete;
+
+private:
+	bool     m_set;
+	uint64_t m_epoch;
+};
 
 // KYTY_DISPATCH_CHAIN: 0 = a barrier pair around every direct dispatch (previous behavior);
 // 1 = direct dispatches recorded back to back share one barrier pair while no guest sync point and

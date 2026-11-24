@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/streamReusePolicy.h"
 
 #include <array>
 #include <atomic>
@@ -209,6 +210,8 @@ public:
 	// earlier GPU access to those bytes (64 KiB granularity). No-op without imported memory.
 	void BeforeCpuWrite(uint64_t vaddr, uint64_t size);
 	static void        ReportImport(double seconds);
+	// KYTY_STREAM_REUSE: one "PERF streamreuse" line (stream path outcomes since the last one).
+	static void        ReportStreamReuse(double seconds, uint64_t frames);
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -434,6 +437,8 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	// KYTY_AB_FLAG=stream_host_cached: a ring in the default memory for the forced-off arm.
 	std::unique_ptr<StreamBuffer>                     m_stream_default;
+	// KYTY_STREAM_REUSE: stream copies of CPU-dirty ranges (front and back thread, never at once).
+	std::unique_ptr<StreamReuse::Table> m_stream_reuse = std::make_unique<StreamReuse::Table>();
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;

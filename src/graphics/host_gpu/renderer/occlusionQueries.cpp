@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/render.h"
 
 #include <algorithm>
 
@@ -76,6 +77,7 @@ void OcclusionQueries::PublishDumps() {
 		WriteZPassCounters(reinterpret_cast<volatile uint64_t*>(dump.address),
 		                   m_samples + dump.uncounted, (dump.address & 8u) == 0);
 	}
+	NoteGuestStore(); // KYTY_STREAM_REUSE: plain stores into guest memory
 	m_dumps.clear();
 }
 
