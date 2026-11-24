@@ -4942,6 +4942,33 @@ public:
             "write invalidation without a remaining copy did not establish CPU "
             "ownership");
 
+    // A CPU fill of write-watched pages invalidates them up front instead of
+    // faulting on each page, and leaves the whole range CPU-modified.
+    LibKernel::Memory::InstallGpuResources(&resources);
+    gpu.SendCommandSync([&] {
+      constexpr uint64_t fill = fault_base + 0x22000;
+      constexpr uint32_t bytes = 2 * TRACKER_PAGE_SIZE;
+      (void)buffer_cache.FindBuffer(fill, bytes);
+      (void)buffer_cache.ObtainBufferForImage(fill, bytes);
+      Require("GpuCommandLane", "watched CPU fill setup",
+              !buffer_cache.IsRegionCpuModified(fill, bytes) &&
+                  !buffer_cache.IsRegionGpuModified(fill, bytes),
+              "the fill destination was not fully write-watched");
+      Common::DebugCounters::SetEnabled(true);
+      const auto faults = Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
+      buffer_cache.FillBuffer(fill, bytes, 0xababababu, false);
+      const auto after = Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
+      Common::DebugCounters::SetEnabled(false);
+      const auto *words = reinterpret_cast<const uint32_t *>(fill);
+      Require("GpuCommandLane", "CPU fill of watched pages",
+              after == faults && std::all_of(words, words + bytes / sizeof(*words),
+                                             [](uint32_t word) { return word == 0xababababu; }) &&
+                  buffer_cache.IsRegionCpuModified(fill, 1) &&
+                  buffer_cache.IsRegionCpuModified(fill + bytes - 1, 1),
+              "the fill faulted, left a page clean, or wrote incorrect bytes");
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+
     // With storage-image readback on, a GL2 writeback copies a tiled image's
     // first shader write, or the first after a CPU write, back to guest
     // memory, and guest accesses wait for the copy; a plain rewrite or a

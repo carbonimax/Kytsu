@@ -3097,7 +3097,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (!IsRegionGpuModified(vaddr, size)) {
 		BeforeCpuWrite(vaddr, size);
 		LateRead::NoteBackingWrite(vaddr, size, true);
-		// Access the guest mapping so write faults invalidate cached buffers and images.
+		(void)m_scheduler.Context().InvalidateMemory(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		LateRead::NoteBackingWrite(vaddr, size, true);
