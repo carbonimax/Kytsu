@@ -575,7 +575,6 @@ struct ResolvedTextureDesc {
 	TextureCache::ImageDesc desc;
 	vk::Format              pixel_format      = vk::Format::eUndefined;
 	vk::Format              view_format       = vk::Format::eUndefined;
-	bool                    shader_conversion = false;
 };
 
 // KYTY_TEXTURE_DESC_MEMO (default 1; 0 = off; 2 = verify): ResolveTexture keeps the
@@ -644,7 +643,7 @@ bool SameResolvedTextureDesc(const ResolvedTextureDesc& a, const ResolvedTexture
 	const auto& x = a.desc.info;
 	const auto& y = b.desc.info;
 	return a.pixel_format == b.pixel_format && a.view_format == b.view_format &&
-	       a.shader_conversion == b.shader_conversion && a.desc.type == b.desc.type &&
+	       a.desc.type == b.desc.type &&
 	       a.desc.heap == b.desc.heap && a.desc.view_info == b.desc.view_info &&
 	       x.data == y.data && x.stencil == y.stencil && x.metadata.range == y.metadata.range &&
 	       x.metadata.kind == y.metadata.kind && x.metadata.dcc_alpha_msb == y.metadata.dcc_alpha_msb &&
@@ -741,7 +740,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto id = [&] {
 		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
-		return texture_cache.FindImage(desc, resolved->shader_conversion, find_memo);
+		return texture_cache.FindImage(desc, false, find_memo);
 	}();
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
@@ -872,14 +871,13 @@ bool RenderExecutor::ResolveKeptTexture(const ShaderRecompiler::IR::ImageResourc
 	auto&      texture_cache     = m_context.GetTextureCache();
 	const auto pixel_format      = memo.resolved.pixel_format;
 	const auto view_format       = memo.resolved.view_format;
-	const bool shader_conversion = memo.resolved.shader_conversion;
 	out.desc       = memo.resolved.desc;
 	out.image_view = nullptr;
 	out.layout     = vk::ImageLayout::eUndefined;
 	out.mip_views.clear();
 	auto id = [&] {
 		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
-		return texture_cache.FindImage(out.desc, shader_conversion, &memo.find);
+		return texture_cache.FindImage(out.desc, false, &memo.find);
 	}();
 	out.image_id = id;
 	if (!id) {
@@ -955,8 +953,6 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	                                ? Prospero::BufferFormat::k16UNorm
 	                                : ShaderRecompiler::IR::CompareFormat(resource, descriptor.Format());
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
-	const bool shader_conversion =
-	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
 	    storage || resource.numeric_class ==
 	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
@@ -1057,7 +1053,6 @@ static bool ResolveTextureDesc(const RenderContext& context,
 	desc.heap = resource.heap;
 	out.pixel_format      = pixel_format;
 	out.view_format       = view_format;
-	out.shader_conversion = shader_conversion;
 	return true;
 }
 

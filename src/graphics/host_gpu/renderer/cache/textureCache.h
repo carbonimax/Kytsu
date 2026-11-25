@@ -317,7 +317,7 @@ private:
 	void                         CountAliasClass(const ImageInfo& info, int32_t delta) noexcept;
 	[[nodiscard]] bool           NoAliasPossible(const ImageInfo& requested) const noexcept;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
-	                                           ImageId cached, ImageId merged);
+	                                           ImageId cached, ImageId merged, bool exact_format);
 	// Sets keep_both instead of recreating when the new description may sit beside the cached one.
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached, bool& keep_both);

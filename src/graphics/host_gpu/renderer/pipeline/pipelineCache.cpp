@@ -1801,9 +1801,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (object_primitive_id) {
 		// PA_CL_OBJPRIM_ID_CNTL = 2: VGT_OBJECT_ID plus the pipelined 32-bit primitive ID.
-		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
-		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
-		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
+		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || !pixel_active ||
+		                     (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
+		                     (!mesh_active && user_config.GetPrimType() != Prospero::PrimitiveType::kTriList));
 		const auto& target = context.GetRenderTarget(7);
 		EXIT_NOT_IMPLEMENTED(Prospero::ResolveRenderTargetFormat(target.info.format,
 		                                                       target.info.channel_type)
@@ -1812,6 +1812,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
+		mesh.output_primitive_id = object_primitive_id;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
 		const auto  logical_threads =
@@ -1996,9 +1997,8 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			}
 		}
 	}
-	ShaderRecompiler::IR::PushData::Window push_data {
-	    .begin = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(mesh_active, object_primitive_id,
-	                                                                last_stage.user_clip_planes)};
+	auto push_data = ShaderRecompiler::IR::PushData::GraphicsWindow(
+	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
 		m_program_cache->Get(pixel_params, pixel_info, push_data);
 		for (const auto& output: pixel_info.stage.program->info.outputs) {
