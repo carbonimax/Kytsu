@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-// KYTY_RECORDER_HOST_COPY=1 (default 0): the stream copy of a small CPU-dirty read binding
+// KYTY_RECORDER_HOST_COPY=1 (default; 0 = off): the stream copy of a small CPU-dirty read binding
 // (BufferCache::ObtainBuffer) is reserved in the stream ring by the command processor, but the
 // recorder thread (KYTY_CP_RECORD_THREAD=1) copies the bytes, as a CmdRecord::Call queued in ring
 // order, so before the submission of the commands that read them (a direct submission drains the

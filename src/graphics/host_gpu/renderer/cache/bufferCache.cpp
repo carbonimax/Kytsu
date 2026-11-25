@@ -3402,14 +3402,14 @@ static bool CopyStreamBytes(uint64_t vaddr, uint8_t* mapped, uint64_t size, bool
 namespace RecorderHostCopy {
 namespace {
 
-// 0 = off, 1 = on, 2 = on with checks: the command processor also copies the bytes at
+// 0 = off, 1 = on (default, also when unset), 2 = on with checks: the command processor also copies the bytes at
 // reservation time and the recorder compares its copy with them (a difference is a guest write
 // in between, counted and logged; the recorder's bytes are kept).
 int Mode() {
 	static std::atomic<int64_t> once {Common::OnceUnset};
 	return static_cast<int>(Common::Once(once, [] {
 		const char* value = std::getenv("KYTY_RECORDER_HOST_COPY");
-		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
 		const int   mode  = v == 1 || v == 2 ? static_cast<int>(v) : 0;
 		std::printf("BufferCache: KYTY_RECORDER_HOST_COPY=%d (stream copies on the recorder thread)\n", mode);
 		std::fflush(stdout);
