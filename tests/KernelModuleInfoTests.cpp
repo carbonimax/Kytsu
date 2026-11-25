@@ -222,10 +222,19 @@ TEST(RuntimeLinker, BindsImportsByNidLibraryAndModuleName) {
 	// A LibcInternal import without a LibcInternal provider binds to libc's.
 	EXPECT_EQ(resolve("TstHleLibc#B#B").vaddr, 0x1000u);
 
-	// Any other library binds by its own name only.
+	// A strict match wins over the NID-only fallback, which would take LibcInternal's (added first).
+	EXPECT_EQ(resolve("TstHleIntern#C#C").vaddr, 0x3000u);
+
+	// With no strict match, the same NID from another library binds: HLE first, then modules.
 	const auto hle = resolve("TstHleLibc#D#D");
-	EXPECT_EQ(hle.vaddr, 0u);
-	EXPECT_EQ(hle.name, "TstHleLibc[Rtc][Rtc][Func]");
+	EXPECT_EQ(hle.vaddr, 0x1000u);
+	EXPECT_EQ(hle.name, "TstHleLibc[libc][libc][Func]");
+	EXPECT_EQ(resolve("utWixLDEbrw#D#D").vaddr, exporter->base_vaddr + 0x10);
+
+	// A NID nobody exports stays a stub named after its own library.
+	const auto stub = resolve("TstNoExport#D#D");
+	EXPECT_EQ(stub.vaddr, 0u);
+	EXPECT_EQ(stub.name, "TstNoExport[Rtc][Rtc][Func]");
 
 	// dlsym looks a module's exports up by the NID of the symbol name.
 	SymbolDatabase kernel;
