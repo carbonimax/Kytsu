@@ -1158,13 +1158,7 @@ bool IsVirtualAddressKnown(uint64_t vaddr) {
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size, span_holes);
-	if (clamped_size != 0 && clamped_size != size) {
-		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
-	}
-	return clamped_size;
+	return g_virtual_ranges->ClampRangeSize(vaddr, size, span_holes);
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
