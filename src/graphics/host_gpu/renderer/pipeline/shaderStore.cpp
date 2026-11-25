@@ -73,6 +73,7 @@ constexpr std::array ShaderEnvironment {
     "KYTY_F16_ROUNDING",          "KYTY_TESS_HS_MODEL",              "KYTY_F16_STORE_RTZ",
     "KYTY_MOVREL_READ_MUX",
     "KYTY_EXEC_SELECT_FORWARD",   "KYTY_COMPARE_SELECT_FOLD",
+    "KYTY_DEPTH_COMPARE_COLOR",
 };
 
 uint64_t FrameChecksum(Frame frame, std::span<const uint8_t> compressed) {

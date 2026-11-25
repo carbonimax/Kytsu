@@ -224,6 +224,33 @@ uint32_t SampledComponentZero(EmitterState& state, Prospero::TextureNumericClass
 	EXIT("invalid sampled image numeric class");
 }
 
+// ImageResource::manual_compare: the S# DEPTH_COMPARE_FUNC as the Dref test (reference OP texel)
+// on one texel or four gathered ones; the reference is clamped to [0, 1] as for a UNORM depth.
+uint32_t ManualDepthCompare(EmitterState& state, uint32_t manual_compare, uint32_t reference,
+                            uint32_t texels, uint32_t components) {
+	const auto type      = components == 1u ? TypeF32(state) : TypeF32Vector(state, components);
+	const auto bool_type = components == 1u ? TypeBool(state) : TypeBoolVector(state, components);
+	const auto splat     = [&](uint32_t scalar) {
+		if (components == 1u) return scalar;
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, type, result, scalar, scalar, scalar,
+		                          scalar);
+		return result;
+	};
+	const auto function = manual_compare - 1u;
+	if (function == 0u || function == 7u) {
+		return splat(ConstantF32Value(state, function == 7u ? 1.0f : 0.0f));
+	}
+	constexpr std::array<spv::Op, 8> tests {spv::OpNop,           spv::OpFOrdLessThan,
+	                                        spv::OpFOrdEqual,      spv::OpFOrdLessThanEqual,
+	                                        spv::OpFOrdGreaterThan, spv::OpFUnordNotEqual,
+	                                        spv::OpFOrdGreaterThanEqual, spv::OpNop};
+	const auto clamped = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(state, reference, ZeroF32(state),
+	                                                              ConstantF32Value(state, 1.0f));
+	return Select(state, type, Binary(state, tests[function], bool_type, splat(clamped), texels),
+	              splat(ConstantF32Value(state, 1.0f)), splat(ZeroF32(state)));
+}
+
 uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
                       Prospero::TextureNumericClass numeric_class, bool dref,
                       const IR::MemoryInfo& mem, bool gather = false) {
@@ -1021,6 +1048,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto EmitGather = [&](uint32_t resource, uint32_t array_index, uint32_t result_type) {
 				const auto& candidate = state.program.info.images[resource];
 				const auto sampler = samplers[candidate.numeric_class != Prospero::TextureNumericClass::Float];
+				const auto manual = dref ? candidate.manual_compare : 0u;
 				const auto dimension = candidate.dimension;
 				const auto coord = CoordF32(ctx, mem, *address, layout.coord,
 				                            ImageDimensionInfoFor(dimension).coordinate_components,
@@ -1039,10 +1067,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					const auto sample = state.builder.AllocateId();
 					const std::array operands {operand_mask, offset};
 					state.builder.AddFunction(
-					    dref ? spv::OpImageDrefGather : spv::OpImageGather, result_type,
-					    sample, sampled, coord, component_or_dref,
+					    dref && manual == 0u ? spv::OpImageDrefGather : spv::OpImageGather, result_type,
+					    sample, sampled, coord, manual != 0u ? ConstantU32(state, 0) : component_or_dref,
 					    std::span(operands).first(operand_mask != 0u ? 2u : 0u));
-					return sample;
+					return manual != 0u ? ManualDepthCompare(state, manual, component_or_dref, sample, 4u)
+					                    : sample;
 				};
 				const auto gathered =
 				    candidate.mip_mode == IR::ImageMipMode::Dynamic && candidate.mip_count > 1u
@@ -1161,6 +1190,15 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto sampled = MakeSampledImage(state, resource, sampler.id, 0u, array_index,
 			                                      sampler.dynamic);
 			const auto sample = state.builder.AllocateId();
+			if (const auto manual = dref ? candidate.manual_compare : 0u; manual != 0u) {
+				state.builder.AddFunction(
+				    explicit_lod ? spv::OpImageSampleExplicitLod : spv::OpImageSampleImplicitLod,
+				    ImageVectorType(state, Prospero::TextureNumericClass::Float, 4), sample, sampled,
+				    coord, std::span<const uint32_t>(sample_operands).first(sample_operand_count));
+				const auto texel = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), texel, sample, 0u);
+				return ManualDepthCompare(state, manual, dref_value, texel, 1u);
+			}
 			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
 			                          std::span<const uint32_t>(sample_operands).first(sample_operand_count));

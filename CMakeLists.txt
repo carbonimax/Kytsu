@@ -1073,6 +1073,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_depth_attachment_feedback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-depth-resource-only)
+	add_test(NAME shader_recompiler_depth_compare_color
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-compare-color-only)
 	add_test(NAME shader_store
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-store-only)
 	add_test(NAME shader_store_key

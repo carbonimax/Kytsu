@@ -73,7 +73,9 @@ void NoteDepthCompareBind(Prospero::BufferFormat guest_format, vk::Format image_
 	static std::set<std::pair<uint64_t, uint32_t>> seen;
 	static uint64_t                                binds = 0, outside = 0;
 	const auto format = static_cast<uint32_t>(guest_format);
-	const bool hit    = color_image && FindGuestDepthFormatPolicy(guest_format) == nullptr;
+	const auto* policy = FindGuestDepthFormatPolicy(guest_format);
+	const bool  hit    = color_image &&
+	                 (policy == nullptr || policy->depth_attachment_format == vk::Format::eUndefined);
 	std::lock_guard lock(mutex);
 	++binds;
 	if (hit) {

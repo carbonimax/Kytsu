@@ -202,6 +202,23 @@ inline constexpr std::array<DepthFormatPolicy, 3> DEPTH_FORMAT_POLICIES {{
      vk::Format::eD32Sfloat,
      {vk::Format::eD32SfloatS8Uint, vk::Format::eUndefined, vk::Format::eUndefined}},
 }};
+// HasDepthView (ResourceMaterialization.cpp) repeats, without Vulkan, the guest formats that get a
+// depth view: the policies with a depth attachment format (a stencil-only policy keeps a color view).
+[[nodiscard]] constexpr bool DepthViewFormatsAre16UNormAnd32Float() noexcept {
+	uint32_t count = 0;
+	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
+		if (policy.depth_attachment_format == vk::Format::eUndefined) {
+			continue;
+		}
+		if (policy.guest_format != Prospero::BufferFormat::k16UNorm &&
+		    policy.guest_format != Prospero::BufferFormat::k32Float) {
+			return false;
+		}
+		count++;
+	}
+	return count == 2;
+}
+static_assert(DepthViewFormatsAre16UNormAnd32Float());
 
 [[nodiscard]] inline constexpr const DepthFormatPolicy*
 FindDepthFormatPolicy(Prospero::DepthFormat depth_format) noexcept {

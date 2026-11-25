@@ -12,6 +12,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <deque>
 #include <fmt/format.h>
@@ -179,9 +180,12 @@ bool ValidatePackedUnormSampling(const ResourcePlan& program, const ResourceSnap
 	return true;
 }
 
-enum class SamplerClass : uint8_t { Float, Integer };
+// Manual: the plain sample of a shader-compared image (manual_compare) needs a variant without the
+// S# comparison, which another image of the same guest sampler may still use natively.
+enum class SamplerClass : uint8_t { Float, Integer, Manual };
 
 SamplerClass ClassifySampler(const ImageResource& image) {
+	if (image.manual_compare != 0u) return SamplerClass::Manual;
 	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
 	               image.numeric_class == Prospero::TextureNumericClass::Sint
 	           ? SamplerClass::Integer : SamplerClass::Float;
@@ -1022,7 +1026,7 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::vector<std::array<uint32_t, 2>> mapping;
+	std::vector<std::array<uint32_t, 3>> mapping;
 	std::vector<Binding>                bindings;
 };
 
@@ -1065,6 +1069,27 @@ private:
 	uint32_t                                    source_count;
 	uint32_t                                    count = 0;
 };
+
+// The guest formats of DEPTH_FORMAT_POLICIES (imageInfo.h, which needs Vulkan; a static_assert there
+// keeps both lists equal): only they get a depth view.
+static bool HasDepthView(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k16UNorm || format == Prospero::BufferFormat::k32Float;
+}
+
+// 1 + the DEPTH_COMPARE_FUNC every sampler of image `index` carries, or 0 (native) when they
+// differ. A sampler shared with a native comparison image gets a Manual variant (SamplerClass).
+static uint32_t ManualCompareFunction(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                                      uint32_t index) {
+	uint32_t function = 0;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.image != index) continue;
+		if (pair.sampler >= snapshot.samplers.size()) return 0;
+		const auto value = 1u + ((snapshot.samplers[pair.sampler].dwords[0] >> 12u) & 0x7u);
+		if (function != 0 && function != value) return 0;
+		function = value;
+	}
+	return function;
+}
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool null_descriptor_supported, bool emulate_image_min_lod) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -1131,6 +1156,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    return pair.image == base_index && pair.sampler < snapshot.samplers.size() &&
 			           (snapshot.samplers[pair.sampler].dwords[0] >> 31u) != 0u;
 		    });
+		// shortcut: direct images only, and the shader compares the filtered texel (not PCF of four
+		// texels); extend to indirect tables and gathers with weights if a title needs them.
+		if (DepthCompareColorEnabled() && !storage && base.depth_compare && !base.heap && i == base_index &&
+		    image.indirect_root == ImageResource::NoIndirectImage &&
+		    !HasDepthView(CompareFormat(base, format))) { // the format the host view takes
+			image.manual_compare = ManualCompareFunction(program, snapshot, i);
+		}
 		// The shader decodes direct 8 and 8_8 sRGB textures where the device has no sRGB view.
 		if (!storage && !base.depth_compare && !image.skip_degamma &&
 		    image.indirect_root == ImageResource::NoIndirectImage &&
@@ -2328,6 +2360,14 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 	return resource;
 }
 
+bool DepthCompareColorEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEPTH_COMPARE_COLOR");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
@@ -2384,6 +2424,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.view_min_level             = source.view_min_level;
 		image.null_fallback              = source.null_fallback;
 		image.skip_degamma               = source.skip_degamma;
+		image.manual_compare             = source.manual_compare;
+		// A shader comparison samples a plain color view through a non-comparison sampler.
+		if (source.manual_compare != 0u) image.depth_compare = false;
 		image.heap                       = source.heap;
 		image.indirect_resources.clear();
 	}
@@ -2428,7 +2471,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::Integer;
-		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		samplers[index].integer_border        = binding.type == SamplerClass::Integer;
 	}
 	for (uint32_t index = 0; index < sampler_plan.bindings.size(); index++) {
 		const auto& binding = sampler_plan.bindings[index];
