@@ -1123,6 +1123,8 @@ static int ConvertSocketOptionName(int level, int option) {
 		}
 	} else if (level == 6 && option == 1) {
 		return TCP_NODELAY;
+	} else if (level == 41 && option == 27) {
+		return IPV6_V6ONLY;
 	}
 #if defined(_WIN32)
 	// Winsock shares the BSD socket-level numbering for these; it reports WSAEINVAL, not
