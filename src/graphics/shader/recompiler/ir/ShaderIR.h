@@ -175,6 +175,9 @@ struct ImageResource {
 	uint32_t                      view_min_level = 0;
 	bool                          sample_access_only     = true; // Every use is a sample.
 	bool                          depth_compare     = false;
+	// 1 + the S# DEPTH_COMPARE_FUNC when the comparison is made in the shader (a color format
+	// without a depth view, KYTY_DEPTH_COMPARE_COLOR=1); 0 = native Dref.
+	uint32_t                      manual_compare    = 0;
 	bool                          skip_degamma      = false; // A sampler reads sRGB as stored.
 	bool                          cube              = false;
 	bool                          r128              = false;

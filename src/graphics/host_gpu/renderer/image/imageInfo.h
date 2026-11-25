@@ -202,6 +202,10 @@ inline constexpr std::array<DepthFormatPolicy, 3> DEPTH_FORMAT_POLICIES {{
      vk::Format::eD32Sfloat,
      {vk::Format::eD32SfloatS8Uint, vk::Format::eUndefined, vk::Format::eUndefined}},
 }};
+// HasDepthView (ResourceMaterialization.cpp) repeats these guest formats without Vulkan.
+static_assert(DEPTH_FORMAT_POLICIES.size() == 2 &&
+              DEPTH_FORMAT_POLICIES[0].guest_format == Prospero::BufferFormat::k16UNorm &&
+              DEPTH_FORMAT_POLICIES[1].guest_format == Prospero::BufferFormat::k32Float);
 
 [[nodiscard]] inline constexpr const DepthFormatPolicy*
 FindDepthFormatPolicy(Prospero::DepthFormat depth_format) noexcept {

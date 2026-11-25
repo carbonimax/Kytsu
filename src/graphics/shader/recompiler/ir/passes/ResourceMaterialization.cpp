@@ -12,6 +12,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <deque>
 #include <fmt/format.h>
@@ -1066,6 +1067,33 @@ private:
 	uint32_t                                    count = 0;
 };
 
+// The guest formats of DEPTH_FORMAT_POLICIES (imageInfo.h, which needs Vulkan; a static_assert there
+// keeps both lists equal): only they get a depth view.
+static bool HasDepthView(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k16UNorm || format == Prospero::BufferFormat::k32Float;
+}
+
+// 1 + the DEPTH_COMPARE_FUNC every sampler of image `index` carries, or 0 (native) when they
+// differ or one of them also serves a native comparison image, whose host sampler keeps
+// compareEnable: a plain sample through it would be undefined too.
+static uint32_t ManualCompareFunction(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                                      uint32_t index) {
+	uint32_t function = 0;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.image != index) continue;
+		if (pair.sampler >= snapshot.samplers.size()) return 0;
+		const bool shared = std::ranges::any_of(program.info.sampled_pairs, [&](const auto& other) {
+			return other.sampler == pair.sampler && other.image != index &&
+			       other.image < program.info.images.size() &&
+			       program.info.images[other.image].depth_compare;
+		});
+		const auto value = 1u + ((snapshot.samplers[pair.sampler].dwords[0] >> 12u) & 0x7u);
+		if (shared || (function != 0 && function != value)) return 0;
+		function = value;
+	}
+	return function;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool null_descriptor_supported, bool emulate_image_min_lod) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
@@ -1131,6 +1159,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    return pair.image == base_index && pair.sampler < snapshot.samplers.size() &&
 			           (snapshot.samplers[pair.sampler].dwords[0] >> 31u) != 0u;
 		    });
+		// shortcut: direct images only, and the shader compares the filtered texel (not PCF of four
+		// texels); extend to indirect tables and gathers with weights if a title needs them.
+		if (DepthCompareColorEnabled() && !storage && base.depth_compare && !base.heap && i == base_index &&
+		    image.indirect_root == ImageResource::NoIndirectImage &&
+		    !HasDepthView(CompareFormat(base, format))) { // the format the host view takes
+			image.manual_compare = ManualCompareFunction(program, snapshot, i);
+		}
 		// The shader decodes direct 8 and 8_8 sRGB textures where the device has no sRGB view.
 		if (!storage && !base.depth_compare && !image.skip_degamma &&
 		    image.indirect_root == ImageResource::NoIndirectImage &&
@@ -2328,6 +2363,14 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 	return resource;
 }
 
+bool DepthCompareColorEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEPTH_COMPARE_COLOR");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
@@ -2384,6 +2427,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.view_min_level             = source.view_min_level;
 		image.null_fallback              = source.null_fallback;
 		image.skip_degamma               = source.skip_degamma;
+		image.manual_compare             = source.manual_compare;
+		// A shader comparison samples a plain color view through a non-comparison sampler.
+		if (source.manual_compare != 0u) image.depth_compare = false;
 		image.heap                       = source.heap;
 		image.indirect_resources.clear();
 	}
