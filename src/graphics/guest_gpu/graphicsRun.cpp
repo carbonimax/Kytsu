@@ -1672,13 +1672,10 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	GpuCapture::Touch(args_addr, sizeof(vk::DispatchIndirectCommand));
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		// Snapshot all dimensions after making GPU writes visible: a host pointer read only
-		// faults when its page is protected, and the 12 bytes can cross a page boundary.
+		// Snapshot all dimensions: the 12 bytes can cross a page boundary. ReadGuestMemory reads
+		// GPU-written bytes through the backing, and a pending image write-back by a faulting read.
 		vk::DispatchIndirectCommand args {};
-		if (!Libs::LibKernel::Memory::TryReadBufferBacking(args_addr, &args, sizeof(args))) {
-			// Off the GPU thread the buffer cache cannot sync: keep the direct read.
-			std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
-		}
+		Libs::LibKernel::Memory::ReadGuestMemory(args_addr, &args, sizeof(args));
 		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
