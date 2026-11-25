@@ -30,7 +30,8 @@
 // Stream reuse (KYTY_STREAM_REUSE): a reused range may still wait for its copy; the draw that reuses
 // it is recorded later, so it reads the bytes after the copy. Reuse checks (=2) read the ring on
 // the CPU, so they drain first.
-// Off (direct copy) without the recorder thread, off the GPU thread, with a non-coherent stream
+// Off (direct copy) without the recorder thread or while it does not take the command buffer
+// (CommandScheduler::Capturing: fast frames, tests), off the GPU thread, with a non-coherent stream
 // ring, with KYTY_EOP_AT_GPU (a late overlay would see labels released after the draw) and with
 // the late-read detector. KYTY_AB_FLAG=recorder_host_copy switches it per frame: the pending
 // copies stay tracked whatever the arm.

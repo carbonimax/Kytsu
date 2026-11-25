@@ -3493,10 +3493,11 @@ void Drain(uint64_t& counter) {
 	g_pending.Clear();
 }
 
-// GPU thread: queues the copy for the recorder; false when the caller must copy now.
-bool Defer(const StreamBuffer& stream, uint8_t* mapped, uint64_t vaddr, uint64_t size, bool timed) {
+// GPU thread: queues the copy for the recorder; false when the caller must copy now. `capturing`:
+// the scheduler records this command buffer on the recorder thread (else no recorder ring, e.g. tests).
+bool Defer(const StreamBuffer& stream, uint8_t* mapped, uint64_t vaddr, uint64_t size, bool timed, bool capturing) {
 	const int mode = Mode();
-	if (mode == 0 || PerfStats::AbOff("recorder_host_copy") || CmdRecord::Mode() != 1 ||
+	if (mode == 0 || !capturing || PerfStats::AbOff("recorder_host_copy") || CmdRecord::Mode() != 1 ||
 	    !PerfStats::IsGpuThread() || !stream.IsCoherent() || EopAtGpu::Enabled() || LateRead::Enabled()) {
 		return false;
 	}
@@ -3610,7 +3611,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			const auto arm   = timed ? H::Arm() : 0;
 			// Producer time either way: the copy, or queuing it for the recorder.
 			const auto t0 = timed ? H::NowNs() : 0;
-			if (H::Defer(stream, mapped, vaddr, size, timed)) {
+			if (H::Defer(stream, mapped, vaddr, size, timed, m_scheduler.Capturing())) {
 				if (PerfStats::Enabled()) {
 					H::g_deferred[H::Arm()]++;
 					H::g_deferred_bytes[H::Arm()] += size;
