@@ -262,6 +262,27 @@ void KYTY_SYSV_ABI CountDispatchedSignal(int, void *) { dispatched_signals++; }
 
 void *KYTY_SYSV_ABI ReturnFromGuestThread(void *) { return nullptr; }
 
+std::atomic<int> sleepers_started{0};
+std::atomic<bool> stop_sleepers{false};
+
+void *KYTY_SYSV_ABI SleepUntilStopped(void *) {
+  sleepers_started++;
+  while (!stop_sleepers) {
+    Libs::LibKernel::KernelUsleep(1000);
+  }
+  return nullptr;
+}
+
+Libs::LibKernel::Pthread StartSleeper() {
+  Libs::LibKernel::Pthread sleeper = nullptr;
+  const auto started = sleepers_started.load();
+  Check(Libs::LibKernel::PthreadCreate(&sleeper, nullptr, SleepUntilStopped, nullptr,
+                                       "Sleeper") == OK,
+        "create a sleeping guest thread");
+  WaitForMutexTest([&] { return sleepers_started.load() > started; });
+  return sleeper;
+}
+
 void TestPendingSignalDispatch() {
   using namespace Libs::LibKernel;
   Loader::SymbolDatabase symbols;
@@ -294,6 +315,15 @@ void TestPendingSignalDispatch() {
   Check(PthreadJoin(exiting, nullptr) == OK && !PthreadHasAnyPendingSignal(exiting),
         "joining clears signals the exiting thread did not take");
   Check(remove(30) == OK, "remove signal handler");
+
+  stop_sleepers = false;
+  auto *successor = StartSleeper();
+  const auto canceled = PthreadCancel(exiting);
+  stop_sleepers = true;
+  void *result = nullptr;
+  Check(PthreadJoin(successor, &result) == OK && result == nullptr &&
+            canceled == KERNEL_ERROR_ESRCH,
+        "canceling a joined thread leaves its successor running");
 }
 
 class TempDirectory {
