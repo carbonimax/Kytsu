@@ -18601,7 +18601,7 @@ public:
 
   // A comparison sample of a k8UNorm texture, a guest format with no depth view: the 4x4 PCF case
   // of arigandores/KytyPS5 359b1c3b5. It prints every answer next to the CPU PCF (compare each
-  // texel, then the bilinear weights) and NEAREST references. With KYTY_DEPTH_COMPARE_COLOR=1 the
+  // texel, then the bilinear weights) and NEAREST references. Unless KYTY_DEPTH_COMPARE_COLOR=0 the
   // shader compares the sampled texel: NEAREST must match exactly, LINEAR must equal the test of the
   // filtered texel, and no Dref sample may remain.
   void CheckDepthCompareColorTexture() {
@@ -57655,7 +57655,7 @@ void CheckSampledColorViews() {
 #endif
 
 // One comparison S# serves a k32Float image (depth view, native comparison) and a k8UNorm image
-// (no depth view). With KYTY_DEPTH_COMPARE_COLOR=1 the k8UNorm image compares in the shader through
+// (no depth view). Unless KYTY_DEPTH_COMPARE_COLOR=0 the k8UNorm image compares in the shader through
 // its own sampler variant without the S# function, and the depth image keeps the native one.
 void CheckDepthCompareColorSharedSampler() {
   constexpr const char *name = "DepthCompareColorSharedSampler";

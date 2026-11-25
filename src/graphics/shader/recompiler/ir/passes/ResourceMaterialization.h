@@ -56,7 +56,7 @@ struct ResourceSpecialization {
 	bool operator==(const ResourceSpecialization&) const = default;
 };
 
-// KYTY_DEPTH_COMPARE_COLOR=1 (default off, read once): a comparison sample of a direct color
+// On unless KYTY_DEPTH_COMPARE_COLOR=0 (read once): a comparison sample of a direct color
 // image whose guest format has no depth view (outside DEPTH_FORMAT_POLICIES) reads the texel and
 // compares it in the shader with the S# function, instead of a Dref sample of a color view, which
 // Vulkan leaves undefined. Rule from arigandores/KytyPS5 359b1c3b5.

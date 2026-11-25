@@ -2363,7 +2363,7 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 bool DepthCompareColorEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_DEPTH_COMPARE_COLOR");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
 }
