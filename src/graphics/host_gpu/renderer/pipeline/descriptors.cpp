@@ -1500,6 +1500,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				    address, size, descriptor.NumRecords() != UINT32_MAX);
 				unmapped               = mapped_size == 0;
 				size                   = mapped_size;
+				// A window over 4 GiB or more of adjacent mappings still exceeds one storage view.
+				// shortcut: accesses past the device limit read zero and drop writes; route such
+				// buffers through BDA addressing (upstream KytyPS5 #978) if a title needs them.
+				const auto& graphics = m_context.GetGraphics();
+				size = std::min(size,
+				                uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+				                    (graphics.StorageMinAlignment() - 1));
 			}
 			if (unmapped) {
 				static std::atomic<uint32_t> logged {0};
