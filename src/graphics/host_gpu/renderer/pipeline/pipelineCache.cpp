@@ -308,14 +308,14 @@ struct PipelineCache::ProgramCache {
 
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t push_data_cursor, bool emulate_image_min_lod) {
+		                             ShaderRecompiler::IR::PushData::Window push_data, bool emulate_image_min_lod) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization, emulate_image_min_lod));
 			CaptureSrtReads(resource_plan, runtime, resources);
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords()) ||
+				if (layout.push_data_start_dword !=
+				        push_data.StartFor(layout.ShaderDataDwords(), candidate.program.stage) ||
 				    candidate.specialization != specialization) {
 					continue;
 				}
@@ -495,7 +495,7 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword,
+	                               ShaderRecompiler::IR::PushData::Window push_data,
 	                               std::span<const uint32_t> function_code,
 	                               std::vector<uint32_t>*    spirv) {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
@@ -503,7 +503,7 @@ struct PipelineCache::ProgramCache {
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		const auto emit_begin = diag_log ? PerfStats::SteadyUs() : 0;
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
+		                                               specialization, push_data);
 		if (diag_log) diag_emit_us = PerfStats::SteadyUs() - emit_begin;
 		if (options.stage == ShaderType::Pixel) {
 			// Pixel waves run in 64-lane amdvlk subgroups with no required size: record the guest
@@ -596,7 +596,7 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  ShaderRecompiler::IR::PushData::Window& push_data) {
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
@@ -639,7 +639,7 @@ struct PipelineCache::ProgramCache {
 			                    .resources = &entry->second.resources,
 			                    .handle    = &permutation.handle,
 			                    .module    = &permutation};
-			permutation.program.bindings.AdvancePushData(push_data_cursor);
+			permutation.program.bindings.AdvancePushData(push_data, permutation.program.stage);
 			return permutation.handle;
 		};
 		const char* label      = nullptr;
@@ -688,9 +688,9 @@ struct PipelineCache::ProgramCache {
 					refresh_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 					                                       std::chrono::steady_clock::now() - prof_start).count());
 				}
-				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled);
+				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data, !graphics.image_view_min_lod_enabled);
 			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor,
+				permutation = cached.FindPermutation<false>(runtime, push_data,
 				                                            !graphics.image_view_min_lod_enabled);
 			}
 			if (prof) {
@@ -705,7 +705,7 @@ struct PipelineCache::ProgramCache {
 					store->NoteUsedModule(permutation->handle.id);
 					if (permutation->store_verify_pending) {
 						finish_options();
-						VerifyStored(*permutation, cached, params, options, push_data_cursor);
+						VerifyStored(*permutation, cached, params, options, push_data);
 					}
 				}
 				return bind(*permutation);
@@ -832,20 +832,20 @@ struct PipelineCache::ProgramCache {
 			CaptureSrtReads(entry->second.resource_plan, runtime, entry->second.resources);
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled)) {
+			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data, !graphics.image_view_min_lod_enabled)) {
 				return bind(*permutation);
 			}
 		}
 		if (verify_local) {
 			// Emitted from the GPU thread's own translation with the same specialization.
 			const auto check = ShaderRecompiler::CompileProgram(
-			    std::move(*verify_local), options, entry->second.specialization, push_data_cursor);
+			    std::move(*verify_local), options, entry->second.specialization, push_data);
 			verify_spirv_hash = XXH3_64bits(check.spirv.data(), check.spirv.size() * sizeof(uint32_t));
 		}
 		// Programs with GPU-selected calls depend on their callees' current code: not stored.
 		const bool store_module = store != nullptr && entry->second.call_source == nullptr;
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, lookup_key, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    stage_name, lookup_key, options, std::move(translated), entry->second.specialization, push_data,
 		    entry->second.FunctionCode(), store_module ? &store_spirv : nullptr));
 		if (store_module) {
 			StoreModule(entry->second, input_info, params, options);
@@ -966,7 +966,7 @@ struct PipelineCache::ProgramCache {
 	// KYTY_SHADER_STORE=2: translates and emits a loaded module again and compares the result with
 	// the store.
 	void VerifyStored(Permutation& permutation, SourceEntry& entry, const ShaderParams& params,
-	                  const ShaderRecompiler::CompileOptions& options, uint32_t push_data_cursor) {
+	                  const ShaderRecompiler::CompileOptions& options, ShaderRecompiler::IR::PushData::Window push_data) {
 		permutation.store_verify_pending = false;
 		const auto stored = store->ReadSpirv(permutation.store_spirv - 1, permutation.handle.id);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
@@ -977,7 +977,7 @@ struct PipelineCache::ProgramCache {
 			             ShaderRecompiler::IR::SaveResourcePlan(entry.resource_plan);
 		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               permutation.specialization, push_data_cursor);
+		                                               permutation.specialization, push_data);
 		const bool spirv_equal = !stored.empty() && result.spirv == stored;
 		const auto info       = std::move(result.program).TakeCompiledInfo();
 		ShaderRecompiler::IR::Writer fresh;
@@ -1996,10 +1996,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			}
 		}
 	}
-	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
-	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	ShaderRecompiler::IR::PushData::Window push_data {
+	    .begin = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(mesh_active, object_primitive_id,
+	                                                                last_stage.user_clip_planes)};
 	if (pixel_active) {
-		m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		m_program_cache->Get(pixel_params, pixel_info, push_data);
 		for (const auto& output: pixel_info.stage.program->info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -2027,7 +2028,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	                      !(pixel_active && pixel_info.stage.program != nullptr && StageWritesAnything(pixel_info.stage));
 	cache.tess_deferred = false;
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		m_program_cache->Get(vertex_params[i], vertex_info[i], push_data);
 	}
 	cache.tess_defer = false;
 	if (cache.tess_deferred) {
@@ -2044,8 +2045,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	const auto        params      = PrepareProgram(regs, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	uint32_t          push_data_cursor = 0;
-	const auto        program          = m_program_cache->Get(params, input_info, push_data_cursor);
+	ShaderRecompiler::IR::PushData::Window push_data;
+	const auto        program          = m_program_cache->Get(params, input_info, push_data);
 	// HW_ID2 reads are translated with the graphics compute queue's values.
 	EXIT_NOT_IMPLEMENTED(program && input_info.async_compute && input_info.stage.program != nullptr &&
 	                     input_info.stage.program->info.reads_queue_id);
