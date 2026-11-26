@@ -835,6 +835,7 @@ std::pair<uint32_t, uint32_t> FormattedComponentAddress(EmitterState& state,
 	                        ConstantU32(state, std::countr_zero(plan.resource.element_bits / 8u)))};
 }
 
+// Kept for this fork's device-bounded path, which selects each component separately.
 uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                const PreparedFormattedMemory& plan, uint32_t output_component) {
 	return LoadFormattedComponent(
@@ -858,6 +859,17 @@ uint32_t ConstructU32Composite(EmitterState& state, uint32_t components,
 	words.insert(words.end(), values.begin(), values.begin() + components);
 	state.builder.AddFunction(words);
 	return result;
+}
+
+uint32_t LoadFormattedComponents(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                 const Format::BufferFormatInfo& info, uint32_t components,
+                                 const auto& load_word, const auto& load_subword) {
+	std::array<uint32_t, 4> values {};
+	for (uint32_t output = 0; output < components; ++output) {
+		const auto source = ResolveFormattedSource(ctx, mem, info, output);
+		values[output] = LoadFormattedComponent(ctx, info, source, load_word, load_subword);
+	}
+	return ConstructU32Composite(ctx.state, components, values);
 }
 
 uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
@@ -1146,6 +1158,46 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
+uint32_t LoadIndirectTyped(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                           const IR::MemoryInfo& mem, uint32_t components) {
+	auto& state = ctx.state;
+	const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	const auto zero = ConstantU32CompositeZero(state, components);
+	if (info.byte_size == 0u) return zero;
+	// MTBUF overrides the format and selects channels in order. An invalid V# is still unbound.
+	const auto valid = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+	                          ConstantU32(state, 0u));
+	const auto in_bounds = IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, info.byte_size), true);
+	return EmitValueOrDefaultIfCondition(state, AndCondition(state, valid, in_bounds),
+	                                    TypeU32Composite(state, components), zero, [&] {
+		const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                         ConstantU64(state, ~uint64_t {3}));
+		std::array<uint32_t, 4> words {};
+		const auto load_word = [&](uint32_t component) {
+			const auto slot = Format::GetFormatComponentByteOffset(info, component) / 4u;
+			auto& word = words[slot];
+			if (word != 0u) return word;
+			const auto address = slot == 0u ? base : Binary(
+			    state, spv::OpIAdd, TypeU64(state), base, ConstantU64(state, slot * 4u));
+			word = LoadBdaDword(ctx, address, mem.coherent);
+			if (info.byte_size < 4u) {
+				const auto byte = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+				    Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
+				    ConstantU32(state, 4u - info.byte_size));
+				word = Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+				    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3)));
+			}
+			return word;
+		};
+		const auto load_subword = [&](uint32_t component, uint32_t bits) {
+			const auto byte = Format::GetFormatComponentByteOffset(info, component) % 4u;
+			return EmitBitFieldUExtract(state, load_word(component), ConstantU32(state, byte * 8u),
+			                            ConstantU32(state, bits));
+		};
+		return LoadFormattedComponents(ctx, mem, info, components, load_word, load_subword);
+	});
+}
+
 uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
                                uint32_t components, bool coherent) {
 	auto& state = ctx.state;
@@ -1258,6 +1310,11 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	return result;
 }
 
+std::array<uint32_t, 5> IndirectBufferLoadKey(const IR::MemoryInfo& mem, uint32_t components) {
+	return {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted),
+	        mem.typed ? uint32_t(Format::DecodeTBufferFormat(mem.data_format, mem.number_format)) : UINT32_MAX};
+}
+
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
@@ -1265,8 +1322,7 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
 		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
-			    const auto function = state.indirect_buffer_load_functions.at(
-			        {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
+			    const auto function = state.indirect_buffer_load_functions.at(IndirectBufferLoadKey(mem, components));
 			    const auto args = IndirectBufferArgs(ctx, inst);
 			    const auto result = state.builder.AllocateId();
 			    state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components),
@@ -1490,10 +1546,9 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			if (memory.kind != IR::ResourceKind::IndirectBuffer ||
 			    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) continue;
 			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(
-			    std::array {memory.data_bits, components, uint32_t(memory.coherent),
-			                uint32_t(memory.formatted)}, 0u);
+			    IndirectBufferLoadKey(memory, components), 0u);
 			if (!inserted) continue;
-			if (memory.formatted && state.indirect_format_function == 0u) {
+			if (memory.formatted && !memory.typed && state.indirect_format_function == 0u) {
 				DefineIndirectBufferFormats(ctx);
 			}
 			const auto function = entry->second = state.builder.AllocateId();
@@ -1514,7 +1569,8 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			}
 			EmitLabel(state, state.builder.AllocateId());
 			const auto buffer = PrepareIndirectBuffer(state, args);
-			const auto result = memory.formatted ? LoadIndirectFormatted(ctx, buffer, components, memory.coherent)
+			const auto result = memory.typed ? LoadIndirectTyped(ctx, buffer, memory, components)
+			    : memory.formatted ? LoadIndirectFormatted(ctx, buffer, components, memory.coherent)
 			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);
