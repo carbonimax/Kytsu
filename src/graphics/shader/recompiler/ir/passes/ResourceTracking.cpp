@@ -675,8 +675,6 @@ private:
 	};
 
 	struct ResolvedHandle {
-		const Inst* handle;
-		uint32_t pc;
 		DescriptorSource source;
 		Value planning_handle;
 	};
@@ -1027,10 +1025,9 @@ private:
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
 	                uint32_t base_reg, DescriptorSource& descriptor, uint32_t pc) {
-		const auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
-			return entry.handle == &handle && entry.pc == pc;
-		});
-		if (resolved == m_resolved_handles.end()) {
+		const auto [resolved, inserted] =
+		    m_resolved_handles.try_emplace({reinterpret_cast<uintptr_t>(&handle), pc});
+		if (inserted) {
 			if (handle.NumArgs() != width) {
 				Fail(pc, fmt::format("{} has {} descriptor dwords, expected {}",
 				                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
@@ -1050,9 +1047,9 @@ private:
 				// Border color and its table index are unused unless a clamp axis selects border mode.
 				descriptor.dwords[3] = Value(0u);
 			}
-			m_resolved_handles.push_back({&handle, pc, descriptor, {}});
+			resolved->second.source = descriptor;
 		} else {
-			descriptor = resolved->source;
+			descriptor = resolved->second.source;
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
@@ -1207,10 +1204,9 @@ private:
 			const auto flags = read->Flags<MemoryFlags>();
 			auto& memory = m_program.memory_info[flags.index];
 			const auto* handle = read->Arg(0).Resolve().TryInstruction();
-			auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
-				return entry.handle == handle && entry.pc == flags.pc;
-			});
-			EXIT_IF(resolved == m_resolved_handles.end());
+			const auto found = m_resolved_handles.find({reinterpret_cast<uintptr_t>(handle), flags.pc});
+			EXIT_IF(found == m_resolved_handles.end());
+			auto* resolved = &found->second;
 			uint32_t bad_dword = 0;
 			if (!ValidateSource(resolved->source, bad_dword)) continue;
 			memory.planning_only = true;
@@ -1240,9 +1236,10 @@ private:
 			const auto uses = read->Uses();
 			for (const auto& use: uses) use.user->SetArg(use.operand, flat);
 			for (auto& entry: m_resolved_handles) {
-				for (uint32_t word = 0; word < entry.source.dword_count; ++word)
-					if (entry.source.dwords[word].Resolve() == Value(read))
-						entry.source.dwords[word] = flat;
+				auto& source = entry.second.source;
+				for (uint32_t word = 0; word < source.dword_count; ++word)
+					if (source.dwords[word].Resolve() == Value(read))
+						source.dwords[word] = flat;
 			}
 			for (auto* block: m_program.blocks) {
 				if (block->condition.Resolve() == Value(read)) block->condition = flat;
@@ -5050,7 +5047,7 @@ private:
 	const CFG::Graph&                          m_native_cfg;
 	ShaderStageInputInfo                       m_input;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
-	std::vector<ResolvedHandle>                m_resolved_handles;
+	std::map<std::pair<uintptr_t, uint32_t>, ResolvedHandle> m_resolved_handles;
 	std::vector<SrtCollectFrame>               m_srt_stack;
 	std::unordered_map<const Inst*, size_t>    m_srt_path;
 	std::unordered_set<const Inst*>            m_srt_visited;
