@@ -219,6 +219,11 @@ MadRounding LegacyMadRounding() {
 	return mode;
 }
 
+// Instructions that flush f32 denormals in every MODE keep doing so where the module preserves them.
+uint32_t FlushF32DenormIfPreserved(EmitterState& state, uint32_t value) {
+	return state.f32_denorms_preserved ? EmitFlushF32DenormToSignedZero(state, value) : value;
+}
+
 } // namespace
 
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -228,28 +233,30 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	// Explicit denormal checks cost about a quarter of the menu fps on an NVIDIA laptop GPU, so
+	// they are only emitted where the module preserves f32 denormals (the host flushes them
+	// everywhere else).
+	a = FlushF32DenormIfPreserved(state, a);
+	b = FlushF32DenormIfPreserved(state, b);
+	c = FlushF32DenormIfPreserved(state, c);
 	switch (LegacyMadRounding()) {
-		case MadRounding::Fused: return EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
+		case MadRounding::Fused:
+			return FlushF32DenormIfPreserved(state,
+			                                 EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c));
 		case MadRounding::RoundedProduct: {
 			// No NoContraction here: that decoration is what makes SPIRV-Cross emit the helpers.
 			const auto product =
 			    EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, ConstantF32(state, 0x80000000u));
-			return EmitFPAdd32(state, product, c);
+			return FlushF32DenormIfPreserved(
+			    state, EmitFPAdd32(state, FlushF32DenormIfPreserved(state, product), c));
 		}
 		case MadRounding::Separate: break;
 	}
-	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
-	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
-	// a = EmitFlushF32DenormToSignedZero(state, a);
-	// b = EmitFlushF32DenormToSignedZero(state, b);
-	// c = EmitFlushF32DenormToSignedZero(state, c);
 	const auto product = EmitFPMul32(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	// const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
-	const auto sum = EmitFPAdd32(state, product, c);
+	const auto sum = EmitFPAdd32(state, FlushF32DenormIfPreserved(state, product), c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	// return EmitFlushF32DenormToSignedZero(state, sum);
-	return sum;
+	return FlushF32DenormIfPreserved(state, sum);
 }
 
 uint32_t EmitConvertU16U32(EmitterState& state, uint32_t arg0) {
@@ -403,7 +410,8 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
-	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
+	return FlushF32DenormIfPreserved(
+	    state, Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source));
 }
 
 uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
@@ -428,7 +436,7 @@ uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
 	// A denormal input already rounds to 1.0, the result for its flushed zero.
-	return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {arg0});
+	return FlushF32DenormIfPreserved(state, EmitExt(state, TypeF32(state), GLSLstd450Exp2, {arg0}));
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {

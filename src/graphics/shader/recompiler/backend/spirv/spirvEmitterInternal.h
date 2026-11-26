@@ -95,6 +95,7 @@ struct EmitterState {
 	const Profile&                                  profile;
 	bool                                            resource_min_lod = true;
 	IR::PushData::Window                            push_data;
+	bool                                            f32_denorms_preserved = false;
 	uint32_t                                        debug_source = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;

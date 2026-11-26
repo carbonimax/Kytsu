@@ -1010,6 +1010,7 @@ struct PipelineCache::ProgramCache {
 	      profile {.maintenance8 = graphics.maintenance8_enabled,
 		           .native_float_min_max =
 		               graphics.physical_device_properties.vendorID == 0x1002u,
+		           .denorm_preserve_f32 = graphics.denorm_preserve_f32,
 		           // v_cvt_u32/i32_f32 saturate and turn NaN into 0, as the guest's do.
 		           .native_float_to_int =
 		               graphics.physical_device_properties.vendorID == 0x1002u && CompareSelectFold(),

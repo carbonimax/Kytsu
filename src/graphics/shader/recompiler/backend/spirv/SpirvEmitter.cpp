@@ -33,6 +33,10 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	EmitterState state(program, input_info, profile);
 	state.push_data        = push_data;
 	state.resource_min_lod = host_features.resource_min_lod;
+	// FP_DENORM[5:4] = 3 (FLOAT_MODE 0xf0) keeps f32 denormals; hosts flush them by default.
+	state.f32_denorms_preserved =
+	    profile.denorm_preserve_f32 && program.stage == ShaderType::Compute &&
+	    input_info.compute != nullptr && ((input_info.compute->float_mode >> 4u) & 3u) == 3u;
 	if (!host_features.buffer_int64_atomics && program.info.buffer_int64_atomics) {
 		Fail(program,
 		     "shader requires shaderBufferInt64Atomics, which is not enabled on the host GPU");
