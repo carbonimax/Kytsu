@@ -973,13 +973,7 @@ static bool ResolveTextureDesc(const RenderContext& context,
 		image_layers = std::max(image_layers, 6u);
 	}
 	auto          view_base    = static_cast<uint32_t>(base_level);
-	auto pixel_format = surface_format.vk_format;
-	if (resource.depth_compare) {
-		if (const auto* depth_format = FindGuestDepthFormatPolicy(format);
-		    depth_format && depth_format->depth_attachment_format != vk::Format::eUndefined) {
-			pixel_format = depth_format->depth_attachment_format;
-		}
-	}
+	const auto pixel_format = SampledDepthCompareFormat(format, resource.depth_compare).value_or(surface_format.vk_format);
 	const auto raw_sint_format = ShaderRecompiler::IR::RawSignedStorageFormat(resource, format);
 	const auto storage_view_format = resource.atomic64 ? vk::Format::eR64Uint
 	                                 : storage && resource.atomic ? vk::Format::eR32Uint
