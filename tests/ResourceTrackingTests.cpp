@@ -473,8 +473,9 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
              "a descriptor read sharing its memory index entered the table plan");
 }
 
-void TestResidentImageHeap() {
-  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+// A LOD query through the table selects its candidate like a sample (IMAGE_GET_LOD).
+void TestResidentImageHeap(ValueOpcode access) {
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, false, access);
   fixture->PlanAndTrack();
   const auto plan = ExtractResourcePlan(fixture->program);
   std::array<uint32_t, 8> descriptor{};
@@ -10624,7 +10625,8 @@ int main(int argc, char **argv) {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
-    Run("resident image heap", TestResidentImageHeap);
+    Run("resident image heap", [] { TestResidentImageHeap(ValueOpcode::ImageSampleRaw); });
+    Run("resident image heap LOD query", [] { TestResidentImageHeap(ValueOpcode::ImageQueryLod); });
     Run("image heap kinds", TestImageHeapKinds);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
