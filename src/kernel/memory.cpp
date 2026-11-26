@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
+#include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -17,6 +18,7 @@
 #include "graphics/host_gpu/memTrackProf.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -31,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <thread>
 #include <vector>
@@ -1155,10 +1158,90 @@ bool IsVirtualAddressKnown(uint64_t vaddr) {
 	return g_virtual_ranges->IsKnown(vaddr);
 }
 
+// Opt-in diagnostic (KYTY_MEM_CALLER=1): which guest code asks for big memory, and from where.
+static bool MemCallerLog() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_MEM_CALLER");
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
+	}();
+	return enabled;
+}
+
+static constexpr uint64_t MEM_CALLER_MIN_SIZE = 256ull << 20u;
+
+static void DescribeGuestCode(uint64_t vaddr, char* out, size_t out_size) {
+	auto* p = Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(vaddr);
+	if (p == nullptr) {
+		std::snprintf(out, out_size, "-");
+		return;
+	}
+	std::snprintf(out, out_size, "%s+0x%" PRIx64,
+	              Common::PathToString(p->file_name.filename()).c_str(), vaddr - p->base_vaddr);
+}
+
+// Call before taking g_memory_operation_mutex: FindProgramByAddr takes the linker lock.
+static void LogMemCaller(const char* what, uint64_t ret, const void* frame, uint64_t a, uint64_t b,
+                         uint64_t c, bool once_per_caller = false) {
+	static std::mutex         seen_mutex;
+	static std::set<uint64_t> seen_callers;
+	if (once_per_caller) {
+		std::lock_guard lock(seen_mutex);
+		if (!seen_callers.insert(ret).second) {
+			return;
+		}
+	}
+	char desc[160];
+	DescribeGuestCode(ret, desc, sizeof(desc));
+	std::printf("MEMCALL %s tid=%d a=0x%" PRIx64 " b=0x%" PRIx64 " c=0x%" PRIx64 " ret=0x%" PRIx64
+	            " %s\n",
+	            what, Common::Thread::GetThreadIdUnique(), a, b, c, ret, desc);
+	// The guest frames sit just above this HLE entry on the same stack: print the words that are
+	// guest code addresses (return addresses; deeper callers come later).
+	uint64_t count = once_per_caller ? 128 : 1024;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(frame, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) {
+		count = 0;
+	} else {
+		const auto end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+		count          = std::min<uint64_t>(count, (end - reinterpret_cast<uint64_t>(frame)) / 8);
+	}
+#endif
+	const auto* stack = static_cast<const uint64_t*>(frame);
+	for (uint64_t i = 0; i < count; i++) {
+		DescribeGuestCode(stack[i], desc, sizeof(desc));
+		if (desc[0] != '-') {
+			std::printf("MEMCALL   [+0x%03" PRIx64 "] %s\n", i * 8, desc);
+		}
+	}
+	std::fflush(stdout);
+}
+
+#define MEM_CALLER(what, size, a, b, c)                                                            \
+	do {                                                                                           \
+		if (MemCallerLog() && (size) >= MEM_CALLER_MIN_SIZE) {                                     \
+			LogMemCaller(what, reinterpret_cast<uint64_t>(__builtin_return_address(0)),            \
+			             __builtin_frame_address(0), a, b, c);                                     \
+		}                                                                                          \
+	} while (0)
+
+#define MEM_CALLER_ONCE(what, a, b, c)                                                             \
+	do {                                                                                           \
+		if (MemCallerLog()) {                                                                      \
+			LogMemCaller(what, reinterpret_cast<uint64_t>(__builtin_return_address(0)),            \
+			             __builtin_frame_address(0), a, b, c, true);                               \
+		}                                                                                          \
+	} while (0)
+
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
-	return g_virtual_ranges->ClampRangeSize(vaddr, size, span_holes);
+	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size, span_holes);
+	if (clamped_size != size && size >= (1ull << 30u) && MemCallerLog()) {
+		std::printf("MEMCALL clamp addr=0x%" PRIx64 " size=0x%" PRIx64 " to 0x%" PRIx64 "\n", vaddr,
+		            size, clamped_size);
+	}
+	return clamped_size;
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
@@ -2035,12 +2118,15 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot,
                                                    int flags, const char* name) {
 	PRINT_NAME();
+	MEM_CALLER("map_named_flexible", len, len, static_cast<uint64_t>(prot),
+	           static_cast<uint64_t>(flags));
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	return MapFlexibleMemory(addr_in_out, len, prot, flags, name);
 }
 
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
 	PRINT_NAME();
+	MEM_CALLER("map_flexible", len, len, static_cast<uint64_t>(prot), static_cast<uint64_t>(flags));
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	return MapFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
@@ -2321,6 +2407,8 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
                                                   size_t alignment, int64_t* phys_addr_out,
                                                   size_t* size_out) {
 	PRINT_NAME();
+	MEM_CALLER_ONCE("available_direct", static_cast<uint64_t>(search_start),
+	                static_cast<uint64_t>(search_end), alignment);
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -2515,6 +2603,7 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
                                              size_t alignment, int memory_type,
                                              int64_t* phys_addr_out) {
 	PRINT_NAME();
+	MEM_CALLER("allocate_direct", len, len, alignment, static_cast<uint64_t>(memory_type));
 	return AllocateDirectMemory(search_start, search_end, len, alignment, memory_type,
 	                            phys_addr_out);
 }
@@ -2522,6 +2611,7 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, int memory_type,
                                                  int64_t* phys_addr_out) {
 	PRINT_NAME();
+	MEM_CALLER("allocate_main_direct", len, len, alignment, static_cast<uint64_t>(memory_type));
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -2789,6 +2879,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
+	MEM_CALLER("map_direct", len, len, static_cast<uint64_t>(direct_memory_start),
+	           static_cast<uint64_t>(flags));
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, "");
 }
@@ -2796,6 +2888,8 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
+	MEM_CALLER("map_direct2", len, len, static_cast<uint64_t>(direct_memory_start),
+	           static_cast<uint64_t>(flags));
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	return MapDirectMemory(addr, len, prot, flags, direct_memory_start, alignment, "", type);
 }
@@ -2903,6 +2997,8 @@ int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, 
                                              int64_t direct_memory_start, size_t alignment,
                                              const char* name) {
 	PRINT_NAME();
+	MEM_CALLER("map_named_direct", len, len, static_cast<uint64_t>(direct_memory_start),
+	           static_cast<uint64_t>(flags));
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -2969,6 +3065,7 @@ static int ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 
 int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment) {
 	PRINT_NAME();
+	MEM_CALLER("reserve_virtual", len, len, static_cast<uint64_t>(flags), alignment);
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -3446,6 +3543,12 @@ int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int
 int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
                                   int* num_entries_out, int flags) {
 	PRINT_NAME();
+	if (MemCallerLog() && entries != nullptr) {
+		for (int i = 0; i < num_entries; i++) {
+			MEM_CALLER("batch_map", entries[i].length, entries[i].length, entries[i].offset,
+			           static_cast<uint64_t>(entries[i].operation));
+		}
+	}
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -3539,6 +3642,7 @@ static void MemoryPoolSubtractCommitted(uint64_t len) {
 int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_end, size_t len,
                                          size_t alignment, int64_t* phys_addr_out) {
 	PRINT_NAME();
+	MEM_CALLER("pool_expand", len, len, alignment, static_cast<uint64_t>(search_start));
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
