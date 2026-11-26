@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <span>
@@ -138,9 +139,11 @@ struct GraphicContext {
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
 	}
 
+	// At least 8: the 64-bit view of a storage binding (coherent DWORDX2 pairs, 64-bit atomics) only
+	// checks the shader-side byte address, so the binding base must keep 8-byte alignment. On a device
+	// with a 4-byte minimum, 64-bit stores from a base at 4 mod 8 were observed landing 4 bytes low.
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
-		const auto alignment = physical_device_properties.limits.minStorageBufferOffsetAlignment;
-		return alignment != 0 ? alignment : 1;
+		return std::max<vk::DeviceSize>(physical_device_properties.limits.minStorageBufferOffsetAlignment, 8);
 	}
 
 	[[nodiscard]] bool CreateAllocator();
