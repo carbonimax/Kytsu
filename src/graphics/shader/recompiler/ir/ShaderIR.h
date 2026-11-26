@@ -817,7 +817,6 @@ struct Program: ResourcePlan {
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory);
 
 std::string ProgramToString(const Program& program);
-bool        HasShaderMemoryWrites(const Program& program);
 
 // Checks the IR's structure and, with require_ssa, that no register-state pseudo is left
 // (only tests validate the IR before the SSA rewrite).
