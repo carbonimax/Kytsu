@@ -807,23 +807,29 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
+	enum class LaneQuantifier { Any, All };
+	struct EdgePredicate {
+		Value condition;
+		bool positive;
+		LaneQuantifier lanes = LaneQuantifier::All;
+	};
+
 	using DescriptorValues = std::map<const Inst*, Value>;
 	using ZeroTest = std::pair<Value, bool>; // SSA operand and whether the edge requires nonzero.
 
-	ZeroTest EdgeZeroTest(const Block* from, const Block* to) const {
-		const auto edge = ConditionalEdge(from, to);
-		if (!edge || edge->lanes != LaneQuantifier::All) return {};
-		const auto* test = edge->condition.TryInstruction();
+	static ZeroTest EdgeZeroTest(const EdgePredicate& edge) {
+		if (edge.lanes != LaneQuantifier::All) return {};
+		const auto* test = edge.condition.TryInstruction();
 		if (test == nullptr || (test->GetOpcode() != ValueOpcode::IEqual32 &&
 		                        test->GetOpcode() != ValueOpcode::INotEqual32)) return {};
 		for (uint32_t i = 0; i < 2u; ++i) {
 			if (test->Arg(i).Resolve() == Value(0u))
-				return {test->Arg(i ^ 1u).Resolve(), edge->positive == (test->GetOpcode() == ValueOpcode::INotEqual32)};
+				return {test->Arg(i ^ 1u).Resolve(), edge.positive == (test->GetOpcode() == ValueOpcode::INotEqual32)};
 		}
 		return {};
 	}
 
-	Value LowerDescriptorValue(Value value, ZeroTest use, DescriptorValues& values) {
+	Value LowerDescriptorValue(Value value, const Block* use, DescriptorValues& values) {
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return value;
@@ -858,7 +864,7 @@ private:
 	}
 
 	// A two-arm diamond whose arms are single-predecessor tails into the merge.
-	Value LowerDiamondPhi(const Inst& inst, ZeroTest use, DescriptorValues& values) {
+	Value LowerDiamondPhi(const Inst& inst, const Block* use, DescriptorValues& values) {
 		if (inst.NumArgs() != 2u || inst.NumPhiBlocks() != 2u || inst.GetType() != Type::U32) {
 			return {};
 		}
@@ -901,10 +907,21 @@ private:
 		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer)) {
 			// A repeated test of the very same SSA value guarantees which arm reaches this use.
 			// Comparing addresses of separate loads would be unsound for a writable shader.
-			if (use.first.IsEmpty()) return {};
-			const auto first = EdgeZeroTest(branch, targets[0]);
-			if (first.first != use.first) return {};
-			const auto chosen = LowerDescriptorValue(inst.Arg(first.second == use.second ? 0u : 1u), use, values);
+			if (use == nullptr) return {};
+			const auto branch_edge = ConditionalEdge(branch, targets[0]);
+			if (!branch_edge) return {};
+			const auto first = EdgeZeroTest(*branch_edge);
+			if (first.first.IsEmpty()) return {};
+			std::optional<bool> nonzero;
+			const bool guarded = GuardedOnEntry(use, [&](const Block* at) { return at == merge; },
+			    [&](const EdgePredicate& edge) {
+				    const auto test = EdgeZeroTest(edge);
+				    if (test.first != first.first || (nonzero && *nonzero != test.second)) return false;
+				    nonzero = test.second;
+				    return true;
+			    });
+			if (!guarded || !nonzero) return {};
+			const auto chosen = LowerDescriptorValue(inst.Arg(first.second == *nonzero ? 0u : 1u), use, values);
 			return ValidateRuntimeValue(m_program, chosen) ? chosen : Value {};
 		}
 		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
@@ -948,7 +965,7 @@ private:
 
 	// A structured merge whose controlling conditional branch nominates this block as its
 	// merge. The two arms may themselves contain nested merges, so lower them recursively.
-	Value LowerStructuredPhi(const Inst& inst, ZeroTest use, DescriptorValues& values) {
+	Value LowerStructuredPhi(const Inst& inst, const Block* use, DescriptorValues& values) {
 		if (inst.NumArgs() != 2u || inst.NumPhiBlocks() != 2u || inst.GetType() != Type::U32) {
 			return {};
 		}
@@ -1019,11 +1036,9 @@ private:
 				                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
 			}
 			descriptor.dword_count = width;
-			const auto* block = handle.Parent();
-			const auto use = m_shader_writes == ShaderWrites::Resource && !m_program.srt_plan_complete && block != nullptr &&
-			                 block->ImmPredecessors().size() == 1u
-			    ? EdgeZeroTest(block->ImmPredecessors()[0], block) : ZeroTest {};
-			auto& values = m_descriptor_values[use.first.IsEmpty() ? nullptr : block];
+			const auto* use = m_shader_writes == ShaderWrites::Resource && !m_program.srt_plan_complete
+			    ? handle.Parent() : nullptr;
+			auto& values = m_descriptor_values[use];
 			for (uint32_t i = 0; i < width; i++) {
 				const auto value = base_reg != UINT32_MAX
 				    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
@@ -1411,13 +1426,6 @@ private:
 		uint32_t bad_dword = 0;
 		return ValidateSource(descriptor, bad_dword);
 	}
-
-	enum class LaneQuantifier { Any, All };
-	struct EdgePredicate {
-		Value condition;
-		bool positive;
-		LaneQuantifier lanes = LaneQuantifier::All;
-	};
 
 	// The immediate that edge proves value differs from on every lane, if any.
 	std::optional<uint32_t> ExcludedBy(const EdgePredicate& edge, Value value) const {
