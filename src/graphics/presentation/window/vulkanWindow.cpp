@@ -737,6 +737,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 
+	// NONE would force one denorm mode on every float width (VUID-RuntimeSpirv-denormBehaviorIndependence-06290).
+	graphics.denorm_preserve_f32 =
+	    float_controls.shaderDenormPreserveFloat32 == VK_TRUE &&
+	    float_controls.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone;
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.vertex_subgroups_supported    = static_cast<bool>(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eVertex);
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;

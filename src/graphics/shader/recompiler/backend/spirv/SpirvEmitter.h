@@ -33,6 +33,8 @@ enum class StorageBoundsCounter : uint32_t {
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
+	// shaderDenormPreserveFloat32 with a denormBehaviorIndependence other than NONE.
+	bool denorm_preserve_f32 = false;
 	// OpConvertFToU/FToS saturate and give 0 for NaN, as V_CVT_U32/I32_F32 do. SPIR-V leaves
 	// out-of-range conversions undefined, so only a device known to convert this way sets it.
 	bool native_float_to_int = false;
