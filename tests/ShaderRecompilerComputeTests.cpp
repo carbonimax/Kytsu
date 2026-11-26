@@ -41940,6 +41940,43 @@ TestCase CoherentBufferLoadDwordx2Swizzled() {
   return test;
 }
 
+// A glc BUFFER_STORE_DWORDX2 into a binding whose guest base is 4 mod 8 lands at its own address:
+// the host binding offset follows the renderer's StorageMinAlignment and the shader prefix takes
+// the remainder.
+void CheckCoherentPairStoreUnalignedBase(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  const u32 alignment = static_cast<u32>(vulkan.RuntimeContext().StorageMinAlignment());
+  constexpr u32 base = 12u;
+  const u32 host_offset = base / alignment * alignment;
+  const u32 prefix = base - host_offset;
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = wave == 64 ? "CoherentPairStoreUnalignedBaseWave64"
+                           : "CoherentPairStoreUnalignedBaseWave32";
+    test.initial.assign(12, 0xccccccccu);
+    test.expected = test.initial;
+    for (u32 i = 0; i < 2; ++i) {
+      AppendVMovLiteral(&test.code, 20, i * 8u);
+      AppendVMovLiteral(&test.code, 2, 0xa0000000u + i);
+      AppendVMovLiteral(&test.code, 3, 0xb0000000u + i);
+      test.code.push_back(EncodeMubuf0(0x1d, 0, false, true, true));
+      test.code.push_back(EncodeMubuf1(2, 0, 20));
+      test.expected[(base + i * 8u) / 4u] = 0xa0000000u + i;
+      test.expected[(base + i * 8u) / 4u + 1u] = 0xb0000000u + i;
+    }
+    AppendEnd(&test.code);
+    test.user_data = MakeStructuredStorageBufferData(0, 16);
+    test.has_user_data = true;
+    test.storage_buffer_offsets = {prefix};
+    test.storage_buffer_ranges = {{host_offset, 16u + prefix}};
+    test.required_spirv = {"OpAtomicStore"};
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORDX2, O::S_ENDPGM};
+    test.compute_info.wave_size = wave;
+    test.has_compute_info = true;
+    RunCase(&vulkan, test);
+  }
+}
+
 TestCase BufferLoadDwordx3SnapshotsOverlappingAddress() {
   using O = ShaderOpcode;
 
@@ -64868,6 +64905,7 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, CoherentBufferPairContention(wave));
     }
     RunCase(&vulkan, CoherentBufferLoadDwordx2Swizzled());
+    CheckCoherentPairStoreUnalignedBase(vulkan);
     RunCase(&vulkan, BufferWorkgroupPublication(32));
     RunCase(&vulkan, BufferWorkgroupPublication(64));
     RunCase(&vulkan, BufferWorkgroupPublication(32, true));
@@ -65621,6 +65659,7 @@ int main(int argc, char **argv) {
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   RunStorageBoundsTests(vulkan);
+  CheckCoherentPairStoreUnalignedBase(vulkan);
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
