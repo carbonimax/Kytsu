@@ -1448,13 +1448,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			                               source, &program, snapshot.buffers[resource], metadata.written, cache);
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
-			auto size = descriptor.GetSize();
-			if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
-			    !metadata.scalar) {
-				// OOB_SELECT=2 only tests NumRecords != 0; a zero-stride fetch
-				// still needs its full payload when NumRecords is smaller than it.
-				size = std::max(size, uint64_t {metadata.max_byte_extent});
-			}
+			auto size = BufferBindingSize(metadata, descriptor);
 			if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 				source = {};
 				continue;
