@@ -605,6 +605,11 @@ add_executable(eager_pages_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EagerPagesT
 target_link_libraries(eager_pages_tests fmt::fmt common)
 target_include_directories(eager_pages_tests PRIVATE ${inc_headers})
 
+add_executable(recorder_host_copy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RecorderHostCopyTests.cpp"
+)
+target_include_directories(recorder_host_copy_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -994,6 +999,7 @@ if(BUILD_TESTING)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)
 	add_test(NAME tess_pretranslate_policy COMMAND $<TARGET_FILE:tess_pretranslate_policy_tests>)
 	add_test(NAME staging_memory_policy COMMAND $<TARGET_FILE:staging_memory_policy_tests>)
+	add_test(NAME recorder_host_copy COMMAND $<TARGET_FILE:recorder_host_copy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
 	add_test(NAME aliased_mrt_incompatible COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-incompatible-only)
@@ -1216,6 +1222,7 @@ if(BUILD_TESTING)
 		async_pipeline_policy_tests
 		tess_pretranslate_policy_tests
 		staging_memory_policy_tests
+		recorder_host_copy_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

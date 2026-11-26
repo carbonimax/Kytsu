@@ -10,7 +10,9 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/recorderHostCopy.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
@@ -556,6 +558,7 @@ void BufferCache::ReportImport(double seconds) {
 }
 
 void BufferCache::BeforeCpuWrite(uint64_t vaddr, uint64_t size) {
+	RecorderHostCopy::NoteCpWrite(vaddr, size);
 	if (!m_import || size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return;
 	}
@@ -3383,6 +3386,182 @@ static bool StreamReuseMatches(const StreamBuffer& stream, uint64_t vaddr, uint6
 	return false;
 }
 
+// The stream copy of ObtainBuffer, on the command processor or on the recorder thread
+// (KYTY_RECORDER_HOST_COPY): the guest bytes with the pending labels overlaid (`overlaid` set when some were).
+static bool CopyStreamBytes(uint64_t vaddr, uint8_t* mapped, uint64_t size, bool* overlaid = nullptr) {
+	if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+		return false;
+	}
+	const bool any = EopAtGpu::OverlayPending(vaddr, mapped, size);
+	if (overlaid != nullptr) {
+		*overlaid = any;
+	}
+	return true;
+}
+
+namespace RecorderHostCopy {
+namespace {
+
+// 0 = off, 1 = on (default, also when unset), 2 = on with checks: the command processor also copies the bytes at
+// reservation time and the recorder compares its copy with them (a difference is a guest write
+// in between, counted and logged; the recorder's bytes are kept).
+int Mode() {
+	static std::atomic<int64_t> once {Common::OnceUnset};
+	return static_cast<int>(Common::Once(once, [] {
+		const char* value = std::getenv("KYTY_RECORDER_HOST_COPY");
+		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
+		const int   mode  = v == 1 || v == 2 ? static_cast<int>(v) : 0;
+		std::printf("BufferCache: KYTY_RECORDER_HOST_COPY=%d (stream copies on the recorder thread)\n", mode);
+		std::fflush(stdout);
+		return mode;
+	}));
+}
+
+// Followed by `size` snapshot bytes in mode 2.
+struct Call {
+	uint8_t* mapped;
+	uint64_t vaddr;
+	uint64_t size;
+	bool     timed;
+	bool     check;
+};
+
+// Producer (GPU thread) state, and the recorder's progress.
+PendingRanges         g_pending;
+uint64_t              g_issued = 0;
+std::atomic<uint64_t> g_done {0};
+
+// Stats. Copy times are sampled (1 copy in 8, scaled), split by thread and by AB arm.
+constexpr uint64_t    Sample = 8;
+uint64_t              g_sample_counter = 0;
+std::array<uint64_t, 2> g_direct {}, g_direct_bytes {}, g_direct_back_ns {}, g_direct_front_ns {};
+std::array<uint64_t, 2> g_deferred {}, g_deferred_bytes {};
+std::array<std::atomic<uint64_t>, 2> g_recorder_ns {};
+uint64_t g_overlap_drains = 0, g_signal_drains = 0, g_drain_ns = 0;
+std::atomic<uint64_t> g_read_failures {0};
+std::atomic<uint64_t> g_checked {0}, g_check_diffs {0};
+
+uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+size_t Arm() {
+	return PerfStats::AbArmOff() ? 0u : 1u;
+}
+
+void Run(void* data) {
+	const auto& c  = *static_cast<const Call*>(data);
+	const auto  t0 = c.timed ? NowNs() : 0;
+	if (!CopyStreamBytes(c.vaddr, c.mapped, c.size)) {
+		// The guest unmapped the range before the GPU read it: zeros, as an unbacked read.
+		std::memset(c.mapped, 0, static_cast<size_t>(c.size));
+		if (g_read_failures.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("BufferCache: KYTY_RECORDER_HOST_COPY: guest range 0x%016" PRIx64 "+0x%" PRIx64
+			            " unreadable at copy time, zero-filled\n",
+			            c.vaddr, c.size);
+			std::fflush(stdout);
+		}
+	}
+	if (c.timed) {
+		g_recorder_ns[Arm()].fetch_add((NowNs() - t0) * Sample, std::memory_order_relaxed);
+	}
+	if (c.check) {
+		const auto* snapshot = static_cast<const uint8_t*>(data) + sizeof(Call);
+		g_checked.fetch_add(1, std::memory_order_relaxed);
+		if (std::memcmp(snapshot, c.mapped, static_cast<size_t>(c.size)) != 0 &&
+		    g_check_diffs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			uint64_t first = 0;
+			while (snapshot[first] == c.mapped[first]) {
+				first++;
+			}
+			std::printf("BufferCache: KYTY_RECORDER_HOST_COPY=2 guest bytes changed after the reservation: 0x%016" PRIx64
+			            "+0x%" PRIx64 " first byte +0x%" PRIx64 "\n",
+			            c.vaddr, c.size, first);
+			std::fflush(stdout);
+		}
+	}
+	g_done.fetch_add(1, std::memory_order_release);
+}
+
+void Drain(uint64_t& counter) {
+	const auto t0 = NowNs();
+	CmdRecord::Drain();
+	g_drain_ns += NowNs() - t0;
+	counter++;
+	g_pending.Clear();
+}
+
+// GPU thread: queues the copy for the recorder; false when the caller must copy now. `capturing`:
+// the scheduler records this command buffer on the recorder thread (else no recorder ring, e.g. tests).
+bool Defer(const StreamBuffer& stream, uint8_t* mapped, uint64_t vaddr, uint64_t size, bool timed, bool capturing) {
+	const int mode = Mode();
+	if (mode == 0 || !capturing || PerfStats::AbOff("recorder_host_copy") || CmdRecord::Mode() != 1 ||
+	    !PerfStats::IsGpuThread() || !stream.IsCoherent() || EopAtGpu::Enabled() || LateRead::Enabled()) {
+		return false;
+	}
+	g_pending.Prune(g_done.load(std::memory_order_acquire));
+	g_pending.Add(vaddr, vaddr + size, g_issued++);
+	const Call call {mapped, vaddr, size, timed, mode == 2};
+	if (mode == 2) {
+		static thread_local std::vector<uint8_t> data;
+		data.resize(sizeof(Call) + size);
+		std::memcpy(data.data(), &call, sizeof(Call));
+		if (!CopyStreamBytes(vaddr, data.data() + sizeof(Call), size)) {
+			EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+		}
+		CmdRecord::Call(&Run, data.data(), data.size());
+	} else {
+		CmdRecord::Call(&Run, &call, sizeof(call));
+	}
+	return true;
+}
+
+} // namespace
+
+void NoteCpWrite(uint64_t address, uint64_t size) {
+	if (!g_pending.Empty() && PerfStats::IsGpuThread() &&
+	    g_pending.NeedsDrain(address, size, g_done.load(std::memory_order_acquire))) {
+		Drain(g_overlap_drains);
+	}
+}
+
+void DrainPending() {
+	if (g_issued == g_done.load(std::memory_order_acquire)) {
+		g_pending.Clear();
+		return;
+	}
+	if (PerfStats::IsGpuThread()) {
+		Drain(g_signal_drains);
+	}
+}
+
+void Report(double seconds, uint64_t frames) {
+	const auto f = static_cast<double>(std::max<uint64_t>(frames, 1));
+	if (g_direct[0] + g_direct[1] + g_deferred[0] + g_deferred[1] == 0 || seconds <= 0.0) {
+		return;
+	}
+	for (size_t arm = 0; arm < 2; arm++) {
+		std::printf("PERF hostcopy %.1fs arm%zu: frames=%" PRIu64 " direct=%.0f/frame (%.0f B/frame) back=%.3fms/frame"
+		            " front=%.3fms/frame deferred=%.0f/frame (%.0f B/frame) recorder=%.3fms/frame\n",
+		            seconds, arm, frames, static_cast<double>(g_direct[arm]) / f,
+		            static_cast<double>(g_direct_bytes[arm]) / f, static_cast<double>(g_direct_back_ns[arm]) / 1e6 / f,
+		            static_cast<double>(g_direct_front_ns[arm]) / 1e6 / f, static_cast<double>(g_deferred[arm]) / f,
+		            static_cast<double>(g_deferred_bytes[arm]) / f,
+		            static_cast<double>(g_recorder_ns[arm].exchange(0, std::memory_order_relaxed)) / 1e6 / f);
+	}
+	std::printf("PERF hostcopy %.1fs: drains overlap=%" PRIu64 " signal=%" PRIu64 " wait=%.3fms/frame"
+	            " read_failures=%" PRIu64 " checked=%" PRIu64 " diffs=%" PRIu64 "\n",
+	            seconds, g_overlap_drains, g_signal_drains, static_cast<double>(g_drain_ns) / 1e6 / f,
+	            g_read_failures.load(std::memory_order_relaxed), g_checked.exchange(0, std::memory_order_relaxed),
+	            g_check_diffs.load(std::memory_order_relaxed));
+	g_direct = g_direct_bytes = g_direct_back_ns = g_direct_front_ns = g_deferred = g_deferred_bytes = {};
+	g_overlap_drains = g_signal_drains = g_drain_ns = 0;
+}
+
+} // namespace RecorderHostCopy
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -3413,6 +3592,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			const auto result = m_stream_reuse->Find(key, stamp, reused);
 			Bump(g_stream_reuse_stats.results[static_cast<size_t>(result)]);
 			if (result == StreamReuse::Result::Hit) {
+				if (reuse == 2) {
+					RecorderHostCopy::DrainPending(); // the earlier copy may still be queued on the recorder
+				}
 				if (reuse != 2 || StreamReuseMatches(stream, vaddr, size, reused)) {
 					Bump(g_stream_reuse_stats.hit_bytes, size);
 					return {&stream, reused};
@@ -3422,10 +3604,35 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			namespace H   = RecorderHostCopy;
+			// Deferred copies never overlay: Defer is off while KYTY_EOP_AT_GPU holds labels.
+			bool overlaid    = false;
+			const bool timed = PerfStats::Enabled() && H::g_sample_counter++ % H::Sample == 0;
+			const auto arm   = timed ? H::Arm() : 0;
+			// Producer time either way: the copy, or queuing it for the recorder.
+			const auto t0 = timed ? H::NowNs() : 0;
+			if (H::Defer(stream, mapped, vaddr, size, timed, m_scheduler.Capturing())) {
+				if (PerfStats::Enabled()) {
+					H::g_deferred[H::Arm()]++;
+					H::g_deferred_bytes[H::Arm()] += size;
+					if (timed) {
+						auto& ns = CpPipeline::IsBackThread() ? H::g_direct_back_ns : H::g_direct_front_ns;
+						ns[arm] += (H::NowNs() - t0) * H::Sample;
+					}
+				}
+			} else {
+				if (!CopyStreamBytes(vaddr, mapped, size, &overlaid)) {
+					EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+				}
+				if (PerfStats::Enabled()) {
+					H::g_direct[H::Arm()]++;
+					H::g_direct_bytes[H::Arm()] += size;
+					if (timed) {
+						auto& ns = CpPipeline::IsBackThread() ? H::g_direct_back_ns : H::g_direct_front_ns;
+						ns[arm] += (H::NowNs() - t0) * H::Sample;
+					}
+				}
 			}
-			const bool overlaid = EopAtGpu::OverlayPending(vaddr, mapped, size);
 			stream.Commit();
 			Bump(g_stream_reuse_stats.fresh);
 			Bump(g_stream_reuse_stats.fresh_bytes, size);

@@ -68,6 +68,8 @@ public:
 	// The render context's scheduler: its command buffers are the ones KYTY_CP_RECORD_THREAD
 	// records on the recorder thread (see cmdRecord.h).
 	void MarkMainRecorder() noexcept { m_record_main = true; }
+	// The current command buffer is recorded on the recorder thread (CmdRecord::Call reaches it).
+	[[nodiscard]] bool Capturing() const noexcept { return m_capturing; }
 	// KYTY_IDLE_SUBMIT=N (default 8, 0 = off; GPU thread, command processor between packets): true when
 	// the command buffer being recorded holds at least N draws or dispatches and the GPU completed
 	// everything submitted before it. The caller then submits it (earlier submission only: same
