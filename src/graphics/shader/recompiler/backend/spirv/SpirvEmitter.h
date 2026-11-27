@@ -54,6 +54,8 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// shaderEarlyAndLateFragmentTests (VK_AMD_shader_early_and_late_fragment_tests).
+	bool early_and_late_fragment_tests = false;
 };
 
 // Descriptor range of a storage binding of `range` bytes whose shader leaves loads and plain stores

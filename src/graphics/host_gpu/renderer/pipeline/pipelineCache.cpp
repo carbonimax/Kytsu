@@ -1023,7 +1023,8 @@ struct PipelineCache::ProgramCache {
 		           .r8_srgb_views   = graphics.r8_srgb_views,
 		           .r8g8_srgb_views = graphics.r8g8_srgb_views,
 		           .relaxed_float   = Config::RelaxedShaderFloatEnabled(),
-		           .ray_query       = graphics.ray_query_enabled} {
+		           .ray_query       = graphics.ray_query_enabled,
+		           .early_and_late_fragment_tests = graphics.early_and_late_fragment_tests_enabled} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {

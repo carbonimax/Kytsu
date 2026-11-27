@@ -479,6 +479,11 @@ static void ShaderGetStaticInputInfoPS(
 	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
 	     !sh.db_shader_control.shader_z_export_enable &&
 	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
+	// EARLY_Z_THEN_RE_Z tests before the shader and writes after it, so kill is allowed. Depth or
+	// mask export and alpha-to-mask stay on the late-only path, as above.
+	ps_info.ps_early_late_z =
+	    (sh.db_shader_control.shader_z_behavior == 3 && !sh.db_shader_control.shader_z_export_enable &&
+	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
@@ -616,6 +621,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
+	key.push_back(static_cast<uint32_t>(info.ps_early_late_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.object_primitive_id));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
@@ -942,6 +948,15 @@ ShaderParams PrepareProgram(
     ShaderPixelInputInfo&                               ps_info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	if (ps_info.ps_early_late_z) {
+		static std::mutex                   mutex;
+		static std::unordered_map<uint64_t, bool> logged;
+		std::scoped_lock                    lock(mutex);
+		if (logged.emplace(hash, true).second) {
+			std::printf("Shader: pixel shader %016" PRIx64 " tests depth before and after (kill=%d)\n",
+			            hash, ps_info.ps_pixel_kill_enable ? 1 : 0);
+		}
+	}
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
@@ -1028,6 +1043,7 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_no_perspective    = %s\n"
 	     "\t ps_pixel_kill_enable = %s\n"
 	     "\t ps_early_z           = %s\n"
+	     "\t ps_early_late_z      = %s\n"
 	     "\t lds_size_dwords      = %u\n",
 	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
 	     info.ps_perspective_center_vgpr, info.ps_perspective_sample_vgpr,
@@ -1037,7 +1053,7 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     info.ps_front_face_all_bits ? "true" : "false", info.ps_ancillary ? "true" : "false",
 	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
 	     info.ps_pixel_kill_enable ? "true" : "false", info.ps_early_z ? "true" : "false",
-	     info.lds_size_dwords);
+	     info.ps_early_late_z ? "true" : "false", info.lds_size_dwords);
 
 	for (uint32_t i = 0; i < info.input_num; i++) {
 		LOGF("\t interpolator_settings[%u] = %u\n", i, info.interpolator_settings[i]);

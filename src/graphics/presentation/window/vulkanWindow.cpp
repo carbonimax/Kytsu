@@ -667,8 +667,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		acceleration_structure.pNext = &ray_query;
 		supported_features2.pNext    = &acceleration_structure;
 	}
+	const bool early_late_extension =
+	    HasExtension(device_extensions, VK_AMD_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderEarlyAndLateFragmentTestsFeaturesAMD early_late {};
+	if (early_late_extension) {
+		early_late.pNext          = supported_features2.pNext;
+		supported_features2.pNext = &early_late;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.device_fault_enabled = device_fault_extension && device_fault.deviceFault == VK_TRUE;
+	graphics.early_and_late_fragment_tests_enabled =
+	    early_late_extension && early_late.shaderEarlyAndLateFragmentTests == VK_TRUE;
+	LOGF("Vulkan early and late fragment tests: %s\n",
+	     graphics.early_and_late_fragment_tests_enabled ? "true" : "false");
 	const bool ray_query_enabled = ray_query_extensions &&
 	                               acceleration_structure.accelerationStructure && ray_query.rayQuery;
 	const bool barycentric_supported =
@@ -914,6 +925,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	if (graphics.early_and_late_fragment_tests_enabled) {
+		early_late.pNext  = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &early_late;
 	}
 	if (graphics.device_clock_period_ps != 0u) {
 		shader_clock.pNext = const_cast<void*>(create_info.pNext);
@@ -1367,7 +1382,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
 		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
 		                             VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
-		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME}) {
+		                             VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
+		                             VK_AMD_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
