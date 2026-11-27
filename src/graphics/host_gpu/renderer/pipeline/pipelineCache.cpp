@@ -1862,6 +1862,19 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
+		// Early and late tests only for draws that write neither depth nor stencil: killing shaders
+		// that also wrote depth left square artifacts under that mode (cause not established).
+		const auto& depth_control = context.GetDepthControl();
+		pixel_info.ps_early_late_z = pixel_info.ps_early_late_z && m_graphics.early_and_late_fragment_tests_enabled &&
+		                             !depth_control.z_write_enable && !depth_control.stencil_enable;
+		if (pixel_info.ps_early_late_z) {
+			static std::mutex                         early_late_mutex;
+			static std::unordered_set<uint64_t>       early_late_logged;
+			std::scoped_lock                          lock(early_late_mutex);
+			if (early_late_logged.emplace(pixel_params.hash).second) {
+				std::printf("Shader: pixel shader %016" PRIx64 " tests depth before and after\n", pixel_params.hash);
+			}
+		}
 		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
 			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
 			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;

@@ -948,15 +948,6 @@ ShaderParams PrepareProgram(
     ShaderPixelInputInfo&                               ps_info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
-	if (ps_info.ps_early_late_z) {
-		static std::mutex                   mutex;
-		static std::unordered_map<uint64_t, bool> logged;
-		std::scoped_lock                    lock(mutex);
-		if (logged.emplace(hash, true).second) {
-			std::printf("Shader: pixel shader %016" PRIx64 " tests depth before and after (kill=%d)\n",
-			            hash, ps_info.ps_pixel_kill_enable ? 1 : 0);
-		}
-	}
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
