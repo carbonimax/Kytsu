@@ -15889,6 +15889,65 @@ void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
   CheckSpirvBinaryValidates(ordinary_result.spirv);
 }
 
+void TestNewShaderRecompilerEarlyAndLateFragmentTests() {
+  constexpr uint32_t ExecutionModeEarlyFragmentTests = 9;
+  constexpr uint32_t ExecutionModeEarlyAndLateFragmentTestsAMD = 5017;
+
+  const uint32_t killing_shader[] = {
+      EncodeExp0(0x00, 0xf, true, false, true),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info;
+  ps_info.ps_pixel_kill_enable = true;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  const auto *no_feature = options.profile;
+  auto feature = *options.profile;
+  feature.early_and_late_fragment_tests = true;
+
+  const auto today = RecompileForTest(killing_shader, options);
+  ps_info.ps_early_late_z = true;
+  const auto without_feature = RecompileForTest(killing_shader, options);
+  Check(without_feature.spirv == today.spirv,
+        "a device without early and late tests changed the module");
+
+  options.profile = &feature;
+  const auto with_feature = RecompileForTest(killing_shader, options);
+  CheckSpirvBinaryValidates(with_feature.spirv);
+  Check(SpirvContainsExecutionMode(with_feature.spirv,
+                                   ExecutionModeEarlyAndLateFragmentTestsAMD),
+        "a killing EARLY_Z_THEN_RE_Z shader lost EarlyAndLateFragmentTestsAMD");
+  Check(!SpirvContainsExecutionMode(with_feature.spirv,
+                                    ExecutionModeEarlyFragmentTests),
+        "a killing shader requested EarlyFragmentTests");
+  Check(SpirvInstructionOpcodeCount(with_feature.spirv, 252) != 0,
+        "the kill was dropped with early and late tests");
+
+  ps_info.ps_early_late_z = false;
+  const auto other_order = RecompileForTest(killing_shader, options);
+  options.profile = no_feature;
+  Check(other_order.spirv == RecompileForTest(killing_shader, options).spirv,
+        "another depth order changed on a device with early and late tests");
+
+  const uint32_t ordinary_shader[] = {
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  ps_info.ps_pixel_kill_enable = false;
+  ps_info.ps_early_late_z = true;
+  options.profile = &feature;
+  const auto no_kill = RecompileForTest(ordinary_shader, options);
+  CheckSpirvBinaryValidates(no_kill.spirv);
+  Check(SpirvContainsExecutionMode(no_kill.spirv,
+                                   ExecutionModeEarlyAndLateFragmentTestsAMD) &&
+            !SpirvContainsExecutionMode(no_kill.spirv,
+                                        ExecutionModeEarlyFragmentTests),
+        "an EARLY_Z_THEN_RE_Z shader without kill did not get only "
+        "EarlyAndLateFragmentTestsAMD");
+}
+
 void TestNewShaderRecompilerNativeBindingPlan() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
@@ -18784,6 +18843,7 @@ int main(int argc, char **argv) {
   TestAliasedMrtExport();
   TestLogicalAlphaBlendExport();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
+  TestNewShaderRecompilerEarlyAndLateFragmentTests();
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();
   TestPatternFill();

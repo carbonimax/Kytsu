@@ -910,6 +910,11 @@ void DefineModule(EmitterState& state) {
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
+		} else if (state.input_info.pixel->ps_early_late_z && state.depth_variable == 0 &&
+		           state.profile.early_and_late_fragment_tests) {
+			state.builder.RequireExtension("SPV_AMD_shader_early_and_late_fragment_tests");
+			state.builder.AddExecutionMode(state.main_func,
+			                               spv::ExecutionModeEarlyAndLateFragmentTestsAMD);
 		}
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {

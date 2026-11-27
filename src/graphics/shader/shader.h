@@ -257,6 +257,8 @@ struct ShaderPixelInputInfo {
 	uint8_t target_merge_mask[8] = {};
 	bool target_merge_alpha_source = false;
 	bool                                           ps_early_z                   = false;
+	// Z_ORDER EARLY_Z_THEN_RE_Z: test before the shader, write after it (EarlyAndLateFragmentTestsAMD).
+	bool                                           ps_early_late_z              = false;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
