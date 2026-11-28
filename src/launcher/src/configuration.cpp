@@ -34,6 +34,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(audio_input_device);
 	KYTY_CFG_SET(audio_output);
 	KYTY_CFG_SET(present_mode);
+	KYTY_CFG_SET(output_resolution);
 	KYTY_CFG_SET(gpu_index);
 	KYTY_CFG_SET(fullscreen_enabled);
 	KYTY_CFG_SET(hdr_enabled);
@@ -106,6 +107,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	audio_input_device = s.value("audio_input_device", audio_input_device).toString();
 	KYTY_CFG_GET(audio_output);
 	KYTY_CFG_GET(present_mode);
+	KYTY_CFG_GET(output_resolution);
 	gpu_index = s.value("gpu_index", -1).toInt();
 	if (EnumToText(present_mode).isEmpty()) {
 		present_mode = PresentMode::Mailbox;

@@ -96,6 +96,9 @@ public:
 	enum class AudioOutput { TV, AVReceiver, SoundBar, Headphones };
 	Q_ENUM(AudioOutput)
 
+	enum class OutputResolution { Auto, UHD, FHD };
+	Q_ENUM(OutputResolution)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -126,6 +129,7 @@ public:
 	QString                audio_input_device;
 	AudioOutput            audio_output                = AudioOutput::TV;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	OutputResolution       output_resolution           = OutputResolution::Auto;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
@@ -193,6 +197,7 @@ public:
 		audio_input_device          = other.audio_input_device;
 		audio_output                = other.audio_output;
 		present_mode                = other.present_mode;
+		output_resolution           = other.output_resolution;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
