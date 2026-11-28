@@ -31,6 +31,9 @@ enum class PssrUpscaler { Linear, DLSS, FSR };
 // Values are the speaker types games read.
 enum class AudioOutput { TV, AVReceiver, SoundBar, Headphones };
 
+// Video output resolution games see; Auto keeps 4K unless the game opts into detection.
+enum class OutputResolution { Auto, UHD, FHD };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -64,6 +67,7 @@ struct ConfigOptions {
 	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
 	uint32_t               keyboard_player                = 0;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	OutputResolution       output_resolution           = OutputResolution::Auto;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
@@ -131,6 +135,7 @@ const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
 AudioOutput GetAudioOutput();
+OutputResolution GetOutputResolution();
 const std::optional<ControllerColor>& GetControllerColor();
 uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();

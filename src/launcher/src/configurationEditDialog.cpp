@@ -280,6 +280,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->comboBox_audio_output->setCurrentIndex(static_cast<int>(info.audio_output));
 	m_ui->comboBox_screen_resolution->setCurrentText(info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
+	m_ui->comboBox_output_resolution->setCurrentIndex(static_cast<int>(info.output_resolution));
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
 	// Keep Auto when Qt is built without Vulkan support.
@@ -586,6 +587,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	    Configuration::NormalizeResolution(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
+	info.output_resolution = static_cast<Configuration::OutputResolution>(
+	    ui.comboBox_output_resolution->currentIndex());
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hdr_enabled               = ui.checkBox_hdr->isChecked();

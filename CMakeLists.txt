@@ -944,6 +944,11 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_output_resolution_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --output-resolution fhd)
+	add_test(NAME emulator_output_resolution_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --output-resolution 720p)
+	set_tests_properties(emulator_output_resolution_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME net_resolver COMMAND $<TARGET_FILE:net_resolver_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)

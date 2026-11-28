@@ -57,6 +57,10 @@ AudioOutput GetAudioOutput() {
 	return g_config->audio_output;
 }
 
+OutputResolution GetOutputResolution() {
+	return g_config->output_resolution;
+}
+
 const std::optional<ControllerColor>& GetControllerColor() {
 	return g_config->controller_color;
 }

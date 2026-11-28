@@ -165,6 +165,19 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
+            <item row="3" column="0">
+             <widget class="QLabel" name="label_output_resolution">
+              <property name="text"><string>Output resolution:</string></property>
+             </widget>
+            </item>
+            <item row="3" column="1">
+             <widget class="QComboBox" name="comboBox_output_resolution">
+              <property name="toolTip"><string>Video output resolution games see. Auto reports 4K unless the game detects it; 1080p lets some games render fewer pixels for more speed and a softer image.</string></property>
+              <item><property name="text"><string>Auto</string></property></item>
+              <item><property name="text"><string notr="true">4K</string></property></item>
+              <item><property name="text"><string notr="true">1080p</string></property></item>
+             </widget>
+            </item>
             <item row="4" column="0">
              <widget class="QLabel" name="label_gpu">
               <property name="text"><string>GPU:</string></property>
