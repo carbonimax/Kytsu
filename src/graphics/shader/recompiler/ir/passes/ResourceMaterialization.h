@@ -62,6 +62,8 @@ struct ResourceSpecialization {
 // Vulkan leaves undefined. Rule from arigandores/KytyPS5 359b1c3b5.
 bool DepthCompareColorEnabled();
 
+uint64_t BufferBindingSize(const BufferResource& resource, const ShaderBufferResource& descriptor);
+
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
